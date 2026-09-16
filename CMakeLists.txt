@@ -1,13 +1,13 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.20)
 
 project(Mira
-    VERSION 1.0.0
-    DESCRIPTION "A small, modern C++20 thread pool"
+    VERSION 2.0.0
+    DESCRIPTION "A modern C++23 thread pool"
     HOMEPAGE_URL "https://github.com/dqsjqian/Mira"
     LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------
-# Library: header only, C++20, nothing beyond the standard library.
+# Library: header only, C++23, nothing beyond the standard library.
 # ---------------------------------------------------------------------------
 
 add_library(mira INTERFACE)
@@ -17,7 +17,11 @@ target_include_directories(mira INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
-target_compile_features(mira INTERFACE cxx_std_20)
+# C++23 is the minimum, not a ceiling. On MSVC this CMake maps cxx_std_23 to
+# /std:c++latest, which enables the C++26 preview on top of the C++23 features
+# Mira actually uses. Pass -DCMAKE_CXX_STANDARD=26 to ask for C++26 explicitly
+# on toolchains that support it.
+target_compile_features(mira INTERFACE cxx_std_23)
 
 find_package(Threads REQUIRED)
 target_link_libraries(mira INTERFACE Threads::Threads)

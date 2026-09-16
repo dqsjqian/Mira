@@ -1,0 +1,28 @@
+---
+# Static analysis policy for Mira.
+#
+# Run it with:
+#   cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+#   clang-tidy -p build tests/thread_pool_test.cpp examples/basic_usage.cpp
+#
+# bugprone-easily-swappable-parameters is off because adjacent integer
+# parameters of the same type are inherent to this API (thread counts, queue
+# limits, index ranges). cert-err58-cpp is off because the header deliberately
+# defines a handful of namespace-scope constants and formatters.
+#
+# CheckMain is off so that main() is not required to be exception free: the
+# test and example binaries are supposed to terminate on an unexpected
+# exception. Destructors, noexcept functions and swap are still checked.
+Checks: >
+  clang-analyzer-*,
+  bugprone-*,
+  concurrency-*,
+  performance-*,
+  cert-*,
+  -bugprone-easily-swappable-parameters,
+  -cert-err58-cpp
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*'
+FormatStyle: file
+CheckOptions:
+  bugprone-exception-escape.CheckMain: false
