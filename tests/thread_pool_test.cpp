@@ -93,12 +93,23 @@ void test_options_construction() {
 }
 
 void test_thread_count_is_clamped() {
+    // ThreadPool(0) promises a clamped explicit count, so it means "1 worker"
+    // rather than "auto". This also exercises the clamp through the real
+    // constructor.
     mira::ThreadPool small(0);
     CHECK(small.thread_count() == 1);
 
-    mira::ThreadPool huge(mira::ThreadPool::kMaxThreadCount + 1000);
-    CHECK(huge.thread_count() == mira::ThreadPool::kMaxThreadCount);
-    huge.shutdown();
+    // The upper bound is checked through the pure helper, not by constructing a
+    // pool: verifying it for real means spawning kMaxThreadCount threads, which
+    // is exactly what the clamp exists to prevent, and CI runners refuse to
+    // create that many.
+    CHECK(mira::ThreadPool::clamp_thread_count(0) == 1);
+    CHECK(mira::ThreadPool::clamp_thread_count(1) == 1);
+    CHECK(mira::ThreadPool::clamp_thread_count(4) == 4);
+    CHECK(mira::ThreadPool::clamp_thread_count(mira::ThreadPool::kMaxThreadCount) ==
+          mira::ThreadPool::kMaxThreadCount);
+    CHECK(mira::ThreadPool::clamp_thread_count(mira::ThreadPool::kMaxThreadCount + 1000) ==
+          mira::ThreadPool::kMaxThreadCount);
 }
 
 void test_stats_snapshot() {

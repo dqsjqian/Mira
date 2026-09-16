@@ -92,19 +92,16 @@ using size_type = std::size_t;
 // ---------------------------------------------------------------------------
 
 #if defined(__cpp_lib_move_only_function)
-template <class Signature>
-using MoveOnlyFunction = std::move_only_function<Signature>;
+template<class Signature> using MoveOnlyFunction = std::move_only_function<Signature>;
 #else
 /// A move-only type-erased callable, standing in for std::move_only_function.
-template <class Signature>
-class MoveOnlyFunction;
+template<class Signature> class MoveOnlyFunction;
 
-template <class Result, class... Args>
-class MoveOnlyFunction<Result(Args...)> {
+template<class Result, class... Args> class MoveOnlyFunction<Result(Args...)> {
 public:
     MoveOnlyFunction() noexcept = default;
 
-    template <class Callable>
+    template<class Callable>
         requires(!std::same_as<std::remove_cvref_t<Callable>, MoveOnlyFunction> &&
                  std::invocable<std::remove_cvref_t<Callable>&, Args...>)
     MoveOnlyFunction(Callable&& callable)
@@ -130,8 +127,7 @@ private:
         virtual Result invoke(Args&&... args) = 0;
     };
 
-    template <class Callable>
-    class Holder final : public Base {
+    template<class Callable> class Holder final : public Base {
     public:
         explicit Holder(Callable callable) : callable_(std::move(callable)) {}
 
@@ -302,6 +298,20 @@ public:
     /// Upper bound applied to resize() and the constructor, so a bad argument
     /// cannot try to spawn millions of threads.
     static constexpr size_type kMaxThreadCount = 4096;
+
+    /// The worker count the pool actually uses for `requested`: 0 becomes 1,
+    /// anything above kMaxThreadCount is capped, every other value is returned
+    /// unchanged. This is the rule behind the documented "[1, kMaxThreadCount]"
+    /// range, exposed so a caller can validate a configuration without paying
+    /// to construct a pool.
+    [[nodiscard]] static constexpr size_type clamp_thread_count(size_type requested) noexcept {
+        const size_type clamped =
+            requested == 0 ? 1 : (requested > kMaxThreadCount ? kMaxThreadCount : requested);
+        // A pool with zero workers could never make progress, so every caller
+        // may rely on at least one worker being requested.
+        MIRA_ASSUME(clamped >= 1);
+        return clamped;
+    }
 
     /// Construction parameters.
     struct Options {
@@ -700,15 +710,6 @@ public:
     }
 
 private:
-    [[nodiscard]] static constexpr size_type clamp_thread_count(size_type count) noexcept {
-        const size_type clamped =
-            count == 0 ? 1 : (count > kMaxThreadCount ? kMaxThreadCount : count);
-        // A pool with zero workers could never make progress, so every caller
-        // may rely on at least one worker being requested.
-        MIRA_ASSUME(clamped >= 1);
-        return clamped;
-    }
-
     /// Queues `task`, or reports why it could not be queued.
     [[nodiscard]] std::expected<void, PoolError> try_accept(Task task) {
         {

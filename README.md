@@ -20,9 +20,9 @@ std::println("answer = {}", answer.get());              // 42
 ## Highlights
 
 - **Header only.** One file, no dependencies beyond the C++23 standard library.
-- **C++23 first.** The task queue is a `std::move_only_function`, refusals are
-  reported with `std::expected`, and pool statistics drop straight into
-  `std::format`.
+- **C++23 first.** The task queue is a move-only callable (`std::move_only_function`
+  where the standard library has it), refusals are reported with `std::expected`,
+  and pool statistics drop straight into `std::format`.
 - **No busy waiting.** Every wait goes through a condition variable, including
   `wait()`, which used to spin on an atomic counter.
 - **No per-task indirection.** A `std::packaged_task` is moved straight into the
@@ -45,16 +45,37 @@ std::println("answer = {}", answer.get());              // 42
 
 ## Requirements
 
-- A C++23 compiler and standard library:
-  - MSVC 19.35+ (Visual Studio 2022 17.5+), with `/std:c++23preview` or
-    `/std:c++latest`. Verified on MSVC 19.51.36247 (Visual Studio 2026).
-  - GCC 14+ with libstdc++ 14+, with `-std=c++23`.
-  - Clang 19+ with libc++ 19+, with `-std=c++23`.
+- A C++23 compiler and standard library. CI builds and runs the test suite with
+  `-DMIRA_WERROR=ON` on every combination below, so these are verified, not
+  inferred:
+
+  | Toolchain | Standard library |
+  | --- | --- |
+  | GCC 14.2, GCC 15.2 | libstdc++ |
+  | Clang 19.1, Clang 20.1 | libstdc++ 14 |
+  | AppleClang 21 (Xcode 26), Homebrew LLVM 20.1 | libc++ |
+  | MSVC 14.44 (Visual Studio 2022), 14.51 (Visual Studio 2026) | MSVC STL |
+  | MinGW-w64 GCC 16.2 (UCRT64) | libstdc++ |
+
+- C++23 mode: `-std=c++23` on GCC and Clang, `/std:c++23preview` or
+  `/std:c++latest` on MSVC.
+- AddressSanitizer with UndefinedBehaviorSanitizer, and ThreadSanitizer, both
+  under GCC on Linux.
 - CMake 3.20+ if you want to use the CMake build.
 
-Only MSVC was available on the machine where this version was written, so the GCC
-and Clang versions above are minimums derived from when each library feature
-landed, not verified numbers.
+### Portability notes
+
+Two C++23 library features Mira uses are still missing from libc++, Apple's
+included. Mira detects both at build time and degrades instead of failing:
+
+- No `<stacktrace>`. Task provenance in `task_history()` is disabled,
+  `mira::StackTrace` is an empty type, and `mira::has_stacktrace` is `false`.
+- No `std::move_only_function`. `mira::MoveOnlyFunction` falls back to an
+  equivalent move-only, type-erased wrapper. No public API changes.
+
+Clang 18 and earlier cannot build Mira against libstdc++ at all: they report
+`__cpp_concepts` as `201907L`, and libstdc++'s `<expected>` requires `202002L`.
+Clang 19 is the first release that reports `202002L`.
 
 ## Getting started
 
@@ -233,13 +254,12 @@ module offsets.
 
 | Feature | Where |
 | --- | --- |
-| `std::move_only_function` | the task queue, so a task never has to be copyable |
+| `std::move_only_function` | the task queue, so a task never has to be copyable (a fallback covers libc++, see the portability notes) |
 | `std::expected` | `try_submit()`, `try_resize()` |
 | Explicit object parameter (`this Self&&`) | `submit()`, `try_submit()`, `parallel_for()`, `parallel_for_each()` require an lvalue pool |
-| `std::views::enumerate` + `std::ranges::to` | `workers()` |
 | `std::format` + `std::formatter` | `to_string(PoolStats)` and the `PoolStats` formatter |
 | `std::print` / `std::println` | the example |
-| `[[assume]]` | `clamp_thread_count()` and `parallel_for()` |
+| `[[assume]]` | `clamp_thread_count()` and `parallel_for()`, on compilers that implement it |
 | `std::unreachable` | the exhaustive switches in `to_string()` |
 | `std::to_underlying` | the numeric state code in `to_string(PoolStats)` |
 | `std::stacktrace` | optional task provenance in `task_history()` |
@@ -272,9 +292,10 @@ Mira keeps the useful parts of that API and rebuilds the rest:
 
 A few implementation details worth knowing:
 
-- Tasks are type-erased into `std::move_only_function<void()>`. The concrete
-  callable lives inside a `std::packaged_task`, which is what gives every task a
-  future and lets the queue hold move-only callables without an indirection.
+- Tasks are type-erased into a move-only callable (`mira::MoveOnlyFunction<void()>`,
+  which is `std::move_only_function` where available). The concrete callable lives
+  inside a `std::packaged_task`, which is what gives every task a future and lets
+  the queue hold move-only callables without an indirection.
 - The lifecycle is a single `State` value (`running`, `paused`, `draining`)
   instead of three independent booleans, so the transitions are exhaustive and
   the state is always consistent with the worker list.
