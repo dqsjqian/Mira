@@ -1,0 +1,312 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux: the two documented minimums plus the newest GCC and Clang.
+  # ---------------------------------------------------------------------------
+  linux:
+    name: Linux / ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: GCC 14 (minimum)
+            cc: gcc-14
+            cxx: g++-14
+          - name: GCC 15 (newest)
+            cc: gcc-15
+            cxx: g++-15
+            install_gcc15: true
+          - name: Clang 18 (minimum)
+            cc: clang-18
+            cxx: clang++-18
+            gcc_install_dir: /usr/lib/gcc/x86_64-linux-gnu/14
+          - name: Clang 20 (newest)
+            cc: clang-20
+            cxx: clang++-20
+            install_llvm: 20
+            gcc_install_dir: /usr/lib/gcc/x86_64-linux-gnu/14
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install GCC 15
+        if: matrix.install_gcc15
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y gcc-15 g++-15
+
+      - name: Install LLVM
+        if: matrix.install_llvm
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh ${{ matrix.install_llvm }}
+
+      - name: Install Ninja
+        run: |
+          command -v ninja >/dev/null 2>&1 || {
+            sudo apt-get update -qq
+            sudo apt-get install -y ninja-build
+          }
+
+      - name: Show toolchain
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          $CXX --version | head -1
+          cmake --version | head -1
+
+      # Clang defaults to the distribution's default libstdc++, which on
+      # ubuntu-24.04 is GCC 13 and therefore missing C++23 library features.
+      # Point it at the GCC 14 standard library explicitly.
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+          GCC_INSTALL_DIR: ${{ matrix.gcc_install_dir }}
+        run: |
+          extra_cxx_flags=""
+          if [ -n "$GCC_INSTALL_DIR" ]; then
+            extra_cxx_flags="--gcc-install-dir=$GCC_INSTALL_DIR"
+          fi
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMIRA_WERROR=ON \
+            -DCMAKE_CXX_FLAGS="$extra_cxx_flags" \
+            -DCMAKE_REQUIRED_FLAGS="$extra_cxx_flags"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Run the example
+        run: ./build/mira_example
+
+  # ---------------------------------------------------------------------------
+  # macOS: Apple's own clang and the newest upstream clang, both on libc++.
+  # ---------------------------------------------------------------------------
+  macos:
+    name: macOS / ${{ matrix.name }}
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: AppleClang (Xcode 26, libc++)
+            upstream_llvm: false
+          - name: Homebrew LLVM (libc++)
+            upstream_llvm: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select compiler
+        env:
+          UPSTREAM_LLVM: ${{ matrix.upstream_llvm }}
+        run: |
+          set -eu
+          if [ "$UPSTREAM_LLVM" = "true" ]; then
+            formula=""
+            for candidate in llvm llvm@21 llvm@20; do
+              if brew list --versions "$candidate" >/dev/null 2>&1; then
+                formula="$candidate"
+                break
+              fi
+            done
+            if [ -z "$formula" ]; then
+              brew install llvm
+              formula=llvm
+            fi
+            prefix="$(brew --prefix "$formula")"
+          else
+            prefix="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr"
+          fi
+          printf 'CC=%s/bin/clang\nCXX=%s/bin/clang++\n' "$prefix" "$prefix" >> "$GITHUB_ENV"
+
+      - name: Show toolchain
+        run: |
+          $CXX --version | head -1
+          cmake --version | head -1
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMIRA_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Run the example
+        run: ./build/mira_example
+
+  # ---------------------------------------------------------------------------
+  # Windows: MSVC from two Visual Studio generations, plus MinGW-w64 GCC.
+  # ---------------------------------------------------------------------------
+  windows-msvc:
+    name: Windows / MSVC ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025-vs2026
+            label: (VS2026)
+          - os: windows-2022
+            label: (VS2022)
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          cl 2>&1 | Select-Object -First 1
+          cmake --version | Select-Object -First 1
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMIRA_WERROR=ON
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --parallel
+
+      - name: Test
+        shell: pwsh
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Run the example
+        shell: pwsh
+        run: ./build/mira_example.exe
+
+  windows-mingw:
+    name: Windows / MinGW-w64 GCC (UCRT64)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Show toolchain
+        shell: msys2 {0}
+        run: |
+          g++ --version | head -1
+          cmake --version | head -1
+
+      - name: Configure
+        shell: msys2 {0}
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMIRA_WERROR=ON
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build build --parallel
+
+      - name: Test
+        shell: msys2 {0}
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Run the example
+        shell: msys2 {0}
+        run: ./build/mira_example.exe
+
+  # ---------------------------------------------------------------------------
+  # Sanitizers: a thread pool that only passes its own tests is not evidence.
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: Linux / ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ASan + UBSan
+            flags: -fsanitize=address,undefined -fno-omit-frame-pointer
+          - name: TSan
+            flags: -fsanitize=thread -fno-omit-frame-pointer
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Ninja
+        run: |
+          command -v ninja >/dev/null 2>&1 || {
+            sudo apt-get update -qq
+            sudo apt-get install -y ninja-build
+          }
+
+      # ThreadSanitizer needs a lower ASLR entropy than recent kernels default
+      # to, otherwise every run aborts with "unexpected memory mapping".
+      - name: Relax ASLR entropy
+        if: matrix.name == 'TSan'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure
+        env:
+          CC: gcc-14
+          CXX: g++-14
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="${{ matrix.flags }} -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.flags }}"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # Formatting, pinned so a clang-format upgrade cannot turn the gate red.
+  # ---------------------------------------------------------------------------
+  format:
+    name: clang-format 22.1.3
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install clang-format
+        run: pip install clang-format==22.1.3
+
+      - name: Check formatting
+        run: |
+          clang-format --version
+          clang-format --dry-run --Werror --style=file \
+            include/mira/thread_pool.hpp \
+            tests/thread_pool_test.cpp \
+            examples/basic_usage.cpp
