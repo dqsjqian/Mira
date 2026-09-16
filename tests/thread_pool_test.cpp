@@ -256,6 +256,10 @@ void test_many_tasks() {
         total += future.get();
     }
     CHECK(total == 1000LL * 1001LL / 2LL);
+    // A future is fulfilled before the pool finishes bookkeeping for its task,
+    // so the last get() can return while completed_ is still catching up.
+    // wait() joins that bookkeeping; only then is completed_count() exact.
+    pool.wait();
     CHECK(pool.completed_count() == 1000);
 }
 
