@@ -6,6 +6,31 @@
 #ifndef MIRA_THREAD_POOL_HPP
 #define MIRA_THREAD_POOL_HPP
 
+// std::stacktrace is the one C++23 library feature Mira uses that is not
+// universally available. libc++ has no <stacktrace> header at all, Apple's
+// included, and GCC 13 and 14 keep the symbols out of the main runtime
+// library, so a toolchain can have the header and still fail to link it. The
+// CMake build probes for both cases and defines MIRA_NO_STACKTRACE; a
+// header-only user can define it too, and __has_include catches the missing
+// header on its own.
+#if !defined(MIRA_NO_STACKTRACE) && defined(__has_include)
+#if !__has_include(<stacktrace>)
+#define MIRA_NO_STACKTRACE 1
+#endif
+#endif
+
+// [[assume]] where the compiler implements it, and nothing where it does not.
+// MSVC only learned the attribute in 19.50, so VS2022 warns about it and a
+// /WX build treats that warning as an error.
+#if defined(__has_cpp_attribute)
+#if __has_cpp_attribute(assume) >= 202207L
+#define MIRA_ASSUME(condition) [[assume(condition)]]
+#endif
+#endif
+#if !defined(MIRA_ASSUME)
+#define MIRA_ASSUME(condition) static_cast<void>(0)
+#endif
+
 #include <chrono>
 #include <concepts>
 #include <condition_variable>
@@ -18,7 +43,9 @@
 #include <future>
 #include <mutex>
 #include <ranges>
+#if !defined(MIRA_NO_STACKTRACE)
 #include <stacktrace>
+#endif
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -104,13 +131,54 @@ struct PoolStats {
     State state = State::running;
 };
 
+#if defined(MIRA_NO_STACKTRACE)
+/// One frame of a task's provenance trace.
+///
+/// This stands in for std::stacktrace_entry on toolchains that have no usable
+/// std::stacktrace, so that TaskRecord keeps the same shape everywhere. It
+/// always reports nothing.
+class StackFrame {
+public:
+    [[nodiscard]] std::string description() const { return {}; }
+    [[nodiscard]] std::string source_file() const { return {}; }
+    [[nodiscard]] std::uint_least32_t source_line() const noexcept { return 0; }
+};
+
+/// The call stack captured when a task was submitted.
+class StackTrace {
+public:
+    [[nodiscard]] bool empty() const noexcept { return true; }
+    [[nodiscard]] std::size_t size() const noexcept { return 0; }
+    [[nodiscard]] StackFrame operator[](std::size_t) const noexcept { return StackFrame{}; }
+    [[nodiscard]] static StackTrace current(std::size_t skip = 0,
+                                            std::size_t max_depth = 0) noexcept {
+        static_cast<void>(skip);
+        static_cast<void>(max_depth);
+        return {};
+    }
+};
+#else
+/// One frame of a task's provenance trace.
+using StackFrame = std::stacktrace_entry;
+/// The call stack captured when a task was submitted.
+using StackTrace = std::stacktrace;
+#endif
+
+/// Whether task provenance can be recorded in this translation unit.
+#if defined(MIRA_NO_STACKTRACE)
+inline constexpr bool has_stacktrace = false;
+#else
+inline constexpr bool has_stacktrace = true;
+#endif
+
 /// Where a task came from. Only recorded when Options::trace_depth is non-zero.
 struct TaskRecord {
     /// Monotonic submission number, starting at 1.
     std::uint64_t sequence = 0;
-    /// Stack of the submit()/try_submit() call site. Symbol names need debug
-    /// information in the binary; without it the frames carry module offsets.
-    std::stacktrace origin;
+    /// Stack of the submit()/try_submit() call site, empty when has_stacktrace
+    /// is false. Symbol names need debug information in the binary; without it
+    /// the frames carry module offsets.
+    StackTrace origin;
 };
 
 /// Identity of one worker thread.
@@ -302,7 +370,7 @@ public:
         const size_type chunk = (total + chunks - 1) / chunks;
         // Every index is covered because chunks <= total, so the rounded-up
         // chunk size is at least one.
-        [[assume(chunk >= 1)]];
+        MIRA_ASSUME(chunk >= 1);
 
         std::vector<std::future<void>> futures;
         futures.reserve(chunks);
@@ -566,7 +634,7 @@ private:
             count == 0 ? 1 : (count > kMaxThreadCount ? kMaxThreadCount : count);
         // A pool with zero workers could never make progress, so every caller
         // may rely on at least one worker being requested.
-        [[assume(clamped >= 1)]];
+        MIRA_ASSUME(clamped >= 1);
         return clamped;
     }
 
@@ -584,7 +652,7 @@ private:
                 // Frame 0 is current() itself; the next frames are Mira's own
                 // submit path, then the caller.
                 history_.push_back(
-                    TaskRecord{.sequence = ++sequence_, .origin = std::stacktrace::current(1)});
+                    TaskRecord{.sequence = ++sequence_, .origin = StackTrace::current(1)});
                 while (history_.size() > trace_depth_) {
                     history_.pop_front();
                 }

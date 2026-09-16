@@ -98,7 +98,9 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
       - name: Run the example
-        run: ./build/mira_example
+        run: |
+          test -x ./build/mira_example || { echo "example not built on this toolchain"; exit 0; }
+          ./build/mira_example
 
   # ---------------------------------------------------------------------------
   # macOS: Apple's own clang and the newest upstream clang, both on libc++.
@@ -155,7 +157,9 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
       - name: Run the example
-        run: ./build/mira_example
+        run: |
+          test -x ./build/mira_example || { echo "example not built on this toolchain"; exit 0; }
+          ./build/mira_example
 
   # ---------------------------------------------------------------------------
   # Windows: MSVC from two Visual Studio generations, plus MinGW-w64 GCC.
@@ -198,7 +202,12 @@ jobs:
 
       - name: Run the example
         shell: pwsh
-        run: ./build/mira_example.exe
+        run: |
+          if (Test-Path ./build/mira_example.exe) {
+            ./build/mira_example.exe
+          } else {
+            Write-Host "example not built on this toolchain"
+          }
 
   windows-mingw:
     name: Windows / MinGW-w64 GCC (UCRT64)
@@ -235,7 +244,9 @@ jobs:
 
       - name: Run the example
         shell: msys2 {0}
-        run: ./build/mira_example.exe
+        run: |
+          test -x ./build/mira_example.exe || { echo "example not built on this toolchain"; exit 0; }
+          ./build/mira_example.exe
 
   # ---------------------------------------------------------------------------
   # Sanitizers: a thread pool that only passes its own tests is not evidence.

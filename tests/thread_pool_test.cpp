@@ -591,7 +591,13 @@ void test_task_history_is_bounded_ring() {
     // The oldest entries were dropped, so the window holds submissions 3 to 5.
     CHECK(history.front().sequence == 3);
     CHECK(history.back().sequence == 5);
-    CHECK(!history.back().origin.empty());
+    // Frames are only there where std::stacktrace is usable. On toolchains
+    // without it the trace is deliberately empty rather than absent.
+    if constexpr (mira::has_stacktrace) {
+        CHECK(!history.back().origin.empty());
+    } else {
+        CHECK(history.back().origin.empty());
+    }
 }
 
 void test_task_history_is_empty_without_tracing() {

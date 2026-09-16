@@ -46,13 +46,23 @@ endif()
 # ---------------------------------------------------------------------------
 # Standard library side libraries
 #
-# Two C++23 library features Mira uses do not always live in the main runtime
-# library: on GCC 14, <stacktrace> needs libstdc++_libbacktrace and <print>
-# needs libstdc++exp. Hardcoding that would break toolchains that keep both in
-# the main runtime (MSVC, libc++, newer libstdc++), so probe for it instead.
+# Two of the C++23 library features Mira uses are not always part of the main
+# runtime library:
+#
+#   * libc++ has no <stacktrace> header at all, Apple's included, so there is
+#     nothing to link against there.
+#   * libstdc++ keeps the experimental C++23 library, which includes both
+#     std::stacktrace and std::print, in libstdc++exp. GCC 13 put the
+#     std::stacktrace symbols in a separate libstdc++_libbacktrace instead.
+#   * MSVC and newer libstdc++ need nothing extra.
+#
+# So probe rather than hardcode: link the snippet on its own, then against each
+# candidate library in turn.
 # ---------------------------------------------------------------------------
 
 include(CheckCXXSourceCompiles)
+
+set(MIRA_EXPERIMENTAL_LIBRARIES stdc++exp stdc++_libbacktrace)
 
 set(MIRA_STACKTRACE_PROBE "
 #include <stacktrace>
@@ -80,24 +90,47 @@ else()
     set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -std=c++23")
 endif()
 
-check_cxx_source_compiles("${MIRA_STACKTRACE_PROBE}" MIRA_STACKTRACE_LINKS_UNAIDED)
-
-if(MIRA_STACKTRACE_LINKS_UNAIDED)
-    message(STATUS "Mira: std::stacktrace links against the standard library")
-else()
-    set(CMAKE_REQUIRED_LIBRARIES stdc++_libbacktrace)
-    check_cxx_source_compiles("${MIRA_STACKTRACE_PROBE}" MIRA_STACKTRACE_LINKS_WITH_LIBBACKTRACE)
-    unset(CMAKE_REQUIRED_LIBRARIES)
-    if(MIRA_STACKTRACE_LINKS_WITH_LIBBACKTRACE)
-        message(STATUS "Mira: std::stacktrace needs -lstdc++_libbacktrace")
-        target_link_libraries(mira INTERFACE stdc++_libbacktrace)
-    else()
-        message(FATAL_ERROR
-            "Mira needs C++23 and a linkable std::stacktrace. This probe failed "
-            "both with and without -lstdc++_libbacktrace, which usually means the "
-            "compiler does not support C++23 at all (Mira needs GCC 14+, "
-            "Clang 18+ or MSVC 19.40+).")
+# Sets <prefix>_OK, and <prefix>_LIBRARIES to whatever had to be linked.
+function(mira_resolve_side_libraries prefix snippet)
+    check_cxx_source_compiles("${snippet}" "${prefix}_LINKS_UNAIDED")
+    if(${prefix}_LINKS_UNAIDED)
+        set(${prefix}_OK TRUE PARENT_SCOPE)
+        set(${prefix}_LIBRARIES "" PARENT_SCOPE)
+        return()
     endif()
+
+    set(index 0)
+    foreach(candidate IN LISTS ARGN)
+        math(EXPR index "${index} + 1")
+        set(CMAKE_REQUIRED_LIBRARIES "${candidate}")
+        check_cxx_source_compiles("${snippet}" "${prefix}_LINKS_WITH_${index}")
+        unset(CMAKE_REQUIRED_LIBRARIES)
+        if(${prefix}_LINKS_WITH_${index})
+            set(${prefix}_OK TRUE PARENT_SCOPE)
+            set(${prefix}_LIBRARIES "${candidate}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+
+    set(${prefix}_OK FALSE PARENT_SCOPE)
+    set(${prefix}_LIBRARIES "" PARENT_SCOPE)
+endfunction()
+
+mira_resolve_side_libraries(MIRA_STACKTRACE "${MIRA_STACKTRACE_PROBE}"
+    ${MIRA_EXPERIMENTAL_LIBRARIES})
+
+if(MIRA_STACKTRACE_OK)
+    if(MIRA_STACKTRACE_LIBRARIES)
+        message(STATUS "Mira: std::stacktrace needs -l${MIRA_STACKTRACE_LIBRARIES}")
+        target_link_libraries(mira INTERFACE ${MIRA_STACKTRACE_LIBRARIES})
+    else()
+        message(STATUS "Mira: std::stacktrace links against the standard library")
+    endif()
+else()
+    # Not fatal: the header falls back to an empty trace so that the pool still
+    # builds and runs, it just cannot say where a task came from.
+    message(STATUS "Mira: no usable <stacktrace> here, task provenance is disabled")
+    target_compile_definitions(mira INTERFACE MIRA_NO_STACKTRACE=1)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -123,25 +156,21 @@ endif()
 option(MIRA_BUILD_EXAMPLES "Build the Mira examples" ON)
 
 if(MIRA_BUILD_EXAMPLES)
-    add_executable(mira_example examples/basic_usage.cpp)
-    target_link_libraries(mira_example PRIVATE mira::mira)
-    target_compile_options(mira_example PRIVATE ${MIRA_WARNING_FLAGS})
-
     # std::print is the one side library Mira's own headers do not pull in, so
     # the probe result is attached to the example rather than to the interface.
-    check_cxx_source_compiles("${MIRA_PRINT_PROBE}" MIRA_PRINT_LINKS_UNAIDED)
-    if(NOT MIRA_PRINT_LINKS_UNAIDED)
-        set(CMAKE_REQUIRED_LIBRARIES stdc++exp)
-        check_cxx_source_compiles("${MIRA_PRINT_PROBE}" MIRA_PRINT_LINKS_WITH_STDCXXEXP)
-        unset(CMAKE_REQUIRED_LIBRARIES)
-        if(MIRA_PRINT_LINKS_WITH_STDCXXEXP)
-            message(STATUS "Mira: std::print needs -lstdc++exp")
-            target_link_libraries(mira_example PRIVATE stdc++exp)
-        else()
-            message(FATAL_ERROR
-                "This toolchain ships <print> but cannot link std::print, which "
-                "the Mira example uses for its output.")
+    mira_resolve_side_libraries(MIRA_PRINT "${MIRA_PRINT_PROBE}"
+        ${MIRA_EXPERIMENTAL_LIBRARIES})
+
+    if(MIRA_PRINT_OK)
+        add_executable(mira_example examples/basic_usage.cpp)
+        target_link_libraries(mira_example PRIVATE mira::mira)
+        target_compile_options(mira_example PRIVATE ${MIRA_WARNING_FLAGS})
+        if(MIRA_PRINT_LIBRARIES)
+            message(STATUS "Mira: std::print needs -l${MIRA_PRINT_LIBRARIES}")
+            target_link_libraries(mira_example PRIVATE ${MIRA_PRINT_LIBRARIES})
         endif()
+    else()
+        message(STATUS "Mira: no usable <print> here, skipping the example")
     endif()
 endif()
 

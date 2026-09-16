@@ -1,5 +1,7 @@
 # Mira
 
+[![CI](https://github.com/dqsjqian/Mira/actions/workflows/ci.yml/badge.svg)](https://github.com/dqsjqian/Mira/actions/workflows/ci.yml)
+
 A modern C++23 thread pool.
 
 Mira gives you a fixed pool of worker threads and a clean, exception-safe API for
