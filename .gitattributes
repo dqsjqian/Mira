@@ -1,0 +1,16 @@
+# Normalize line endings so the library behaves the same on every platform.
+* text=auto eol=lf
+
+# Windows-only script types keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary assets are never touched.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.zip binary

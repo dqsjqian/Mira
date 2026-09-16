@@ -1,17 +1,41 @@
+# Build output
+build/
+out/
+cmake-build-*/
+_deps/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+install_manifest.txt
+*.cmake.stamp
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+compile_commands.json
+
 # Prerequisites
 *.d
 
-# Compiled Object files
+# Compiled object files
 *.slo
 *.lo
 *.o
 *.obj
 
-# Precompiled Headers
+# Precompiled headers
 *.gch
 *.pch
 
-# Compiled Dynamic libraries
+# Compiled dynamic libraries
 *.so
 *.dylib
 *.dll
@@ -20,7 +44,7 @@
 *.mod
 *.smod
 
-# Compiled Static libraries
+# Compiled static libraries
 *.lai
 *.la
 *.a
@@ -30,3 +54,6 @@
 *.exe
 *.out
 *.app
+
+# Logs
+*.log
