@@ -31,9 +31,10 @@ jobs:
             cc: gcc-15
             cxx: g++-15
             install_gcc15: true
-          - name: Clang 18 (minimum)
-            cc: clang-18
-            cxx: clang++-18
+          - name: Clang 19 (minimum)
+            cc: clang-19
+            cxx: clang++-19
+            install_llvm: 19
             gcc_install_dir: /usr/lib/gcc/x86_64-linux-gnu/14
           - name: Clang 20 (newest)
             cc: clang-20

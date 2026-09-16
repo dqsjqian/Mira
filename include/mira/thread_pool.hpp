@@ -41,6 +41,7 @@
 #include <format>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <ranges>
 #if !defined(MIRA_NO_STACKTRACE)
@@ -79,6 +80,72 @@ static_assert(cpp_standard >= 202100L,
               "/std:c++23preview or /std:c++latest (MSVC)");
 
 using size_type = std::size_t;
+
+// ---------------------------------------------------------------------------
+// Standard library compatibility
+//
+// libc++ has not implemented std::move_only_function at all, not even in the
+// version Apple ships with Xcode 26, so the task queue cannot name it
+// directly. MoveOnlyFunction is the real thing where it exists and a small
+// stand-in where it does not. Either way the queue holds a move-only,
+// type-erased callable: no shared ownership and no reference counting.
+// ---------------------------------------------------------------------------
+
+#if defined(__cpp_lib_move_only_function)
+template <class Signature>
+using MoveOnlyFunction = std::move_only_function<Signature>;
+#else
+/// A move-only type-erased callable, standing in for std::move_only_function.
+template <class Signature>
+class MoveOnlyFunction;
+
+template <class Result, class... Args>
+class MoveOnlyFunction<Result(Args...)> {
+public:
+    MoveOnlyFunction() noexcept = default;
+
+    template <class Callable>
+        requires(!std::same_as<std::remove_cvref_t<Callable>, MoveOnlyFunction> &&
+                 std::invocable<std::remove_cvref_t<Callable>&, Args...>)
+    MoveOnlyFunction(Callable&& callable)
+        : holder_(std::make_unique<Holder<std::remove_cvref_t<Callable>>>(
+              std::forward<Callable>(callable))) {}
+
+    MoveOnlyFunction(MoveOnlyFunction&&) noexcept = default;
+    MoveOnlyFunction& operator=(MoveOnlyFunction&&) noexcept = default;
+    MoveOnlyFunction(const MoveOnlyFunction&) = delete;
+    MoveOnlyFunction& operator=(const MoveOnlyFunction&) = delete;
+    ~MoveOnlyFunction() = default;
+
+    [[nodiscard]] explicit operator bool() const noexcept { return holder_ != nullptr; }
+
+    Result operator()(Args... args) { return holder_->invoke(std::forward<Args>(args)...); }
+
+private:
+    struct Base {
+        Base() = default;
+        Base(const Base&) = delete;
+        Base& operator=(const Base&) = delete;
+        virtual ~Base() = default;
+        virtual Result invoke(Args&&... args) = 0;
+    };
+
+    template <class Callable>
+    class Holder final : public Base {
+    public:
+        explicit Holder(Callable callable) : callable_(std::move(callable)) {}
+
+        Result invoke(Args&&... args) override {
+            return std::invoke(callable_, std::forward<Args>(args)...);
+        }
+
+    private:
+        Callable callable_;
+    };
+
+    std::unique_ptr<Base> holder_;
+};
+#endif
 
 /// Lifecycle of a pool.
 enum class State : std::uint8_t {
@@ -207,10 +274,10 @@ struct WorkerInfo {
 ///     retired cooperatively through std::stop_token.
 ///   * Every wait goes through a condition variable. There is no polling and no
 ///     busy-waiting anywhere in the implementation.
-///   * Tasks are type-erased into std::move_only_function<void()>, so a task
-///     never needs to be copyable. A std::packaged_task is moved straight into
-///     the queue: no shared_ptr, no atomic refcount and no extra allocation per
-///     submission.
+///   * Tasks are type-erased into a move-only callable (std::move_only_function
+///     where the standard library has it), so a task never needs to be
+///     copyable. A std::packaged_task is moved straight into the queue: no
+///     shared_ptr, no atomic refcount and no extra allocation per submission.
 ///
 /// Thread safety:
 ///   * submit() and try_submit() may be called concurrently from any number of
@@ -227,7 +294,7 @@ struct WorkerInfo {
 class ThreadPool {
 public:
     using size_type = mira::size_type;
-    using Task = std::move_only_function<void()>;
+    using Task = MoveOnlyFunction<void()>;
     using State = mira::State;
     using PoolError = mira::PoolError;
     using Stats = PoolStats;
@@ -604,15 +671,19 @@ public:
         };
     }
 
-    /// Index and thread id of every worker, built with std::views::enumerate and
-    /// std::ranges::to.
+    /// Index and thread id of every worker.
+    ///
+    /// Written as a loop rather than with std::views::enumerate and
+    /// std::ranges::to: libc++ has no enumerate at all, and Clang 20 against
+    /// libstdc++ 14 rejects the piped form of ranges::to.
     [[nodiscard]] std::vector<WorkerInfo> workers() const {
         std::lock_guard lock(mutex_);
-        return workers_ | std::views::enumerate | std::views::transform([](const auto& entry) {
-                   const auto& [index, worker] = entry;
-                   return WorkerInfo{.index = static_cast<size_type>(index), .id = worker.get_id()};
-               }) |
-               std::ranges::to<std::vector>();
+        std::vector<WorkerInfo> result;
+        result.reserve(workers_.size());
+        for (size_type index = 0; index < workers_.size(); ++index) {
+            result.push_back(WorkerInfo{.index = index, .id = workers_[index].get_id()});
+        }
+        return result;
     }
 
     /// The most recent submissions, newest last, at most
