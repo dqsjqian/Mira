@@ -9,13 +9,12 @@
 # In-process also means the numbers are *relative*: compare two commits, not
 # Mira against wrk. Use `tools/bench/run.sh` for the blessed invocation.
 #
-# Two scenarios, chosen because they are what the optimization work targeted:
+# Scenarios, chosen because they are what the optimization work targeted:
 #   * bench_h1_keepalive — HTTP/1.1 keep-alive small-response request/response
 #   * bench_h2_roundtrip — HTTP/2 multiple concurrent streams per connection
-#
-# Gated behind MIRA_BUILD_BENCH for the same reason the examples are opt-in:
-# a consumer pulling Mira in via add_subdirectory() did not ask for our
-# measurement binaries.
+#   * bench_h1_churn     — full connection lifetime (accept/serve/close)
+#   * bench_h1_cancel    — deadline and stop-token cancellation overhead
+#   * bench_h1_overload  — backpressure: 4 KiB bodies through a 512 B window
 
 if(NOT MIRA_BUILD_BENCH)
     return()
@@ -30,3 +29,18 @@ add_executable(bench_h2_roundtrip h2_roundtrip.cpp)
 target_link_libraries(bench_h2_roundtrip
     PRIVATE Mira::transport Mira::http2 Mira::warnings)
 target_compile_features(bench_h2_roundtrip PRIVATE cxx_std_23)
+
+add_executable(bench_h1_churn h1_churn.cpp)
+target_link_libraries(bench_h1_churn
+    PRIVATE Mira::transport Mira::http Mira::warnings)
+target_compile_features(bench_h1_churn PRIVATE cxx_std_23)
+
+add_executable(bench_h1_cancel h1_cancel.cpp)
+target_link_libraries(bench_h1_cancel
+    PRIVATE Mira::http Mira::warnings)
+target_compile_features(bench_h1_cancel PRIVATE cxx_std_23)
+
+add_executable(bench_h1_overload h1_overload.cpp)
+target_link_libraries(bench_h1_overload
+    PRIVATE Mira::transport Mira::http Mira::warnings)
+target_compile_features(bench_h1_overload PRIVATE cxx_std_23)

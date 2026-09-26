@@ -127,6 +127,31 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build/asan --output-on-failure
 
+  # The negative space of the parsers gets explored continuously, not just
+  # when a maintainer remembers to run the fuzzer. A short, capped smoke pass
+  # on Linux: enough to catch regressions the unit suite's shapes miss, cheap
+  # enough to keep in the required path.
+  fuzz:
+    needs: discipline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Configure with libFuzzer
+        run: >
+          cmake -S . -B build/fuzz -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"
+          -DMIRA_BUILD_FUZZERS=ON
+      - name: Build
+        run: cmake --build build/fuzz --parallel
+      - name: Smoke fuzz (60s cap)
+        run: >
+          ./build/fuzz/fuzz/fuzz_http_parser
+          -max_total_time=60 -max_len=1024 -rss_limit_mb=2560
+          fuzz/corpus/http_parser
+
   # Optional protocol engines (nghttp2 / ngtcp2 / nghttp3) with their
   # dependencies built from pinned, hash-verified sources by the same
   # script a developer would run locally. POSIX only for now: the

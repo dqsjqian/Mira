@@ -60,6 +60,22 @@ version is 0, the minor version is where breaking changes land: a request for
 - In-process benchmarks land under `bench/` (opt-in via `MIRA_BUILD_BENCH`):
   HTTP/1.1 keep-alive small responses and HTTP/2 concurrent streams, with
   the blessed invocation pinned in `tools/bench/run.sh`.
+- Request bodies can stream. A handler whose third parameter is
+  `std::span<const std::byte>` gets the whole buffered body as before; any
+  other callable gets a `RequestBodyReader` and pulls slices while it runs —
+  uploads no longer need to fit in memory to make progress. Either way the
+  connection loop guarantees the body is drained (or the connection dropped)
+  before the next request parses, which is the keep-alive desync rule applied
+  to the streaming path too. Trailers of a chunked body land on the reader
+  after the final read.
+- Benchmarks grew the scenarios the first two were chosen against:
+  `bench_h1_churn` (full connection lifetime: accept, one exchange, close),
+  `bench_h1_cancel` (deadline and stop-token teardown overhead), and
+  `bench_h1_overload` (4 KiB bodies pushed through a 512 B read window —
+  the price of backpressure).
+- libFuzzer harnesses land under `fuzz/` (opt-in via `MIRA_BUILD_FUZZERS`,
+  clang): the request parser is fuzzed across arbitrary chunk boundaries with
+  seed corpus covering smuggling shapes. CI runs a short smoke pass on Linux.
 
 ### Fixed
 

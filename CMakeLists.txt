@@ -142,8 +142,12 @@ endif()
 # The bench gate lives in bench/CMakeLists.txt; it needs the option declared
 # here so `cmake -DMIRA_BUILD_BENCH=ON` is visible before the subdirectory.
 option(MIRA_BUILD_BENCH "Build Mira's in-process benchmarks" OFF)
+option(MIRA_BUILD_FUZZERS "Build Mira's libFuzzer harnesses (clang only)" OFF)
 if(MIRA_BUILD_BENCH)
     add_subdirectory(bench)
+endif()
+if(MIRA_BUILD_FUZZERS)
+    add_subdirectory(fuzz)
 endif()
 
 # ── Examples ────────────────────────────────────────────────────────────────

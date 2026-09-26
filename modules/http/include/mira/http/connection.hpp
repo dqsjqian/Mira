@@ -39,13 +39,18 @@
 #include "mira/http/parser.hpp"
 #include "mira/http/serializer.hpp"
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace Mira::http {
 
@@ -232,7 +237,211 @@ private:
     bool finished_{false};
 };
 
+/// Reads a request body incrementally while the handler runs.
+///
+/// The buffered path in `serve_connection` accumulates the whole body before
+/// the handler sees it, which is exactly right for JSON endpoints and exactly
+/// wrong for uploads: a handler that pipes bytes to disk, a proxy, or another
+/// endpoint should not need the whole body in memory to make progress. Give
+/// the handler a `RequestBodyReader` (by making its third parameter `auto&`
+/// and calling `read`) and the connection loop hands it the body slice by
+/// slice instead.
+///
+/// Ownership of the connection stays with `serve_connection`: the reader
+/// borrows the parser and the input buffer, so a request that outlives its
+/// handler is impossible by construction. Reads carry the request's own
+/// budget — the same deadline the response writes use — so a slow peer
+/// cannot outlive `request_timeout` by streaming a body slowly enough.
+template<BoundedStream Stream>
+class RequestBodyReader {
+public:
+    /// Pull the next slice of the body into `out`.
+    ///
+    /// Returns the number of bytes written; 0 means the body is fully
+    /// consumed (trailers, if any, have been parsed by then). A slice larger
+    /// than `out` is split transparently — the remainder is held and served
+    /// by the following call — so handlers can read with a small fixed
+    /// buffer regardless of what the network delivered.
+    ///
+    /// A protocol error (body over budget, malformed chunk) or a transport
+    /// error (EOF, timeout, cancellation) fails the read. The connection is
+    /// then untrustworthy: `serve_connection` closes it after the handler
+    /// returns.
+    [[nodiscard]] Task<Result<std::size_t>> read(std::span<std::byte> out) {
+        if (finished_) {
+            co_return std::size_t{0};
+        }
+        if (out.empty()) {
+            co_return fail(Errc::invalid_argument);
+        }
+        // Leftovers from a previous read come first: a slice larger than the
+        // caller's buffer was already split, and ordering must be preserved.
+        if (pending_pos_ < pending_.size()) {
+            const std::size_t n =
+                std::min(pending_.size() - pending_pos_, out.size());
+            std::memcpy(out.data(), pending_.data() + pending_pos_, n);
+            pending_pos_ += n;
+            if (pending_pos_ == pending_.size()) {
+                pending_.clear();
+                pending_pos_ = 0;
+            }
+            co_return n;
+        }
+        for (;;) {
+            const Result<ParseStep> step = parser_.parse(input_);
+            if (!step) {
+                finished_ = true;
+                last_error_ = step.error();
+                co_return fail(step.error());
+            }
+            switch (*step) {
+            case ParseStep::body: {
+                const std::span<const std::byte> slice = parser_.body();
+                if (slice.size() <= out.size()) {
+                    std::memcpy(out.data(), slice.data(), slice.size());
+                    co_return slice.size();
+                }
+                std::memcpy(out.data(), slice.data(), out.size());
+                pending_.assign(slice.begin() + static_cast<std::ptrdiff_t>(out.size()),
+                                slice.end());
+                pending_pos_ = 0;
+                co_return out.size();
+            }
+            case ParseStep::complete:
+                finished_ = true;
+                last_error_.reset();
+                co_return std::size_t{0};
+            case ParseStep::head:
+                continue;  // unreachable past the head, kept for symmetry
+            case ParseStep::need_more: {
+                if (parser_.done()) {
+                    finished_ = true;
+                    last_error_.reset();
+                    co_return std::size_t{0};
+                }
+                const std::span<std::byte> space = input_.prepare(read_chunk_);
+                Result<std::size_t> read = co_await stream_.read_some(space, io_);
+                if (!read) {
+                    input_.commit(0);
+                    finished_ = true;
+                    last_error_ = read.error();
+                    co_return fail(read.error());
+                }
+                input_.commit(*read);
+                if (*read == 0) {
+                    finished_ = true;
+                    last_error_ = make_error_code(Errc::eof);
+                    co_return fail(Errc::eof);
+                }
+                continue;
+            }
+            }
+        }
+    }
+
+    /// Read the whole body into one buffer.
+    ///
+    /// The parser's `max_body_size` is the real bound; this is the convenience
+    /// for handlers that genuinely want everything (a disk-backed spill point
+    /// being the memory-safe alternative for anything larger).
+    [[nodiscard]] Task<Result<std::vector<std::byte>>> read_all() {
+        std::vector<std::byte> out;
+        const auto& request = parser_.request();
+        if (request.body_kind == BodyKind::length &&
+            request.content_length <= parser_.limits().max_body_size) {
+            out.reserve(static_cast<std::size_t>(request.content_length));
+        }
+        std::array<std::byte, 8 * 1024> chunk{};
+        for (;;) {
+            Result<std::size_t> n = co_await read(chunk);
+            if (!n) {
+                co_return fail(n.error());
+            }
+            if (*n == 0) {
+                co_return out;
+            }
+            out.insert(out.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*n));
+        }
+    }
+
+    /// True once the body is fully consumed (or has failed).
+    [[nodiscard]] bool done() const noexcept { return finished_; }
+
+    /// Why the body stopped, when it stopped on an error rather than by
+    /// completing. Lets `serve_connection` tell a completed body from a
+    /// failed one after the handler returns.
+    [[nodiscard]] const std::optional<std::error_code>& last_error() const noexcept {
+        return last_error_;
+    }
+
+    /// Trailer fields of a chunked body; meaningful after a 0-byte read.
+    [[nodiscard]] const HeaderMap& trailers() const noexcept { return parser_.trailers(); }
+
+public:
+    RequestBodyReader(Stream& stream, Buffer& input, RequestParser& parser,
+                      OperationOptions io, std::size_t read_chunk)
+        : stream_(stream), input_(input), parser_(parser), io_(std::move(io)),
+          read_chunk_(read_chunk) {}
+
+    /// Drain whatever the handler left unread.
+    ///
+    /// The one rule the buffered path enforces by construction — the body is
+    /// always drained before the next request parses — has to be re-enforced
+    /// here, because a streaming handler may legitimately stop reading (a
+    /// 413 handler that saw `Content-Length: 10G` and refuses to pull it).
+    /// Bytes left in the stream would be parsed as the next request, which
+    /// is the keep-alive desync the connection loop exists to prevent.
+    ///
+    /// A reader that already failed keeps failing: `finished_` set by an
+    /// error is not the same as a completed body, and the connection must
+    /// not stay open just because the handler itself returned success.
+    [[nodiscard]] Task<Result<void>> drain() {
+        if (finished_ && last_error_) {
+            co_return fail(*last_error_);
+        }
+        std::array<std::byte, 8 * 1024> sink{};
+        while (!finished_) {
+            Result<std::size_t> n = co_await read(sink);
+            if (!n) {
+                co_return fail(n.error());
+            }
+            if (*n == 0) {
+                co_return Result<void>{};
+            }
+        }
+        if (last_error_) {
+            co_return fail(*last_error_);
+        }
+        co_return Result<void>{};
+    }
+
+    Stream& stream_;
+    Buffer& input_;
+    RequestParser& parser_;
+    OperationOptions io_;
+    std::size_t read_chunk_;
+    /// Remainder of a body slice that did not fit the caller's buffer, plus
+    /// a read cursor: `pending_.size() - pending_pos_` bytes are owed.
+    std::vector<std::byte> pending_{};
+    std::size_t pending_pos_{0};
+    bool finished_{false};
+    /// Why the body stopped, if it stopped on an error rather than by
+    /// completing. Set by `read`; consumed by `drain`.
+    std::optional<std::error_code> last_error_{};
+};
+
 namespace detail {
+
+/// Detects a handler that takes the buffered body: its third parameter is
+/// `std::span<const std::byte>` (or a reference to one). Any other callable
+/// third parameter gets the streaming reader — the typical signature is
+/// `auto&` accepting a `RequestBodyReader`.
+template<typename Handler, typename Stream>
+concept kHandlerWantsBuffer = requires(Handler handler, Stream& stream) {
+    handler(std::declval<const Request&>(), std::declval<ResponseWriter<Stream>&>(),
+            std::declval<std::span<const std::byte>>());
+};
+
 
 /// Send a minimal error response, used when a request cannot be understood.
 ///
@@ -258,6 +467,15 @@ Task<Result<void>> send_error(Stream& stream, unsigned status, OperationOptions 
 }  // namespace detail
 
 /// Serve requests on `stream` until the connection ends.
+///
+/// The handler decides how the request body arrives. A third parameter of
+/// `std::span<const std::byte>` gets the buffered path: the whole body is
+/// accumulated (up to the parser's `max_body_size`) before the handler runs,
+/// and `parser.body()` slices are appended as they parse. Any other callable
+/// third parameter gets a `RequestBodyReader` instead and pulls slices as it
+/// goes — the connection loop then guarantees the body is drained (or the
+/// connection dropped) before the next request parses, whichever way the
+/// handler stopped reading.
 ///
 /// Returns when the peer closes, a limit is reached, or the exchange decides to
 /// close. A protocol error is answered with a 4xx where possible and then ends
@@ -300,7 +518,15 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
                                                                     : options.idle_timeout)};
 
         // ── read and parse one request ──────────────────────────────────────
-        while (!head_ready || !body_drained) {
+        //
+        // The body phase belongs to whichever mode the handler chose. A
+        // buffered handler runs the loop until the message is complete, so
+        // the whole body is in memory before it is called. A streaming
+        // handler takes over at the head; its `RequestBodyReader` continues
+        // the same parser from exactly this state, and the drain after the
+        // handler closes whatever it left open.
+        constexpr bool buffered_mode = detail::kHandlerWantsBuffer<Handler, Stream>;
+        while (!head_ready || (buffered_mode && !body_drained)) {
             const Result<ParseStep> step = parser.parse(input);
             if (!step) {
                 // The request is malformed or over budget. Answer once with
@@ -314,26 +540,32 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
             switch (*step) {
             case ParseStep::head:
                 head_ready = true;
-                if (parser.request().body_kind == BodyKind::none) {
-                    body_drained = true;
-                } else if (parser.request().body_kind == BodyKind::length) {
-                    // The parser knows the declared size once the head is in;
-                    // reserving it up front turns the vector's doubling
-                    // growth (≈2× the body in copies for large uploads) into
-                    // one allocation plus the linear copies that are
-                    // structurally unavoidable (the input buffer rolls).
-                    // Clamped to the configured limit: a declared size beyond
-                    // it never gets read anyway, and reserving on a hostile
-                    // Content-Length would be a pre-read amplification.
-                    const std::uint64_t declared = parser.request().content_length;
-                    if (declared <= options.limits.max_body_size) {
-                        body.reserve(static_cast<std::size_t>(declared));
+                if constexpr (buffered_mode) {
+                    if (parser.request().body_kind == BodyKind::none) {
+                        body_drained = true;
+                    } else if (parser.request().body_kind == BodyKind::length) {
+                        // The parser knows the declared size once the head is
+                        // in; reserving it up front turns the vector's
+                        // doubling growth (≈2× the body in copies for large
+                        // uploads) into one allocation plus the linear copies
+                        // that are structurally unavoidable (the input buffer
+                        // rolls). Clamped to the configured limit: a declared
+                        // size beyond it never gets read anyway, and reserving
+                        // on a hostile Content-Length would be a pre-read
+                        // amplification. The streaming path skips this — the
+                        // handler owns buffering, not the loop.
+                        const std::uint64_t declared = parser.request().content_length;
+                        if (declared <= options.limits.max_body_size) {
+                            body.reserve(static_cast<std::size_t>(declared));
+                        }
                     }
                 }
                 break;
 
             case ParseStep::body:
-                body.append(parser.body());
+                if constexpr (buffered_mode) {
+                    body.append(parser.body());
+                }
                 break;
 
             case ParseStep::complete:
@@ -387,7 +619,6 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         // reading but not the responding would bound half an exchange.
         ResponseWriter<Stream> writer{stream, head_request, keep_alive, io};
 
-        Result<void> handled{};
         // A throwing handler is an internal error, not a protocol event: the
         // exception must not escape `serve_connection` (the caller's loop has
         // no idea what to do with a half-served connection) and must not be
@@ -397,27 +628,43 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         // the only honest option is to drop the connection. Either way the
         // caller gets `Errc::internal` rather than an exception it cannot
         // attribute to a connection.
-        bool handler_threw = false;
-        try {
-            handled = co_await handler(request, writer, body.readable());
-        } catch (...) {
-            // co_await is illegal inside a catch handler, so the 500 is sent
-            // after the handler — the flag carries the branch out.
-            handler_threw = true;
-        }
-        if (handler_threw) {
-            if (!writer.sent_head()) {
-                static_cast<void>(co_await detail::send_error(stream, 500, io));
+        auto run_handler = [&](auto&& body_argument) -> Task<Result<void>> {
+            try {
+                co_return co_await handler(request, writer, body_argument);
+            } catch (...) {
+                // co_await is illegal inside a catch handler, so the 500 is
+                // sent after the handler — the flag carries the branch out.
+                co_return fail(Errc::internal);
             }
-            co_return fail(Errc::internal);
+        };
+
+        Result<void> handled{};
+        if constexpr (detail::kHandlerWantsBuffer<Handler, Stream>) {
+            handled = co_await run_handler(body.readable());
+        } else {
+            RequestBodyReader<Stream> reader{stream, input, parser, io, options.read_chunk};
+            handled = co_await run_handler(reader);
+            // The streaming contract's other half: whatever the handler left
+            // unread is drained here (bounded by `limits`, failures included)
+            // so the next request starts from trustworthy framing. A drain
+            // that itself fails means the connection is already unusable —
+            // and a reader that stopped on an error keeps failing here even
+            // though the handler itself returned success.
+            if (handled && (!reader.done() || reader.last_error().has_value())) {
+                Result<void> drained = co_await reader.drain();
+                if (!drained) {
+                    handled = fail(drained.error());
+                }
+            }
+        }
+        if (!handled && !writer.sent_head()) {
+            // Nothing on the wire yet: a 500 is still possible. The catch-all
+            // flag and the Result failure path converge here.
+            static_cast<void>(co_await detail::send_error(stream, 500, io));
         }
         if (!handled) {
-            // The handler failed before writing anything: a 500 is still
-            // possible. If it already sent a head, the only honest option is
-            // to close, because the response is half-written.
-            if (!writer.sent_head()) {
-                static_cast<void>(co_await detail::send_error(stream, 500, io));
-            }
+            // A head already sent means the response is half-written; the
+            // only honest option is to close.
             co_return fail(handled.error());
         }
 
