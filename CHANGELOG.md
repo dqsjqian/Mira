@@ -32,6 +32,18 @@ version is 0, the minor version is where breaking changes land: a request for
   throwing HTTP handler) is reported as `internal` instead of escaping the
   connection loop. `serve_connection` answers 500 when nothing was sent and
   drops the connection when a head is already on the wire.
+- `quic::Bytes` is `std::vector<std::byte>`: the wire surfaces (engine
+  accept/receive/write, HTTP/3 request/respond and connection serve/write)
+  speak the library-wide byte type; the C API boundaries (ngtcp2/nghttp3)
+  reinterpret inside the engines' own translation units only.
+- HTTP/2 and HTTP/3 share one header-list type (`http2/headers.hpp`): HPACK
+  and QPACK compress the same field-section semantics, so `http3::Header` is
+  `http2::Header` instead of a pair of strings. Limits stay per-protocol.
+- Destroying a `tls::Stream` with an operation still in flight terminates
+  with a diagnosis instead of leaving the borrowed state dangling silently —
+  the same contract `Task` already carries.
+- Response/request head serialisation reserves its total size up front
+  instead of growing through a dozen reallocations on the way.
 
 ### Fixed
 

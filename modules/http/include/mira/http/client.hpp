@@ -5,6 +5,8 @@
 #include "mira/http/serializer.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 namespace Mira::http {
 
@@ -30,6 +32,17 @@ public:
         : stream_(&stream), options_(options), parser_(Method::get, options.limits) {}
     ClientConnection(const ClientConnection&) = delete;
     ClientConnection& operator=(const ClientConnection&) = delete;
+    ~ClientConnection() {
+        // The class documents "stream 和本对象必须活到全部任务完成" as a
+        // borrow contract; dying mid-exchange means the in-flight coroutine
+        // owns a parser and a stream pointer that are about to evaporate.
+        // Terminate with a diagnosis, matching the library-wide contract
+        // style (Task, tls::Stream) instead of dangling silently.
+        if (busy_ || active_) {
+            std::fputs("Mira: http::ClientConnection destroyed mid-exchange\n", stderr);
+            std::abort();
+        }
+    }
 
     /// request 和 body 必须活到此任务完成；返回时最终响应头可用，但 body 尚未读取完。
     [[nodiscard]] Task<Result<void>>

@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <utility>
 
@@ -39,7 +41,17 @@ public:
     Stream& operator=(Stream&&) noexcept = default;
     Stream(const Stream&) = delete;
     Stream& operator=(const Stream&) = delete;
-    ~Stream() = default;
+    /// 断言即契约：析构时仍有未完成操作意味着协程帧里还挂着对 State 的
+    /// 借用，继续运行就是 use-after-free。与其无声 UB，不如当场诊断终止
+    /// ——与 Task 析构契约同款（std::thread 的 join 契约亦是如此）。
+    ~Stream() {
+        if (state_ && state_->active.test(std::memory_order_acquire)) {
+            std::fprintf(stderr,
+                         "Mira::tls::Stream destroyed with an operation still in flight; "
+                         "await (or destroy) the pending Task before destroying the Stream.\n");
+            std::terminate();
+        }
+    }
 
     [[nodiscard]] Task<Result<void>> handshake(OperationOptions options = {}) {
         return run_void(state_.get(), Operation::handshake, std::move(options));

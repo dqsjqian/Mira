@@ -119,6 +119,12 @@ struct TaskPromise final : TaskPromiseBase {
     void unhandled_exception() noexcept { failure = std::current_exception(); }
 
     /// Hand the result to the awaiter, rethrowing a body exception if any.
+    ///
+    /// The returned reference is bound into the promise's `optional`; the
+    /// task frame is destroyed as soon as the awaiting expression finishes
+    /// (Awaiter/FrameGuard). Consume the value inside that same full
+    /// expression — `auto value = co_await task;` moves it out, while
+    /// binding `T&` or `auto&&` to the result and reading it later dangles.
     T&& result() && {
         if (failure) {
             std::rethrow_exception(failure);

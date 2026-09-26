@@ -129,6 +129,15 @@ Result<void> write_response_head(Buffer& out,
         }
     }
 
+    // One reserve up front beats a dozen growth reallocations on the way to
+    // a typical head; the estimate errs high by a few bytes, which is
+    // cheaper than guessing low and growing mid-append.
+    std::size_t estimated = 32 + response.reason.size() + 32;
+    for (const auto& [name, value] : response.headers) {
+        estimated += name.size() + value.size() + 4;
+    }
+    out.reserve(out.size() + estimated);
+
     // status-line = HTTP-version SP status-code SP [ reason-phrase ]
     append(out, to_string(response.version));
     append(out, " ");
@@ -278,6 +287,10 @@ Result<void> write_request_head(Buffer& out, const Request& request,
     if (framing.size() > limits.max_header_line || framing.size() > limits.max_headers_total - total) {
         return fail(Errc::limit_exceeded);
     }
+    // One reserve up front: method + target + version line, every header
+    // line (name + ": " + value + CRLF), plus framing and the final CRLF.
+    out.reserve(out.size() + method.size() + request.target.size() + 32 +
+                total + request.headers.size() * 4 + framing.size() + 4);
     append(out, method); append(out, " "); append(out, request.target);
     append(out, " "); append(out, to_string(request.version)); append(out, "\r\n");
     for (const auto& [name, value] : request.headers) {
