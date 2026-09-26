@@ -105,7 +105,8 @@ def check_file_server(executable: str, use_curl: bool) -> None:
             # 4. curl interop: the external-client evidence.
             if use_curl:
                 curl = subprocess.run(
-                    ["curl", "-fsS", f"http://127.0.0.1:{port}/blob.bin", "-o", "/dev/null",
+                    ["curl", "-fsS", f"http://127.0.0.1:{port}/blob.bin",
+                     "-o", os.devnull,
                      "-w", "%{http_code} %{size_download}"],
                     capture_output=True, text=True, timeout=TIMEOUT,
                 )
