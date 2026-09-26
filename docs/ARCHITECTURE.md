@@ -34,10 +34,10 @@ and remaining acceptance work must be described separately.
 |---|---|---|
 | Execution and ownership | Lazy, move-only `Task` that terminates rather than destroy a started, unfinished frame; single-threaded `TaskScope` with immediate spawn and one-shot join; executor seam; single-threaded `EventLoop` whose operations carry never-reused identities | Explicit operation/buffer ownership across layers and continued join/drain validation; loop destruction during dispatch is refused rather than supported |
 | Cancellation and deadlines | `OperationOptions` on every core operation, forwarded through TCP, TLS and the HTTP connection loop; `BoundedStream` distinguishes streams that can honour it; HTTP converts `idle_timeout` / `request_timeout` into a fresh deadline per request | Runtime evidence on Windows, where the IOCP semantics rest on CI alone; a cancelled IOCP read may lose bytes, so that connection must be closed; `stop()` is still a stop-pumping request, not I/O cancellation |
-| Transport and composition | TCP and completion-shaped kqueue/epoll/IOCP implementations; stream concepts | Equivalent observable semantics across backends, verified teardown, bounded queues; datagram contracts before UDP expansion |
-| Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered request bodies | Protocol conformance evidence, streamed bodies, slow-consumer backpressure and bounded aggregate memory |
+| Transport and composition | TCP and completion-shaped kqueue/epoll/IOCP implementations; stream concepts; message-preserving UDP datagrams with cancellation/deadline support | Equivalent observable semantics across backends, verified teardown, bounded queues; datagram contract formalized as a core concept before further UDP-based modules build on it |
+| Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered and streaming request bodies (`RequestBodyReader`), chunked trailers, connection-loop drain guarantees; parser fuzzing in CI | Protocol conformance evidence, slow-consumer backpressure bounds and bounded aggregate memory measurements |
 | Security and robustness | Optional OpenSSL TLS stream, parser limits and negative-input tests | Lifecycle-safe TLS cancellation, broader fuzzing, failure injection and resource-exhaustion tests |
-| Engineering evidence | C++23-only build, desktop runtime CI and mobile cross-compilation jobs exist; last confirmed passing desktop baseline is `eddfddb` | Fresh validation of current scope/task/yield changes, mobile runtime evidence, reproducible interop/performance/resource measurements; no current stable ABI promise |
+| Engineering evidence | C++23-only build, desktop runtime CI and mobile cross-compilation jobs exist; last confirmed passing desktop baseline is `9f91060` | Fresh validation of current streaming/fuzz changes, mobile runtime evidence, reproducible interop/performance/resource measurements; no current stable ABI promise |
 
 Rejecting ambiguous or malformed input is part of protocol correctness, not a
 substitute for the other contracts. The HTTP parser rejects conflicting
@@ -144,10 +144,12 @@ time, and by the time it hurts, the fix is a rewrite.
 ### TCP and UDP are transport, not "more protocols"
 
 TCP and UDP belong to the transport layer, not a checklist of HTTP features.
-TCP currently supplies stream connections. UDP remains unimplemented and needs
-a distinct datagram contract rather than a stream-shaped wrapper. DNS and QUIC
-are examples of protocols that may use datagrams; their requirements must not
-be imposed on the TCP API or treated as existing functionality.
+TCP supplies stream connections. UDP supplies message-preserving datagrams
+(`transport::udp::Socket`: completion-shaped send/receive with cancellation
+and deadlines, truncation reported rather than silently clipped); it is a
+datagram contract, not a stream-shaped wrapper. DNS and QUIC are examples of
+protocols that may use datagrams; their requirements must not be imposed on
+the TCP API or treated as existing functionality.
 
 ## Core seams
 
@@ -197,10 +199,15 @@ waits can stop waiting, so a wrapper cannot supply the capability on behalf of
 a stream that lacks it. Handing a budget to a stream that cannot honour it is
 therefore a compile error, not a deadline that silently does nothing.
 
-An asynchronous byte stream is not the same as a streamed HTTP body. Request
-bodies are currently buffered before handler delivery. End-to-end streaming
-must additionally define buffer ownership, incremental consumption, early
-termination and the way slow consumers suspend producers.
+An asynchronous byte stream is not the same as a streamed HTTP body. A
+handler chooses the delivery shape: a `std::span<const std::byte>` third
+parameter gets the buffered body byte-for-byte as before, while any other
+callable receives a `RequestBodyReader` and pulls slices while it runs —
+chunked trailers included, the connection loop draining what the handler
+left unread (or dropping the connection when the drain fails). End-to-end
+streaming still leaves open buffer ownership across protocol layers and the
+way slow consumers suspend producers; those are measured contracts, not
+delivered ones.
 
 ### `TaskScope` — implemented single-threaded child ownership
 
@@ -492,11 +499,13 @@ configuration; the historical milestones below do not certify these gates.
    repeated cancellation and simultaneous completion. Require exactly-once
    completion and no dangling kernel buffers, resumptions or resource leaks
    across kqueue, epoll and IOCP, using applicable sanitizers and fault injection.
-3. **Bounded composable data flow.** Add incremental body consumption and
-   explicit producer/consumer limits. Verify short transfers, partial failures,
+3. **Bounded composable data flow.** Incremental body consumption is delivered
+   (`RequestBodyReader`); the open half is producer/consumer limits. Verify
+   short transfers, partial failures,
    early termination and slow peers over memory streams, TCP and TLS; measure
-   peak memory and outstanding work against configured bounds. Define separate
-   datagram semantics before introducing UDP-based modules.
+   peak memory and outstanding work against configured bounds. Datagram
+   semantics are defined and delivered; UDP-based modules now owe conformance
+   evidence against them, not a definition.
 4. **Cross-platform and protocol correctness.** Run protocol negative cases,
    fuzzing and interoperability checks; test normalized error/EOF/cancel/close
    outcomes on each desktop backend. Obtain mobile runtime evidence before
@@ -639,9 +648,10 @@ it. This foundation is neither production-readiness nor a complete
 cancellation-safety claim.
 
 **Remaining work, not a phase-one scope exemption.** UDP, asynchronous system
-resolution, HTTP/1 client and HTTP/2 engines now exist; QUIC/HTTP3 are experimental.
-The current implementation still lacks complete request-body streaming, a QUIC
-UDP scheduling entry point, independent H2/H3 interoperability and full platform
+resolution, HTTP/1 client, HTTP/2 engines and request-body streaming now
+exist; QUIC/HTTP3 are experimental. The current implementation still lacks a
+QUIC UDP scheduling entry point, independent H2/H3 interoperability and full
+platform
 acceptance. Routing, native OS trust-store integration, end-to-end resource
 bounds and multi-threaded loops also remain incomplete; mTLS policy is now
 available on `tls::Context` but native OS trust-store integration is still open.
