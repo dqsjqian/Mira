@@ -149,17 +149,21 @@ static void test_streaming_chunked_body_with_trailers() {
 
     std::string collected;
     bool has_trailer = false;
-    std::string_view trailer_value;
+    std::string trailer_value;
     auto handler = [&](const http::Request&, auto&, auto& reader) -> Task<Result<void>> {
         std::array<std::byte, 64> chunk{};
         for (;;) {
             Result<std::size_t> n = co_await reader.read(chunk);
             if (!n) co_return fail(n.error());
             if (*n == 0) {
+                // The trailers borrow the parser's storage, which dies with
+                // serve_connection; copy the value out while it is alive.
                 const auto& trailers = reader.trailers();
                 const auto found = trailers.get("x-sum");
                 has_trailer = found.has_value();
-                trailer_value = has_trailer ? std::string_view{*found} : std::string_view{};
+                if (has_trailer) {
+                    trailer_value = *found;
+                }
                 break;
             }
             collected.append(reinterpret_cast<const char*>(chunk.data()), *n);

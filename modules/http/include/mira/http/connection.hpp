@@ -375,6 +375,10 @@ public:
     }
 
     /// Trailer fields of a chunked body; meaningful after a 0-byte read.
+    ///
+    /// The view borrows the connection's parser: it dies with
+    /// `serve_connection` (or the next request on the same connection). Copy
+    /// a value out while the reader is alive if it must outlive the request.
     [[nodiscard]] const HeaderMap& trailers() const noexcept { return parser_.trailers(); }
 
 public:

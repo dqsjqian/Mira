@@ -1,5 +1,6 @@
 # Build trees
 build/
+build-*/
 cmake-build-*/
 
 # Compiler / tooling artefacts

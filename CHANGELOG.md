@@ -79,6 +79,21 @@ version is 0, the minor version is where breaking changes land: a request for
 
 ### Fixed
 
+- `RequestBodyReader::trailers()` is documented as borrowing the connection's
+  parser: the view dies with `serve_connection` (or moves on with the next
+  request), so values that must outlive the request need copying out — the
+  streaming test itself tripped on this, and its ASan build now copies before
+  the connection ends.
+- The CI fuzz job builds with libc++: Ubuntu's clang pairs with a system
+  libstdc++ that lacks `std::expected`, which made `Result<T>` vanish and
+  every core TU fail. `-stdlib=libc++` (plus `libc++-dev`) gives the harness
+  a complete C++23 library; the fuzz harness also includes `<cstdlib>` for
+  `std::abort`, which libc++ does not drag in transitively.
+- `bench/CMakeLists.txt` no longer requires nghttp2: a bare
+  `cmake -DMIRA_BUILD_BENCH=ON` used to die at generate time because
+  `bench_h2_roundtrip` linked `Mira::http2` unconditionally. The bench set
+  degrades to the HTTP/1.1 scenarios with a note pointing at
+  `tools/bench/run.sh`.
 - QUIC/HTTP/3 pump loops no longer mistake the caller's expired deadline for
   the engine timer: the operation now fails with `timed_out` instead of
   spinning the loop thread on a silent peer.

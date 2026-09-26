@@ -136,13 +136,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install clang
-        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Install clang and libc++
+        run: sudo apt-get update && sudo apt-get install -y clang libc++-dev libc++abi-dev
       - name: Configure with libFuzzer
         run: >
           cmake -S . -B build/fuzz -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_CXX_COMPILER=clang++
-          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -stdlib=libc++"
           -DMIRA_BUILD_FUZZERS=ON
       - name: Build
         run: cmake --build build/fuzz --parallel
