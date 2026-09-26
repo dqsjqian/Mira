@@ -136,26 +136,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install clang 19 and libc++
-        # Not Ubuntu's default clang-18: paired with libc++-18 it fails on
-        # <stop_token> of all things (CI-proven). clang-19 is what the
-        # epoll-clang job already validates, straight from noble's own repo.
-        run: >
-          sudo apt-get update &&
-          sudo apt-get install -y clang-19 libc++-19-dev libc++abi-19-dev
+      - name: Install clang 19
+        # clang-19 minimum on Linux (see the epoll-clang entry in build). No
+        # -stdlib=libc++: LLVM 19's libc++ still hides std::stop_token behind
+        # _LIBCPP_HAS_NO_EXPERIMENTAL_STOP_TOKEN (CI-proven with both 18 and
+        # 19; the android job describes the same gate), while libstdc++ ships
+        # the complete library — exactly what epoll-clang already validates.
+        run: sudo apt-get update && sudo apt-get install -y clang-19
       - name: Configure with libFuzzer
         run: >
           cmake -S . -B build/fuzz -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_CXX_COMPILER=clang++-19
-          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -stdlib=libc++"
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"
           -DMIRA_BUILD_FUZZERS=ON
       - name: Build
         run: cmake --build build/fuzz --parallel
-      - name: Smoke fuzz (60s cap)
+      - name: Smoke fuzz (60s cap per harness)
         run: >
           ./build/fuzz/fuzz/fuzz_http_parser
           -max_total_time=60 -max_len=1024 -rss_limit_mb=2560
-          fuzz/corpus/http_parser
+          fuzz/corpus/http_parser &&
+          ./build/fuzz/fuzz/fuzz_response_parser
+          -max_total_time=60 -max_len=1024 -rss_limit_mb=2560
+          fuzz/corpus/response_parser
 
   # Optional protocol engines (nghttp2 / ngtcp2 / nghttp3) with their
   # dependencies built from pinned, hash-verified sources by the same

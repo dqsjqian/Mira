@@ -76,6 +76,12 @@ version is 0, the minor version is where breaking changes land: a request for
 - libFuzzer harnesses land under `fuzz/` (opt-in via `MIRA_BUILD_FUZZERS`,
   clang): the request parser is fuzzed across arbitrary chunk boundaries with
   seed corpus covering smuggling shapes. CI runs a short smoke pass on Linux.
+- The response parser gets the same treatment — `fuzz_response_parser` —
+  because a client parsing an untrusted server's bytes is the same class of
+  hazard as a server parsing an untrusted client's. The harness exercises
+  the documented 1xx reset loop, HEAD/CONNECT body rules and close-delimited
+  framing; its minimized seed corpus (383 inputs) replays in CI alongside
+  the request harness, 60s cap each.
 
 ### Fixed
 

@@ -23,3 +23,10 @@ target_link_libraries(fuzz_http_parser
 target_compile_features(fuzz_http_parser PRIVATE cxx_std_23)
 target_compile_options(fuzz_http_parser PRIVATE -fsanitize=fuzzer)
 target_link_options(fuzz_http_parser PRIVATE -fsanitize=fuzzer)
+
+add_executable(fuzz_response_parser response_parser.cpp)
+target_link_libraries(fuzz_response_parser
+    PRIVATE Mira::http Mira::warnings)
+target_compile_features(fuzz_response_parser PRIVATE cxx_std_23)
+target_compile_options(fuzz_response_parser PRIVATE -fsanitize=fuzzer)
+target_link_options(fuzz_response_parser PRIVATE -fsanitize=fuzzer)
