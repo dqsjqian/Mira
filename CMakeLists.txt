@@ -83,14 +83,21 @@ function(mira_install_module target)
         return()
     endif()
 
+    # Export-set 名字与目标一一对应，用映射表而非 if/elseif 阶梯：
+    # 新模块接入只需加一行 "target=exportSet"，不再多一条分支。
     set(export_set miraTargets)
-    if(target STREQUAL "mira_tls")
-        set(export_set miraTlsTargets)
-    elseif(target STREQUAL "mira_http2")
-        set(export_set miraHttp2Targets)
-    elseif(target STREQUAL "mira_quic" OR target STREQUAL "mira_http3")
-        set(export_set miraHttp3Targets)
-    endif()
+    foreach(entry
+            "mira_tls=miraTlsTargets"
+            "mira_http2=miraHttp2Targets"
+            "mira_quic=miraHttp3Targets"
+            "mira_http3=miraHttp3Targets")
+        string(REPLACE "=" ";" pair "${entry}")
+        list(GET pair 0 mapped_target)
+        list(GET pair 1 mapped_set)
+        if(target STREQUAL "${mapped_target}")
+            set(export_set "${mapped_set}")
+        endif()
+    endforeach()
     install(TARGETS ${target}
         EXPORT ${export_set}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -129,6 +136,14 @@ endif()
 if(MIRA_ENABLE_HTTP3)
     add_subdirectory(modules/quic)
     add_subdirectory(modules/http3)
+endif()
+
+# ── Benchmarks ──────────────────────────────────────────────────────────────
+# The bench gate lives in bench/CMakeLists.txt; it needs the option declared
+# here so `cmake -DMIRA_BUILD_BENCH=ON` is visible before the subdirectory.
+option(MIRA_BUILD_BENCH "Build Mira's in-process benchmarks" OFF)
+if(MIRA_BUILD_BENCH)
+    add_subdirectory(bench)
 endif()
 
 # ── Examples ────────────────────────────────────────────────────────────────

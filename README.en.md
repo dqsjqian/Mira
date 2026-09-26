@@ -260,7 +260,7 @@ Android requires **NDK 29 or newer**: NDK 27/28's libc++ gates `std::stop_token`
 
 1. **End-to-end resource contracts**: streaming request bodies, slow-consumer backpressure, connection- and process-level memory caps
 2. **Deepen run coverage on every platform**: more real-machine run verification of cancellation semantics
-3. **Evidence-backed expansion**: cross-platform negative tests, fuzzing, interop, and reproducible benchmarks
+3. **Evidence-backed expansion**: cross-platform negative tests, fuzzing, interop; in-process benchmarks now ship with the library (`bench/`, reproduce via `tools/bench/run.sh`), with more scenarios to come
 
 See the [architecture document](docs/ARCHITECTURE.md) for design rationale and acceptance criteria.
 

@@ -64,6 +64,17 @@ public:
     using Entry = std::pair<std::string, std::string>;
 
     void append(std::string name, std::string value) {
+        if (!spare_.empty()) {
+            // Move the pooled entry's strings back into service: moving out
+            // of a string keeps its heap buffer, so a name/value of similar
+            // size reuses the allocation instead of making a new one.
+            auto& reused = spare_.back();
+            entries_.emplace_back(std::move(reused.first), std::move(reused.second));
+            spare_.pop_back();
+            entries_.back().first = std::move(name);
+            entries_.back().second = std::move(value);
+            return;
+        }
         entries_.emplace_back(std::move(name), std::move(value));
     }
 
@@ -84,13 +95,29 @@ public:
     [[nodiscard]] auto begin() const noexcept { return entries_.begin(); }
     [[nodiscard]] auto end() const noexcept { return entries_.end(); }
 
-    void clear() noexcept { entries_.clear(); }
+    /// Reset for reuse without paying for the capacity again.
+    ///
+    /// A server parses thousands of requests into one `Request` object;
+    /// `entries_.clear()` alone throws away every header string's heap
+    /// buffer, so the next request re-allocates from zero — exactly the
+    /// realloc churn keep-alive serving exists to avoid. Drained entries go
+    /// to a spare pool and `append` reuses the last one, moving the old
+    /// contents out (which leaves the string's capacity intact) before
+    /// storing the new value.
+    void clear() {
+        spare_ = std::move(entries_);
+        entries_.clear();
+    }
 
     /// Case-insensitive comparison of two field names.
     [[nodiscard]] static bool names_equal(std::string_view a, std::string_view b) noexcept;
 
 private:
     std::vector<Entry> entries_{};
+    /// Drained entries kept for capacity reuse across `clear()` cycles.
+    /// Only the most recent drain is kept: one message's worth of headers,
+    /// bounded, and the common cadence is clear-then-fill-anyway.
+    std::vector<Entry> spare_{};
 };
 
 /// How a message body is delimited, decided from the headers per RFC 9112 §6.

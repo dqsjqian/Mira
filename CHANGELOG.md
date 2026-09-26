@@ -42,8 +42,19 @@ version is 0, the minor version is where breaking changes land: a request for
 - Destroying a `tls::Stream` with an operation still in flight terminates
   with a diagnosis instead of leaving the borrowed state dangling silently —
   the same contract `Task` already carries.
+- Destroying an `http2::Connection` with an operation still in flight aborts
+  with a diagnosis, and overlapping `flush`/`read`/`pump` on one connection
+  fails with `invalid_argument` instead of corrupting the session — the same
+  borrow contract as `tls::Stream` and `http::ClientConnection`.
+- Reusing a parsed `Request`/`Response` keeps header-string capacity:
+  `HeaderMap::clear` drains entries into a bounded spare pool that `append`
+  reuses, so keep-alive serving stops reallocating every header on every
+  request.
 - Response/request head serialisation reserves its total size up front
   instead of growing through a dozen reallocations on the way.
+- In-process benchmarks land under `bench/` (opt-in via `MIRA_BUILD_BENCH`):
+  HTTP/1.1 keep-alive small responses and HTTP/2 concurrent streams, with
+  the blessed invocation pinned in `tools/bench/run.sh`.
 
 ### Fixed
 

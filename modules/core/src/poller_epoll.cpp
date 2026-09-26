@@ -1,9 +1,9 @@
 // epoll readiness backend (Linux, Android).
 //
-// Not exercised on the author's machine (macOS); CI's Linux jobs are the only
-// thing that validates this file, which is why it stays a straight
-// transliteration of the kqueue backend rather than growing Linux-specific
-// cleverness.
+// Exercised for real: the author's Linux container runs this backend through
+// the full test suite (and the h1/h2 benchmarks) on every pass, and CI's
+// Linux jobs do the same. It stays a close sibling of the kqueue backend —
+// the two event models differ in register/unregister shape only.
 
 #include "mira/core/platform.hpp"
 
