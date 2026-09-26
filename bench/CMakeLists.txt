@@ -20,15 +20,23 @@ if(NOT MIRA_BUILD_BENCH)
     return()
 endif()
 
+# bench_h2_roundtrip needs nghttp2; without it the bench set degrades to the
+# HTTP/1.1 scenarios with a note, rather than failing the whole configure.
+if(NOT TARGET Mira::http2)
+    message(STATUS
+        "Mira bench: MIRA_ENABLE_HTTP2 is off — skipping bench_h2_roundtrip "
+        "(tools/bench/run.sh configures it for you)")
+else()
+    add_executable(bench_h2_roundtrip h2_roundtrip.cpp)
+    target_link_libraries(bench_h2_roundtrip
+        PRIVATE Mira::transport Mira::http2 Mira::warnings)
+    target_compile_features(bench_h2_roundtrip PRIVATE cxx_std_23)
+endif()
+
 add_executable(bench_h1_keepalive h1_keepalive.cpp)
 target_link_libraries(bench_h1_keepalive
     PRIVATE Mira::transport Mira::http Mira::warnings)
 target_compile_features(bench_h1_keepalive PRIVATE cxx_std_23)
-
-add_executable(bench_h2_roundtrip h2_roundtrip.cpp)
-target_link_libraries(bench_h2_roundtrip
-    PRIVATE Mira::transport Mira::http2 Mira::warnings)
-target_compile_features(bench_h2_roundtrip PRIVATE cxx_std_23)
 
 add_executable(bench_h1_churn h1_churn.cpp)
 target_link_libraries(bench_h1_churn
