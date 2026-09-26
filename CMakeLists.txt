@@ -156,6 +156,12 @@ if(MIRA_BUILD_EXAMPLES)
     add_executable(mira_echo_server examples/echo_server.cpp)
     target_link_libraries(mira_echo_server PRIVATE Mira::transport Mira::warnings)
 
+    add_executable(mira_hello_world_server examples/hello_world_server.cpp)
+    target_link_libraries(mira_hello_world_server PRIVATE Mira::http Mira::transport Mira::warnings)
+
+    add_executable(mira_tiny_file_server examples/tiny_file_server.cpp)
+    target_link_libraries(mira_tiny_file_server PRIVATE Mira::http Mira::transport Mira::warnings)
+
     if(MIRA_BUILD_TESTS)
         find_package(Python3 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
@@ -165,6 +171,18 @@ if(MIRA_BUILD_EXAMPLES)
                     $<TARGET_FILE:mira_echo_server>
             )
             set_tests_properties(mira_echo_example PROPERTIES TIMEOUT 90)
+            add_test(NAME mira_hello_world_example
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_hello_world_example.py
+                    $<TARGET_FILE:mira_hello_world_server>
+            )
+            set_tests_properties(mira_hello_world_example PROPERTIES TIMEOUT 90)
+            add_test(NAME mira_tiny_file_server_example
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_tiny_file_server.py
+                    $<TARGET_FILE:mira_tiny_file_server>
+            )
+            set_tests_properties(mira_tiny_file_server_example PROPERTIES TIMEOUT 120)
         endif()
     endif()
 endif()

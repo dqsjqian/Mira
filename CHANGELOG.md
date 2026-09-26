@@ -82,6 +82,14 @@ version is 0, the minor version is where breaking changes land: a request for
   the documented 1xx reset loop, HEAD/CONNECT body rules and close-delimited
   framing; its minimized seed corpus (383 inputs) replays in CI alongside
   the request harness, 60s cap each.
+- The examples directory earns its name: `hello_world_server` (the
+  three-step minimum — accept, `serve_connection`, `run_until_complete`)
+  and `tiny_file_server` (streaming both directions: uploads via
+  `RequestBodyReader` to disk, downloads via chunked `send_head_chunked` /
+  `write` / `finish`, directory listing, traversal refusal, a MIME table).
+  Both ship with out-of-process smoke tests, and the file server's test
+  includes real curl interop — an external client against Mira's stack,
+  byte-compared, since that is the claim "HTTP server" makes.
 
 ### Fixed
 
