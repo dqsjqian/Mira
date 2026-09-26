@@ -1284,7 +1284,8 @@ void test_moved_from_loop_operations_fail_cleanly() {
     EventLoop moved{std::move(created.value())};
 
     HandlePair pair;
-    NativeHandle handle = pair.valid() ? pair.first() : NativeHandle{-1};
+    NativeHandle handle = pair.valid() ? pair.first()
+                                       : static_cast<NativeHandle>(-1);
 
     std::array<std::byte, 16> scratch{};
 
@@ -1316,6 +1317,7 @@ void test_moved_from_loop_operations_fail_cleanly() {
     CHECK(!sleep_outcome.has_value());
     CHECK(sleep_outcome.error() == Errc::cancelled);
 
+#if MIRA_HAS_READINESS_API
     Result<void> wait_outcome = Result<void>{};
     {
         struct Probe {
@@ -1328,6 +1330,7 @@ void test_moved_from_loop_operations_fail_cleanly() {
     }
     CHECK(!wait_outcome.has_value());
     CHECK(wait_outcome.error() == Errc::cancelled);
+#endif  // MIRA_HAS_READINESS_API
 
     Result<void> yield_outcome = Result<void>{};
     {
