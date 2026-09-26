@@ -136,14 +136,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install clang and libc++
+      - name: Install clang 19 and libc++
+        # Not Ubuntu's default clang-18: paired with libc++-18 it fails on
+        # <stop_token> of all things (CI-proven). clang-19 is what the
+        # epoll-clang job already validates, straight from noble's own repo.
         run: >
-          sudo apt-get update && sudo apt-get install -y clang-18 libc++-18-dev
-          libc++abi-18-dev
+          sudo apt-get update &&
+          sudo apt-get install -y clang-19 libc++-19-dev libc++abi-19-dev
       - name: Configure with libFuzzer
         run: >
           cmake -S . -B build/fuzz -DCMAKE_BUILD_TYPE=Debug
-          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCMAKE_CXX_COMPILER=clang++-19
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -stdlib=libc++"
           -DMIRA_BUILD_FUZZERS=ON
       - name: Build
