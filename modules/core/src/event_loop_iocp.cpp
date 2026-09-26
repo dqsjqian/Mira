@@ -201,7 +201,7 @@ public:
 
         std::vector<std::pair<detail::OperationId, Error>> orphans;
         std::vector<std::pair<SOCKET, OVERLAPPED*>> to_cancel;
-        std::vector<std::move_only_function<void()>> discarded_work;
+        std::vector<move_only_function<void()>> discarded_work;
         std::size_t kernel_backed = 0;
         {
             const std::lock_guard lock{mutex_};
@@ -655,7 +655,7 @@ public:
         }
     }
 
-    [[nodiscard]] Result<void> post(std::move_only_function<void()> work) {
+    [[nodiscard]] Result<void> post(move_only_function<void()> work) {
         {
             const std::lock_guard lock{mutex_};
             if (shutting_down()) {
@@ -1076,7 +1076,7 @@ private:
     std::vector<std::pair<detail::OperationId, Result<std::size_t>>> resolved_{};
     std::vector<detail::TimerTarget> expired_{};
     std::vector<detail::OperationId> cancels_{};
-    std::vector<std::move_only_function<void()>> to_run_{};
+    std::vector<move_only_function<void()>> to_run_{};
 
     LPFN_ACCEPTEX accept_ex_{nullptr};
     LPFN_CONNECTEX connect_ex_{nullptr};
@@ -1127,7 +1127,7 @@ void EventLoop::detach(NativeHandle handle) {
     impl_->detach(handle);
 }
 
-void EventLoop::post(std::move_only_function<void()> work) {
+void EventLoop::post(move_only_function<void()> work) {
     (void)impl_->post(std::move(work));
 }
 void EventLoop::stop() {

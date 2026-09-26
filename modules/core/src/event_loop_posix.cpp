@@ -126,7 +126,7 @@ public:
         }
 
         std::vector<detail::OperationId> orphans;
-        std::vector<std::move_only_function<void()>> discarded_work;
+        std::vector<move_only_function<void()>> discarded_work;
         {
             const std::lock_guard lock{mutex_};
             orphans.reserve(operations_.size());
@@ -319,7 +319,7 @@ public:
         wake();
     }
 
-    void post(std::move_only_function<void()> work) {
+    void post(move_only_function<void()> work) {
         {
             const std::lock_guard lock{mutex_};
             if (shutting_down()) return;
@@ -675,7 +675,7 @@ private:
     // Members rather than locals so a high event rate does not pay five
     // heap allocations per loop turn; see the comment at their use site.
     std::vector<std::pair<detail::OperationId, Result<void>>> resolved_{};
-    std::vector<std::move_only_function<void()>> to_run_{};
+    std::vector<move_only_function<void()>> to_run_{};
     std::vector<std::pair<int, detail::Interest>> to_rearm_{};
     std::vector<detail::TimerTarget> expired_{};
     std::vector<detail::OperationId> cancels_{};
@@ -744,7 +744,7 @@ void EventLoop::detach(NativeHandle handle) {
     impl_->detach(handle);
 }
 
-void EventLoop::post(std::move_only_function<void()> work) {
+void EventLoop::post(move_only_function<void()> work) {
     impl_->post(std::move(work));
 }
 void EventLoop::stop() {

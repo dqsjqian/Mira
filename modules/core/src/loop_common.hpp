@@ -17,7 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
-#include <functional>  // std::move_only_function
+#include "mira/core/functional.hpp"  // mira::move_only_function
 #include <map>
 #include <optional>
 #include <stop_token>
@@ -347,19 +347,19 @@ template<typename Impl>
 /// Work queued by `post()`, drained on the loop thread.
 class PostQueue {
 public:
-    void push(std::move_only_function<void()> work) { queued_.push_back(std::move(work)); }
+    void push(move_only_function<void()> work) { queued_.push_back(std::move(work)); }
 
     [[nodiscard]] bool empty() const noexcept { return queued_.empty(); }
     [[nodiscard]] std::size_t size() const noexcept { return queued_.size(); }
 
-    void drain_into(std::vector<std::move_only_function<void()>>& out) noexcept {
+    void drain_into(std::vector<move_only_function<void()>>& out) noexcept {
         out.swap(queued_);
     }
 
     void clear() noexcept { queued_.clear(); }
 
 private:
-    std::vector<std::move_only_function<void()>> queued_{};
+    std::vector<move_only_function<void()>> queued_{};
 };
 
 }  // namespace Mira::detail

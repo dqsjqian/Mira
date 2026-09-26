@@ -15,8 +15,12 @@ version is 0, the minor version is where breaking changes land: a request for
 
 ### Changed
 
-- `post()` takes `std::move_only_function<void()>`: posted work no longer has
-  to be copyable, so a callable capturing a `Task` can be posted directly.
+- `post()` takes `mira::move_only_function<void()>`: posted work no longer
+  has to be copyable, so a callable capturing a `Task` can be posted
+  directly. The type is `std::move_only_function` where the toolchain has
+  it (`__cpp_lib_move_only_function`); Apple Clang and the Android NDK
+  still ship without it, so `mira/core/functional.hpp` backs the same
+  name with a small unique-ownership equivalent there.
 - The `Executor` concept now probes the exact resumption closure
   `schedule_on` posts (`detail::PostedResumption`) instead of a function
   pointer, so a type satisfying the concept is a type that actually works.

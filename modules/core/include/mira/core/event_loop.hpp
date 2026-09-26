@@ -31,7 +31,7 @@
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
-#include <functional>  // std::move_only_function lives in <functional>
+#include "mira/core/functional.hpp"  // mira::move_only_function — posted work
 #include <memory>
 #include <span>
 
@@ -186,7 +186,7 @@ public:
     /// Move-only: a callable capturing a `Task` (itself move-only) can be
     /// posted without wrapping, which is a routine need in a coroutine
     /// library. `std::function` would demand copyability and reject it.
-    void post(std::move_only_function<void()> work);
+    void post(move_only_function<void()> work);
 
     // ── driving ─────────────────────────────────────────────────────────────
 
