@@ -1,13 +1,16 @@
 #pragma once
 #include "mira/core/error.hpp"
+#include "mira/http2/headers.hpp"
 #include "mira/quic/engine.hpp"
 
 #include <utility>
 
 namespace Mira::http3 {
 using Mira::Result;
-using Header = std::pair<std::string, std::string>;
-using Headers = std::vector<Header>;
+/// HTTP/2 与 HTTP/3 的头部区块语义相同（HPACK/QPACK 压缩同一份字段序列模型），
+/// 所以共用同一个头部列表类型：换传输层不需要重写头部处理代码。
+using Mira::http2::Header;
+using Mira::http2::Headers;
 
 /// nghttp3 原生负码与引擎自有边界码共用的错误分类。
 /// -100000 段为引擎自有码，其余为 nghttp3 原生码。
@@ -34,7 +37,7 @@ public:
     Engine(Engine&&) noexcept;
     Engine& operator=(Engine&&) noexcept;
     ~Engine();
-    Result<void> receive(std::span<const std::uint8_t> datagram, std::uint64_t now);
+    Result<void> receive(std::span<const std::byte> datagram, std::uint64_t now);
     Result<quic::Bytes> poll(std::uint64_t now);
     Result<void> handle_expiry(std::uint64_t now);
     std::uint64_t expiry() const noexcept;
@@ -42,9 +45,9 @@ public:
     bool peer_goaway() const noexcept;
     bool is_server() const noexcept;
     bool closed() const noexcept;
-    Result<std::int64_t> request(const Headers& fields, std::span<const std::uint8_t> body = {});
+    Result<std::int64_t> request(const Headers& fields, std::span<const std::byte> body = {});
     Result<void>
-    respond(std::int64_t stream, const Headers& fields, std::span<const std::uint8_t> body = {});
+    respond(std::int64_t stream, const Headers& fields, std::span<const std::byte> body = {});
     std::vector<Event> take_events();
     Result<void> consume(std::int64_t stream, std::size_t bytes);
     Result<void> cancel(std::int64_t stream);

@@ -13,7 +13,10 @@ add_library(Mira::http3 ALIAS mira_http3)
 target_include_directories(mira_http3 PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 target_compile_features(mira_http3 PUBLIC cxx_std_23)
 # 加密随机源由 Mira::quic 提供；本模块不直接依赖 TLS 后端。
-target_link_libraries(mira_http3 PUBLIC Mira::quic PRIVATE mira_nghttp3 $<BUILD_INTERFACE:Mira::warnings>)
+# 公共头部类型（http2/headers.hpp 的 Header/Headers）：HPACK 与 QPACK 的
+# 字段区块语义相同，http3 直接复用同一类型，故此处是 PUBLIC 依赖。
+target_link_libraries(mira_http3 PUBLIC Mira::quic Mira::http2
+    PRIVATE mira_nghttp3 $<BUILD_INTERFACE:Mira::warnings>)
 set_target_properties(mira_http3 PROPERTIES OUTPUT_NAME Mira-http3 EXPORT_NAME http3)
 if(COMMAND mira_install_module)
     mira_install_module(mira_http3)

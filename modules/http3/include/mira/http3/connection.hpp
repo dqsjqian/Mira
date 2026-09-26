@@ -26,17 +26,11 @@
 namespace Mira::http3 {
 
 namespace detail {
-inline constexpr std::size_t kMaxDatagram = 65536;
-
-inline std::uint64_t now_ns() noexcept {
-    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                          std::chrono::steady_clock::now().time_since_epoch())
-                                          .count());
-}
-
-inline std::span<const std::byte> as_bytes(const quic::Bytes& data) {
-    return {reinterpret_cast<const std::byte*>(data.data()), data.size()};
-}
+// kMaxDatagram and now_ns come from quic/engine.hpp's detail namespace — the
+// two protocol layers share one clock and one datagram bound instead of
+// drifting duplicates.
+using quic::detail::kMaxDatagram;
+using quic::detail::now_ns;
 }  // namespace detail
 
 /// A received response or request head.
@@ -89,7 +83,7 @@ public:
     /// Server: take over the transport that received the QUIC Initial.
     [[nodiscard]] static Task<Result<Connection>>
     serve(Transport transport, quic::Options options, Limits limits,
-          std::span<const std::uint8_t> initial, OperationOptions io = {}) {
+          std::span<const std::byte> initial, OperationOptions io = {}) {
         // The remote is part of the options: whoever sent the Initial.
         const transport::Endpoint remote = options.remote;
         auto transport_engine = quic::Engine::accept(std::move(options), initial,
@@ -108,14 +102,14 @@ public:
 
     /// Client: submit a request; the body is copied into the engine's budget.
     [[nodiscard]] Task<Result<std::int64_t>>
-    request(const Headers& fields, std::span<const std::uint8_t> body = {}) {
+    request(const Headers& fields, std::span<const std::byte> body = {}) {
         if (!engine_) co_return fail(Errc::invalid_argument);
         co_return engine_->request(fields, body);
     }
 
     /// Server: answer a request stream.
     [[nodiscard]] Task<Result<void>>
-    respond(std::int64_t stream, const Headers& fields, std::span<const std::uint8_t> body = {},
+    respond(std::int64_t stream, const Headers& fields, std::span<const std::byte> body = {},
             OperationOptions io = {}) {
         if (!engine_) co_return fail(Errc::invalid_argument);
         auto sent = engine_->respond(stream, fields, body);
@@ -192,7 +186,7 @@ public:
         auto last = engine_->close(application_error, detail::now_ns());
         if (!last) co_return fail(last.error());
         if (!last->empty()) {
-            auto sent = co_await transport_->send_to(detail::as_bytes(*last), remote_, io);
+            auto sent = co_await transport_->send_to(std::span<const std::byte>{last->data(), last->size()}, remote_, io);
             if (!sent) co_return fail(sent.error());
             if (*sent != last->size()) {
                 co_return fail(std::make_error_code(std::errc::io_error));
@@ -279,7 +273,7 @@ private:
             auto packet = engine_->poll(detail::now_ns());
             if (!packet) co_return fail(packet.error());
             if (packet->empty()) break;
-            auto sent = co_await transport_->send_to(detail::as_bytes(*packet), remote_, io);
+            auto sent = co_await transport_->send_to(std::span<const std::byte>{packet->data(), packet->size()}, remote_, io);
             if (!sent) co_return fail(sent.error());
             if (*sent != packet->size()) {
                 co_return fail(std::make_error_code(std::errc::io_error));
@@ -334,10 +328,8 @@ private:
         } else if (!(received->peer == remote_)) {
             co_return Result<void>{};  // not ours; drop
         }
-        if (auto fed = engine_->receive(
-                std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(buffer.data()),
-                                              received->size},
-                detail::now_ns());
+        if (auto fed = engine_->receive(std::span<const std::byte>{buffer.data(), received->size},
+                                        detail::now_ns());
             !fed) {
             co_return fail(fed.error());
         }

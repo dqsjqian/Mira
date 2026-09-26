@@ -20,6 +20,12 @@ using H3Connection = http3::Connection<transport::udp::Socket>;
 
 namespace {
 
+/// Payloads are library-typed (`std::byte`) end to end; `wire` is a plain
+/// span view kept for uniform call sites.
+std::span<const std::byte> wire(const Bytes& bytes) {
+    return {bytes.data(), bytes.size()};
+}
+
 template<class T>
 T require(Result<T> value) {
     if (!value)
@@ -38,14 +44,12 @@ void check(bool ok, const char* message) {
 
 Task<void> server_side(transport::udp::Socket& server_socket,
                        std::array<std::byte, 65536>& initial_buffer,
-                       std::vector<std::uint8_t>& initial, quic::Options& server_options,
+                       std::vector<std::byte>& initial, quic::Options& server_options,
                        const Endpoint& server_address, std::unique_ptr<H3Connection>& server) {
         auto datagram =
             co_await server_socket.receive_from(initial_buffer, {.deadline = Clock::now() + 5s});
         check(datagram.has_value(), "服务端未收到 Initial");
-        initial.assign(reinterpret_cast<const std::uint8_t*>(initial_buffer.data()),
-                       reinterpret_cast<const std::uint8_t*>(initial_buffer.data()) +
-                           datagram->size);
+        initial.assign(initial_buffer.data(), initial_buffer.data() + datagram->size);
         // Engine::accept requires both endpoints: the local one we bound,
         // the remote learned from the Initial datagram's source address.
         server_options.local = server_address;
@@ -73,8 +77,8 @@ Task<void> server_side(transport::udp::Socket& server_socket,
                 fin = chunk->fin;
             }
             require(co_await server->respond(
-                0, {{":status", "200"}, {"content-length", std::to_string(body.size())}}, body,
-                {.deadline = Clock::now() + 10s}));
+                0, {{":status", "200"}, {"content-length", std::to_string(body.size())}},
+                wire(body), {.deadline = Clock::now() + 10s}));
             // Keep pumping until the client closes: destroying the connection
             // here would drop unacknowledged response datagrams (see quic).
             while (!server->closed()) {
@@ -93,14 +97,14 @@ Task<void> client_side(EventLoop& loop, quic::Options& client_options,
         if (!connected) co_return;
         client = std::make_unique<H3Connection>(std::move(*connected));
 
-        Bytes payload(20000, 0x48);
-        payload[11] = 0;  // 二进制安全
+        Bytes payload(20000, std::byte{0x48});
+        payload[11] = std::byte{0};  // 二进制安全
         const std::int64_t stream = require(co_await client->request(
             {{":method", "POST"},
              {":scheme", "https"},
              {":authority", "localhost"},
              {":path", "/echo"}},
-            payload));
+            wire(payload)));
 
         auto head = co_await client->await_head(stream, {.deadline = Clock::now() + 10s});
         check(head.has_value(), "客户端未收到响应头");
@@ -121,7 +125,7 @@ Task<void> client_side(EventLoop& loop, quic::Options& client_options,
             if (!chunk) co_return;
             require(client->consume(stream, chunk->data.size()));
             check(std::all_of(chunk->data.begin(), chunk->data.end(),
-                              [](std::uint8_t b) { return b == 0x48 || b == 0; }),
+                              [](std::byte b) { return b == std::byte{0x48} || b == std::byte{0}; }),
                   "回显数据损坏");
             total += chunk->data.size();
             fin = chunk->fin;
@@ -148,7 +152,7 @@ Task<void> run(EventLoop& loop, const char* certificate, const char* key) {
     server_options.alpn = "h3";
 
     std::array<std::byte, 65536> initial_buffer{};
-    std::vector<std::uint8_t> initial;
+    std::vector<std::byte> initial;
 
     TaskScope scope;
     std::unique_ptr<H3Connection> client;

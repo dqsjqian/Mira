@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mira/core/error.hpp"
+#include "mira/http2/headers.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -10,12 +11,6 @@
 #include <vector>
 
 namespace Mira::http2 {
-
-struct Header {
-    std::string name;
-    std::string value;
-};
-using Headers = std::vector<Header>;
 
 enum class Role { client, server };
 enum class State { open, draining, closed, failed };

@@ -49,18 +49,6 @@ struct StreamChunk {
     std::uint64_t error_code = 0;
 };
 
-namespace detail {
-/// The datagram size a QUIC endpoint must be able to receive (RFC 9000
-/// recommends at least 65527 for the unsupported-jumbogram case).
-inline constexpr std::size_t kMaxDatagram = 65536;
-
-inline std::uint64_t now_ns() noexcept {
-    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                          std::chrono::steady_clock::now().time_since_epoch())
-                                          .count());
-}
-}  // namespace detail
-
 /// A single QUIC connection over a datagram transport.
 ///
 /// Owns the transport and the engine; one connection per socket. The server
@@ -101,7 +89,7 @@ public:
     /// The datagram is consumed by Engine::accept exactly as in the tests.
     [[nodiscard]] static Task<Result<Connection>> serve(Transport transport,
                                                         Options options,
-                                                        std::span<const std::uint8_t> initial,
+                                                        std::span<const std::byte> initial,
                                                         OperationOptions io = {}) {
         // The remote is part of the options: whoever sent the Initial.
         const transport::Endpoint remote = options.remote;
@@ -130,7 +118,7 @@ public:
     /// Write up to the engine's buffered-send budget, then flush what it
     /// produced. Blocks only for the outgoing datagrams of this round.
     [[nodiscard]] Task<Result<void>>
-    write(std::int64_t stream, std::span<const std::uint8_t> bytes, bool fin,
+    write(std::int64_t stream, std::span<const std::byte> bytes, bool fin,
           OperationOptions io = {}) {
         if (!engine_) co_return fail(Errc::invalid_argument);
         auto written = engine_->write(stream, bytes, fin);
@@ -187,10 +175,9 @@ public:
         auto last = engine_->close(application_error, detail::now_ns());
         if (!last) co_return fail(last.error());
         if (!last->empty()) {
-            auto sent = co_await transport_->send_to(
-                std::span<const std::byte>{reinterpret_cast<const std::byte*>(last->data()),
-                                          last->size()},
-                remote_, io);
+            auto sent = co_await transport_->send_to(std::span<const std::byte>{last->data(),
+                                                                                 last->size()},
+                                                     remote_, io);
             if (!sent) co_return fail(sent.error());
             if (*sent != last->size()) {
                 co_return fail(std::make_error_code(std::errc::io_error));
@@ -254,9 +241,7 @@ private:
             if (!packet) co_return fail(packet.error());
             if (packet->empty()) break;
             auto sent = co_await transport_->send_to(
-                std::span<const std::byte>{reinterpret_cast<const std::byte*>(packet->data()),
-                                          packet->size()},
-                remote_, io);
+                std::span<const std::byte>{packet->data(), packet->size()}, remote_, io);
             if (!sent) co_return fail(sent.error());
             if (*sent != packet->size()) {
                 co_return fail(std::make_error_code(std::errc::io_error));
@@ -331,9 +316,7 @@ private:
             co_return Result<void>{};
         }
         if (auto fed = engine_->receive(
-                std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(
-                                                  buffer.data()),
-                                              received->size},
+                std::span<const std::byte>{buffer.data(), received->size},
                 detail::now_ns());
             !fed) {
             co_return fail(fed.error());

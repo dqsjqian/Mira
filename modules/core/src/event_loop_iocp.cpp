@@ -727,8 +727,18 @@ public:
 
         // `(id, outcome)` rather than `Operation*`: by the time these are
         // delivered, an earlier resumption may already have resolved one of
-        // them, and a stale id resolves to nothing.
-        std::vector<std::pair<detail::OperationId, Result<std::size_t>>> resolved;
+        // them, and a stale id resolves to nothing. Members, not locals, so
+        // a high completion rate does not pay per-turn heap allocations;
+        // reentrancy is impossible (run_once from a resumed coroutine
+        // terminates by contract).
+        resolved_.clear();
+        expired_.clear();
+        cancels_.clear();
+        to_run_.clear();
+        auto& resolved = resolved_;
+        auto& expired = expired_;
+        auto& cancels = cancels_;
+        auto& to_run = to_run_;
         resolved.reserve(removed);
 
         for (ULONG i = 0; i < removed; ++i) {
@@ -755,9 +765,6 @@ public:
             resolved.emplace_back(id, outcome);
         }
 
-        std::vector<detail::TimerTarget> expired;
-        std::vector<detail::OperationId> cancels;
-        std::vector<std::move_only_function<void()>> to_run;
         {
             const std::lock_guard lock{mutex_};
             timers_.extract_expired(detail::Clock::now(), expired);
@@ -1063,6 +1070,13 @@ private:
     /// Non-zero while a batch is being delivered. Loop thread only, which is
     /// the same restriction `run_once` and destroying the loop already carry.
     std::atomic<int> dispatch_depth_{0};
+
+    // Scratch batches for `run_once`, cleared and refilled every turn —
+    // see the comment at their use site.
+    std::vector<std::pair<detail::OperationId, Result<std::size_t>>> resolved_{};
+    std::vector<detail::TimerTarget> expired_{};
+    std::vector<detail::OperationId> cancels_{};
+    std::vector<std::move_only_function<void()>> to_run_{};
 
     LPFN_ACCEPTEX accept_ex_{nullptr};
     LPFN_CONNECTEX connect_ex_{nullptr};

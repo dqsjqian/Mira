@@ -380,11 +380,22 @@ public:
         // `(id, outcome)` rather than anything pointing at a frame: by the
         // time these are delivered, an earlier resumption may already have
         // resolved one of them, and a stale id resolves to nothing.
-        std::vector<std::pair<detail::OperationId, Result<void>>> resolved;
-        std::vector<std::move_only_function<void()>> to_run;
-        std::vector<std::pair<int, detail::Interest>> to_rearm;
-        std::vector<detail::TimerTarget> expired;
-        std::vector<detail::OperationId> cancels;
+        // Members, not locals: at a high event rate the per-iteration
+        // construction and destruction of five vectors is five guaranteed
+        // heap round-trips per loop turn. Reentrancy is impossible (a
+        // resumed coroutine calling run_once terminates by contract), so
+        // one set of scratch vectors is owned by the loop itself and
+        // cleared at the top of every turn.
+        resolved_.clear();
+        to_run_.clear();
+        to_rearm_.clear();
+        expired_.clear();
+        cancels_.clear();
+        auto& resolved = resolved_;
+        auto& to_run = to_run_;
+        auto& to_rearm = to_rearm_;
+        auto& expired = expired_;
+        auto& cancels = cancels_;
         bool wakeup_fired = false;
 
         {
@@ -659,6 +670,15 @@ private:
     detail::TimerQueue timers_{};
     detail::PostQueue posted_{};
     std::vector<detail::OperationId> pending_cancels_{};
+
+    // Scratch batches for `run_once`, cleared and refilled every turn.
+    // Members rather than locals so a high event rate does not pay five
+    // heap allocations per loop turn; see the comment at their use site.
+    std::vector<std::pair<detail::OperationId, Result<void>>> resolved_{};
+    std::vector<std::move_only_function<void()>> to_run_{};
+    std::vector<std::pair<int, detail::Interest>> to_rearm_{};
+    std::vector<detail::TimerTarget> expired_{};
+    std::vector<detail::OperationId> cancels_{};
     detail::OperationId next_id_{detail::kNoOperation};
 
     /// Non-zero while a batch is being delivered. Loop thread only, which is

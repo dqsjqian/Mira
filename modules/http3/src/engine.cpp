@@ -92,8 +92,8 @@ struct Engine::Impl {
                 return NGHTTP3_ERR_CALLBACK_FAILURE;
             stream.field_bytes += size;
             s.header_bytes += size;
-            stream.fields.emplace_back(std::string(reinterpret_cast<char*>(n.base), n.len),
-                                       std::string(reinterpret_cast<char*>(v.base), v.len));
+            stream.fields.push_back(Header{std::string(reinterpret_cast<char*>(n.base), n.len),
+                                           std::string(reinterpret_cast<char*>(v.base), v.len)});
             return 0;
         });
     }
@@ -115,7 +115,11 @@ struct Engine::Impl {
                 return NGHTTP3_ERR_CALLBACK_FAILURE;
             s.streams.at(id).unread += size;
             s.input_bytes += size;
-            return s.push({Event::Kind::body, id, {}, quic::Bytes(bytes, bytes + size), 0});
+            // nghttp3 hands us `const uint8_t*`; converting at the boundary.
+            return s.push({Event::Kind::body, id, {},
+                           quic::Bytes(reinterpret_cast<const std::byte*>(bytes),
+                                       reinterpret_cast<const std::byte*>(bytes) + size),
+                           0});
         });
     }
     static int deferred(nghttp3_conn*, std::int64_t id, std::size_t size, void* p, void*) {
@@ -177,7 +181,11 @@ struct Engine::Impl {
         try {
             auto& b = self(p).streams.at(id).output;
             if (count == 0) return NGHTTP3_ERR_CALLBACK_FAILURE;
-            vec[0] = {b.data(), b.size()};
+            // nghttp3 的 C API 收非 const uint8_t*（只读使用）；库级字节是
+            // std::byte，const_cast 只标记库边界，不授予修改。
+            vec[0].base = const_cast<std::uint8_t*>(
+                reinterpret_cast<const std::uint8_t*>(b.data()));
+            vec[0].len = b.size();
             *flags |= NGHTTP3_DATA_FLAG_EOF;
             return 1;
         } catch (...) {
@@ -219,7 +227,9 @@ struct Engine::Impl {
             switch (event.kind) {
             case quic::Event::Kind::data: {
                 auto n = nghttp3_conn_read_stream2(
-                    conn, event.stream_id, event.data.data(), event.data.size(), event.fin, now);
+                    conn, event.stream_id,
+                    reinterpret_cast<const std::uint8_t*>(event.data.data()),
+                    event.data.size(), event.fin, now);
                 if (n < 0) return check(static_cast<int>(n));
                 if (n > 0) {
                     auto r = transport.consume(event.stream_id, static_cast<std::size_t>(n));
@@ -248,7 +258,7 @@ struct Engine::Impl {
         }
         return {};
     }
-    Result<void> valid_fields(const Headers& fields, std::span<const std::uint8_t> body) {
+    Result<void> valid_fields(const Headers& fields, std::span<const std::byte> body) {
         if (fields.size() > limits.max_headers ||
             body.size() > limits.max_buffered_body - output_bytes)
             return std::unexpected(http3_error(invalid));
@@ -266,7 +276,7 @@ struct Engine::Impl {
         return {};
     }
     Result<void>
-    submit(std::int64_t id, const Headers& fields, std::span<const std::uint8_t> body) {
+    submit(std::int64_t id, const Headers& fields, std::span<const std::byte> body) {
         auto& stream = streams.at(id);
         stream.output.assign(body.begin(), body.end());
         output_bytes += body.size();
@@ -332,7 +342,7 @@ Result<Engine> Engine::create(quic::Engine transport, bool server, Limits limits
     if (server) nghttp3_conn_set_max_client_streams_bidi(s->conn, s->transport.remote_bidi_stream_limit());
     return Engine(std::move(s));
 }
-Result<void> Engine::receive(std::span<const std::uint8_t> packet, std::uint64_t now) {
+Result<void> Engine::receive(std::span<const std::byte> packet, std::uint64_t now) {
     if (impl_->failed) return std::unexpected(http3_error(invalid));
     if (auto r = impl_->transport.receive(packet, now); !r) {
         impl_->failed = true;
@@ -362,9 +372,14 @@ Result<quic::Bytes> Engine::poll(std::uint64_t now) {
                 auto& part = vec[static_cast<std::size_t>(i)];
                 available += part.len;
                 auto count = std::min(part.len, capacity - bytes.size());
-                if (count) bytes.insert(bytes.end(), part.base, part.base + count);
+                if (count) bytes.insert(bytes.end(),
+                                         reinterpret_cast<const std::byte*>(part.base),
+                                         reinterpret_cast<const std::byte*>(part.base) + count);
             }
-            auto r = s.transport.write(id, bytes, fin != 0 && bytes.size() == available);
+            auto r = s.transport.write(
+                id,
+                std::span<const std::byte>{bytes.data(), bytes.size()},
+                fin != 0 && bytes.size() == available);
             if (!r) {
                 // -100001 是 QUIC 引擎的发送预算背压：本轮暂停输出，等下次 poll 重试。
                 if (r.error().value() == -100001) break;
@@ -402,7 +417,7 @@ bool Engine::peer_goaway() const noexcept {
 bool Engine::is_server() const noexcept {
     return impl_->server;
 }
-Result<std::int64_t> Engine::request(const Headers& fields, std::span<const std::uint8_t> body) {
+Result<std::int64_t> Engine::request(const Headers& fields, std::span<const std::byte> body) {
     auto& s = *impl_;
     if (!ready() || s.server || s.going || s.remote_going ||
         s.streams.size() >= s.limits.max_streams)
@@ -415,7 +430,7 @@ Result<std::int64_t> Engine::request(const Headers& fields, std::span<const std:
     return *id;
 }
 Result<void>
-Engine::respond(std::int64_t id, const Headers& fields, std::span<const std::uint8_t> body) {
+Engine::respond(std::int64_t id, const Headers& fields, std::span<const std::byte> body) {
     auto& s = *impl_;
     auto it = s.streams.find(id);
     if (!ready() || !s.server || it == s.streams.end() || it->second.responded)

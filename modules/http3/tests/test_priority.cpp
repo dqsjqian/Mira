@@ -38,13 +38,13 @@ int main(int argc, char** argv) {
         if (!server.ready()) throw std::runtime_error("HTTP3 握手失败");
         const auto control = require(client.open_stream(true));
         // 控制流类型 0，空 SETTINGS；请求采用仅静态表的真实 QPACK 字段段。
-        require(client.write(control, quic::Bytes{0,4,0}, false));
-        const quic::Bytes request{1,16,0,0,0xd1,0xd7,0x50,9,'l','o','c','a','l','h','o','s','t',0xc1};
+        require(client.write(control, std::vector<std::byte>{std::byte{0},std::byte{4},std::byte{0}}, false));
+        const std::vector<std::byte> request{std::byte{1},std::byte{16},std::byte{0},std::byte{0},std::byte{0xd1},std::byte{0xd7},std::byte{0x50},std::byte{9},std::byte{'l'},std::byte{'o'},std::byte{'c'},std::byte{'a'},std::byte{'l'},std::byte{'h'},std::byte{'o'},std::byte{'s'},std::byte{'t'},std::byte{0xc1}};
         for(int round=0; round<4; ++round) {
             auto id = require(client.open_stream());
             if(round == 3) {
                 // PRIORITY_UPDATE_REQUEST_STREAM (0xf0700)，目标是已获 QUIC 授权的新流。
-                require(client.write(control, quic::Bytes{0x80,0x0f,0x07,0x00,4,static_cast<std::uint8_t>(id),'u','=','3'}, false));
+                require(client.write(control, std::vector<std::byte>{std::byte{0x80},std::byte{0x0f},std::byte{0x07},std::byte{0x00},std::byte{4},std::byte{static_cast<unsigned char>(id)},std::byte{'u'},std::byte{'='},std::byte{'3'}}, false));
             }
             require(client.write(id, request, true));
             bool ended = false;

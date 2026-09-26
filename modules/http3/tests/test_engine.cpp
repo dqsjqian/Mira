@@ -5,6 +5,12 @@
 #include <set>
 #include <stdexcept>
 using namespace Mira;
+/// Payloads are library-typed (`std::byte`) end to end; `wire` is a plain
+/// span view kept for uniform call sites.
+std::span<const std::byte> wire(const quic::Bytes& bytes) {
+    return {bytes.data(), bytes.size()};
+}
+
 template<class T>
 T require(quic::Result<T> value) {
     if (!value)
@@ -81,13 +87,13 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("HTTP3 接受了非法取消流编号");
         }
         for (int round = 0; round < 100; ++round) {
-            quic::Bytes body(20000, static_cast<std::uint8_t>(round));
+            quic::Bytes body(20000, std::byte(static_cast<unsigned char>(round)));
             auto id = require(client.request({{":method", "POST"},
                                               {":scheme", "https"},
                                               {":authority", "localhost"},
                                               {":path", "/echo"},
                                               {"content-length", std::to_string(body.size())}},
-                                             body));
+                                             wire(body)));
             bool request_end = false, response_end = false;
             std::size_t incoming = 0, outgoing = 0;
             bool status = false;
@@ -96,8 +102,8 @@ int main(int argc, char** argv) {
                 for (auto& e : server.take_events()) {
                     if (e.stream_id != id) continue;
                     if (e.kind == http3::Event::Kind::body) {
-                        if (!std::all_of(e.data.begin(), e.data.end(), [&](auto b) {
-                                return b == static_cast<std::uint8_t>(round);
+                        if (!std::all_of(e.data.begin(), e.data.end(), [&](std::byte b) {
+                                return b == std::byte(static_cast<unsigned char>(round));
                             }))
                             throw std::runtime_error("request body 损坏");
                         incoming += e.data.size();
@@ -109,7 +115,7 @@ int main(int argc, char** argv) {
                     require(server.respond(
                         id,
                         {{":status", "200"}, {"content-length", std::to_string(body.size())}},
-                        body));
+                        wire(body)));
                     request_end = false;
                 }
                 for (auto& e : client.take_events()) {
@@ -118,8 +124,8 @@ int main(int argc, char** argv) {
                         for (auto& [n, v] : e.fields)
                             if (n == ":status" && v == "200") status = true;
                     if (e.kind == http3::Event::Kind::body) {
-                        if (!std::all_of(e.data.begin(), e.data.end(), [&](auto b) {
-                                return b == static_cast<std::uint8_t>(round);
+                        if (!std::all_of(e.data.begin(), e.data.end(), [&](std::byte b) {
+                                return b == std::byte(static_cast<unsigned char>(round));
                             }))
                             throw std::runtime_error("response body 损坏");
                         outgoing += e.data.size();
@@ -139,7 +145,7 @@ int main(int argc, char** argv) {
         http3::Headers get{
             {":method", "GET"}, {":scheme", "https"}, {":authority", "localhost"}, {":path", "/"}};
         quic::Bytes too_big(4 * 1024 * 1024 + 1);
-        if (client.request(get, too_big)) throw std::runtime_error("body 预算未生效");
+        if (client.request(get, wire(too_big))) throw std::runtime_error("body 预算未生效");
         auto too_many = get;
         for (int i = 0; i < 129; ++i)
             too_many.emplace_back("x-extra", "value");

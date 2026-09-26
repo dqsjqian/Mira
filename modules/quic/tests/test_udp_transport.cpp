@@ -39,7 +39,7 @@ void check(bool ok, const char* message) {
 
 Task<void> server_side(transport::udp::Socket& server_socket,
                        std::array<std::byte, 65536>& initial_buffer,
-                       std::vector<std::uint8_t>& initial, quic::Options& server_options,
+                       std::vector<std::byte>& initial, quic::Options& server_options,
                        const Endpoint& server_address, std::unique_ptr<UdpConnection>& server) {
         // Receive the Initial datagram, then hand the socket to the
         // connection — a QUIC listener routes by connection ID; this test
@@ -47,9 +47,7 @@ Task<void> server_side(transport::udp::Socket& server_socket,
         auto datagram =
             co_await server_socket.receive_from(initial_buffer, {.deadline = Clock::now() + 5s});
         check(datagram.has_value(), "服务端未收到 Initial");
-        initial.assign(reinterpret_cast<const std::uint8_t*>(initial_buffer.data()),
-                      reinterpret_cast<const std::uint8_t*>(initial_buffer.data()) +
-                          datagram->size);
+        initial.assign(initial_buffer.data(), initial_buffer.data() + datagram->size);
         // Engine::accept requires both endpoints: the local one we bound,
         // the remote learned from the Initial datagram's source address.
         server_options.local = server_address;
@@ -96,8 +94,8 @@ Task<void> client_side(EventLoop& loop, quic::Options& client_options,
         check(client->negotiated_protocol() == "h3", "客户端 ALPN 不符");
 
         const std::int64_t stream = require(client->open_stream());
-        quic::Bytes payload(200000, 0x5a);
-        payload[7] = 0;  // 二进制安全：中间有零
+        quic::Bytes payload(200000, std::byte{0x5a});
+        payload[7] = std::byte{0};  // 二进制安全：中间有零
         // FIN rides with the payload: the server echoes what it received
         // only after seeing the end of stream, so splitting them deadlocks.
         require(co_await client->write(stream, payload, true,
@@ -111,7 +109,7 @@ Task<void> client_side(EventLoop& loop, quic::Options& client_options,
             if (!chunk) co_return;
             require(client->consume(stream, chunk->data.size()));
             check(std::all_of(chunk->data.begin(), chunk->data.end(),
-                              [](std::uint8_t b) { return b == 0x5a || b == 0; }),
+                              [](std::byte b) { return b == std::byte{0x5a} || b == std::byte{0}; }),
                   "回显数据损坏");
             total += chunk->data.size();
             fin = chunk->fin;
@@ -139,7 +137,7 @@ Task<void> run(EventLoop& loop, const char* certificate, const char* key) {
     server_options.alpn = "h3";
 
     std::array<std::byte, 65536> initial_buffer{};
-    std::vector<std::uint8_t> initial;
+    std::vector<std::byte> initial;
 
     TaskScope scope;
     std::unique_ptr<UdpConnection> client;

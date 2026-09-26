@@ -115,8 +115,10 @@ struct Engine::Impl {
             auto& stream = s.streams[id];
             stream.unread += size;
             s.received += size;
-            Bytes bytes;
-            if (size) bytes.assign(data, data + size);
+            // The C API hands us `const uint8_t*`; the library-wide byte
+            // type is `std::byte`, and this callback is the boundary.
+            Bytes bytes(reinterpret_cast<const std::byte*>(data),
+                        reinterpret_cast<const std::byte*>(data) + size);
             s.events.push_back({Event::Kind::data,
                                 id,
                                 std::move(bytes),
@@ -222,12 +224,12 @@ Result<Engine> Engine::client(Options o, std::uint64_t now) {
     o.server = false;
     return create(std::move(o), {}, now);
 }
-Result<Engine> Engine::accept(Options o, std::span<const std::uint8_t> initial, std::uint64_t now) {
+Result<Engine> Engine::accept(Options o, std::span<const std::byte> initial, std::uint64_t now) {
     o.server = true;
     return create(std::move(o), initial, now);
 }
 Result<Engine>
-Engine::create(Options options, std::span<const std::uint8_t> initial, std::uint64_t now) {
+Engine::create(Options options, std::span<const std::byte> initial, std::uint64_t now) {
     if (options.local.address_bytes().empty() || options.remote.address_bytes().empty() ||
         options.alpn.empty() || options.alpn.size() > 255 ||
         options.alpn.find('\0') != std::string::npos || options.max_streams == 0 ||
@@ -293,7 +295,9 @@ Engine::create(Options options, std::span<const std::uint8_t> initial, std::uint
     int rv;
     if (s->options.server) {
         ngtcp2_pkt_hd hd{};
-        rv = ngtcp2_accept(&hd, initial.data(), initial.size());
+        // ngtcp2 的 C API 只说 uint8_t；库级字节是 std::byte，cast 收口在此。
+        rv = ngtcp2_accept(&hd, reinterpret_cast<const std::uint8_t*>(initial.data()),
+                           initial.size());
         if (rv != 0) return std::unexpected(quic_error(rv));
         dcid = hd.scid;
         params.original_dcid = hd.dcid;
@@ -373,10 +377,16 @@ Engine::create(Options options, std::span<const std::uint8_t> initial, std::uint
                             TLSEXT_NAMETYPE_host_name,
                             const_cast<char*>(name)) != 1)
             rv = -1;
-        Bytes protocol{static_cast<std::uint8_t>(s->options.alpn.size())};
-        protocol.insert(protocol.end(), s->options.alpn.begin(), s->options.alpn.end());
-        if (SSL_set_alpn_protos(
-                s->ssl, protocol.data(), static_cast<unsigned int>(protocol.size())) != 0)
+        // Wire-format ALPN list: one length-prefixed protocol. SSL wants
+        // `const uint8_t*`; the cast is the boundary.
+        Bytes protocol{static_cast<std::byte>(s->options.alpn.size())};
+        protocol.insert(protocol.end(),
+                        reinterpret_cast<const std::byte*>(s->options.alpn.data()),
+                        reinterpret_cast<const std::byte*>(s->options.alpn.data()) +
+                            s->options.alpn.size());
+        if (SSL_set_alpn_protos(s->ssl,
+                                reinterpret_cast<const unsigned char*>(protocol.data()),
+                                static_cast<unsigned int>(protocol.size())) != 0)
             rv = -1;
     }
     if (rv) return std::unexpected(quic_error(invalid));
@@ -387,12 +397,14 @@ Engine::create(Options options, std::span<const std::uint8_t> initial, std::uint
     }
     return engine;
 }
-Result<void> Engine::receive(std::span<const std::uint8_t> packet, std::uint64_t now) {
+Result<void> Engine::receive(std::span<const std::byte> packet, std::uint64_t now) {
     auto& s = *impl_;
     if (s.failed || s.ended || !s.time(now))
         return std::unexpected(quic_error(invalid));
     ngtcp2_pkt_info info{};
-    int rv = ngtcp2_conn_read_pkt(s.conn, &s.path, &info, packet.data(), packet.size(), now);
+    int rv = ngtcp2_conn_read_pkt(s.conn, &s.path, &info,
+                                  reinterpret_cast<const std::uint8_t*>(packet.data()),
+                                  packet.size(), now);
     if (rv == NGTCP2_ERR_DRAINING) {
         s.ended = true;
         return {};
@@ -417,8 +429,16 @@ Result<Bytes> Engine::poll(std::uint64_t now) {
         if (stream.cancelled || bool(id & 2) != unidirectional) continue;
         for (auto& chunk : stream.chunks) {
             if (chunk.submitted) continue;
-            ngtcp2_vec vec{chunk.bytes.empty() ? nullptr : chunk.bytes.data() + chunk.sent,
-                           chunk.bytes.size() - chunk.sent};
+            // `ngtcp2_vec::base` is `uint8_t*` (a C API without const
+            // discipline); ngtcp2 only reads it, so the const_cast marks the
+            // library boundary rather than granting mutation.
+            ngtcp2_vec vec{
+                chunk.bytes.empty()
+                    ? nullptr
+                    : const_cast<std::uint8_t*>(
+                          reinterpret_cast<const std::uint8_t*>(chunk.bytes.data())) +
+                          chunk.sent,
+                chunk.bytes.size() - chunk.sent};
             ngtcp2_ssize used = -1;
             auto n = ngtcp2_conn_writev_stream(s.conn,
                                                &path.path,
@@ -445,7 +465,9 @@ Result<Bytes> Engine::poll(std::uint64_t now) {
             }
             if (n > 0) {
                 ngtcp2_conn_update_pkt_tx_time(s.conn, now);
-                return Bytes(out.begin(), out.begin() + n);
+                // `out` is the C-API scratch; convert at the boundary.
+                return Bytes(reinterpret_cast<const std::byte*>(out.data()),
+                             reinterpret_cast<const std::byte*>(out.data()) + n);
             }
             break;
         }
@@ -457,7 +479,8 @@ Result<Bytes> Engine::poll(std::uint64_t now) {
         return std::unexpected(quic_error(static_cast<int>(n)));
     }
     if (n) ngtcp2_conn_update_pkt_tx_time(s.conn, now);
-    return Bytes(out.begin(), out.begin() + n);
+    return Bytes(reinterpret_cast<const std::byte*>(out.data()),
+                 reinterpret_cast<const std::byte*>(out.data()) + n);
 }
 Result<void> Engine::handle_expiry(std::uint64_t now) {
     auto& s = *impl_;
@@ -506,7 +529,7 @@ Result<std::int64_t> Engine::open_stream(bool uni) {
     s.streams.try_emplace(id);
     return id;
 }
-Result<void> Engine::write(std::int64_t id, std::span<const std::uint8_t> bytes, bool fin) {
+Result<void> Engine::write(std::int64_t id, std::span<const std::byte> bytes, bool fin) {
     auto& s = *impl_;
     auto it = s.streams.find(id);
     if (s.failed || s.ended || it == s.streams.end() || it->second.fin || it->second.cancelled)
@@ -516,7 +539,13 @@ Result<void> Engine::write(std::int64_t id, std::span<const std::uint8_t> bytes,
         return std::unexpected(quic_error(budget));
     if (bytes.empty() && !fin) return {};
     auto& stream = it->second;
-    stream.chunks.push_back({Bytes(bytes.begin(), bytes.end()), stream.end, 0, fin, false});
+    stream.chunks.push_back({Bytes(reinterpret_cast<const std::byte*>(bytes.data()),
+                                   reinterpret_cast<const std::byte*>(bytes.data()) +
+                                       bytes.size()),
+                             stream.end,
+                             0,
+                             fin,
+                             false});
     stream.end += bytes.size();
     stream.fin = fin;
     s.buffered += bytes.size();
@@ -568,7 +597,8 @@ Result<Bytes> Engine::close(std::uint64_t code, std::uint64_t now) {
     Bytes packet(1200);
     ngtcp2_pkt_info info{};
     auto n = ngtcp2_conn_write_connection_close(
-        s.conn, nullptr, &info, packet.data(), packet.size(), &err, now);
+        s.conn, nullptr, &info, reinterpret_cast<std::uint8_t*>(packet.data()), packet.size(),
+        &err, now);
     if (n < 0) return std::unexpected(quic_error(static_cast<int>(n)));
     packet.resize(static_cast<std::size_t>(n));
     s.ended = true;

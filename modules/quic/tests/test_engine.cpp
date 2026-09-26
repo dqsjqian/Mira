@@ -17,6 +17,11 @@ T require(quic::Result<T> value) {
 void require(quic::Result<void> value) {
     if (!value) throw std::runtime_error(value.error().message());
 }
+/// Test payloads are library-typed (`std::byte`) end to end; `wire` is a
+/// plain span view, kept so call sites read uniformly.
+std::span<const std::byte> wire(const quic::Bytes& bytes) {
+    return {bytes.data(), bytes.size()};
+}
 void check(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
 }
@@ -95,8 +100,8 @@ int main(int argc, char** argv) {
             // 接收数据保留记录期间对端额度不得归还；consume 清空记录后
             // 才补发 MAX_STREAMS。
             auto first = require(client.open_stream());
-            quic::Bytes small(1024, 0xa5);
-            require(client.write(first, small, true));
+            quic::Bytes small(1024, std::byte{0xa5});
+            require(client.write(first, wire(small), true));
             bool fin = false;
             std::size_t got = 0;
             for (int i = 0; i < 10000 && !fin; ++i) {
@@ -125,8 +130,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         auto id = require(client.open_stream());
-        quic::Bytes data(200000, 0x5a);
-        require(client.write(id, data, true));
+        quic::Bytes data(200000, std::byte{0x5a});
+        require(client.write(id, wire(data), true));
         check(!client.write(id, data, false), "FIN 后仍可写");
         std::size_t total = 0;
         bool fin = false;
@@ -135,7 +140,7 @@ int main(int argc, char** argv) {
             for (auto& e : server.take_events())
                 if (e.kind == quic::Event::Kind::data) {
                     check(
-                        std::all_of(e.data.begin(), e.data.end(), [](auto b) { return b == 0x5a; }),
+                        std::all_of(e.data.begin(), e.data.end(), [](std::byte b) { return b == std::byte{0x5a}; }),
                         "payload corrupted");
                     total += e.data.size();
                     fin |= e.fin;
@@ -144,7 +149,7 @@ int main(int argc, char** argv) {
             client.take_events();
         }
         check(total == data.size() && fin, "stream incomplete");
-        require(server.write(id, data, true));
+        require(server.write(id, wire(data), true));
         total = 0;
         fin = false;
         for (int i = 0; i < 10000 && !fin; ++i) {
@@ -152,7 +157,7 @@ int main(int argc, char** argv) {
             for (auto& e : client.take_events())
                 if (e.kind == quic::Event::Kind::data) {
                     check(
-                        std::all_of(e.data.begin(), e.data.end(), [](auto b) { return b == 0x5a; }),
+                        std::all_of(e.data.begin(), e.data.end(), [](std::byte b) { return b == std::byte{0x5a}; }),
                         "response corrupted");
                     total += e.data.size();
                     fin |= e.fin;
@@ -162,7 +167,7 @@ int main(int argc, char** argv) {
         }
         check(total == data.size() && fin, "response incomplete");
         auto cancel_id = require(client.open_stream());
-        require(client.write(cancel_id, data, false));
+        require(client.write(cancel_id, wire(data), false));
         drive();
         for (auto& e : server.take_events())
             if (e.kind == quic::Event::Kind::data)
@@ -186,7 +191,7 @@ int main(int argc, char** argv) {
         require(client.write(other, {}, true));
         auto over = require(client.open_stream());
         quic::Bytes huge(co.max_buffered_bytes + 1);
-        check(!client.write(over, huge, false), "发送预算未执行");
+        check(!client.write(over, wire(huge), false), "发送预算未执行");
         auto close = require(client.close(0, now));
         check(!close.empty(), "close 未生成数据报");
         require(server.receive(close, now));
