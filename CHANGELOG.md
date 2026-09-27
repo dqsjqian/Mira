@@ -13,6 +13,8 @@ version is 0, the minor version is where breaking changes land: a request for
   config, and CMake options all follow the new name (`MiraConfig.cmake`,
   `MIRA_*` options).
 
+## [Unreleased]
+
 ### Changed
 
 - `post()` takes `mira::move_only_function<void()>`: posted work no longer
