@@ -241,9 +241,9 @@ cmake --build build/tls -j && ctest --test-dir build/tls --output-on-failure
 include(ariaFetchPinned)  # 或你自己仓库里的等价「下载 + SHA256 校验」原语
 aria_fetch_pinned_archive(
     NAME      Mira
-    VERSION   0.3.0
-    URL       "https://github.com/dqsjqian/Mira/releases/download/v0.3.0/Mira-0.3.0.tar.gz"
-    SHA256    0019dfc4b32d63c1392aa264aed2253c1e0c2fb09216f8e2cc269bbfb8bb49b5
+    VERSION   0.4.0
+    URL       "https://github.com/dqsjqian/Mira/releases/download/v0.4.0/Mira-0.4.0.tar.gz"
+    SHA256    3290abda456d4897103f160e0905d09c5b29dfc973ec15024b8f76ce705dd856
 )
 set(MIRA_BUILD_TESTS OFF)
 set(MIRA_BUILD_EXAMPLES OFF)
