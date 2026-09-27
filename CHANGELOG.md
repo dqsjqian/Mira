@@ -7,6 +7,14 @@ version is 0, the minor version is where breaking changes land: a request for
 
 ## [Unreleased]
 
+### Added
+
+- CI: a UCRT64 MinGW job (GCC + OpenSSL from the ucrt64 packages, full suite
+  with TLS). MSVC-only Windows coverage shipped two real MinGW-only defects
+  in 0.4.0 — the resolver's empty diagnostics and a coroutine conditional
+  that stalls under GCC 15 — and neither toolchain can see the other's
+  blind spot.
+
 ### Fixed
 
 - Windows: the resolver's diagnostic is never empty. `gai_strerrorA` is

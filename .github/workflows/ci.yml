@@ -93,6 +93,37 @@ jobs:
       - name: Test TLS and HTTPS
         run: ctest --test-dir build/tls --output-on-failure --build-config Debug
 
+  # Windows is not one toolchain. MSVC covers the IOCP backend above, and the
+  # tls job builds it there too — but MinGW GCC is a supported local
+  # toolchain, and both gaps that shipped in 0.4.0 (the resolver's empty
+  # gai_strerrorA diagnostics; a coroutine conditional that stalls under
+  # GCC 15) were invisible to MSVC. One UCRT64 job keeps the GCC lowering
+  # honest, on exactly the stack the Windows-side verification runs.
+  mingw:
+    needs: discipline
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the UCRT64 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-openssl
+      - name: Configure with TLS
+        run: cmake -S . -B build/mingw -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON
+      - name: Build
+        run: cmake --build build/mingw --parallel
+      - name: Test
+        run: ctest --test-dir build/mingw --output-on-failure
+
   # Coroutine frame lifetime is the easiest thing here to get subtly wrong and
   # the hardest to notice without a sanitizer. The event loop raises the
   # stakes: frames are resumed from inside the loop, long after the call that

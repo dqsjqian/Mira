@@ -188,7 +188,7 @@ No 408 is sent: announcing it would require a second budget the caller never gra
 | Windows | IOCP | Desktop loopback CI, dedicated TLS matrix |
 | iOS / Android | kqueue / epoll | Cross-compilation coverage for all non-TLS modules; Android requires **NDK 29+** |
 
-Most recent all-platform CI pass: **15/15 jobs** (three desktop run + sanitizers + fuzz smoke + protocols + mobile cross-compile), covering all protocol code. Design rationale: [the architecture document](docs/ARCHITECTURE.md).
+Most recent all-platform CI pass: **16/16 jobs** (three desktop runs + MinGW + sanitizers + fuzz smoke + protocols + mobile cross-compile), covering all protocol code. Design rationale: [the architecture document](docs/ARCHITECTURE.md).
 
 ## ✨ Capability overview
 

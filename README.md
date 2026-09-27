@@ -188,7 +188,7 @@ auto client = Mira::tls::Context::client({
 | Windows | IOCP | 桌面 loopback 运行 CI，独立 TLS 矩阵 |
 | iOS / Android | kqueue / epoll | 全部非 TLS 模块交叉编译覆盖；Android 需 **NDK 29+** |
 
-最近一次全平台 CI 通过：**15/15 job**（三桌面运行 + sanitizers + fuzz 烟测 + protocols + 移动交叉编译），覆盖全部协议代码。设计依据见 [架构文档](docs/ARCHITECTURE.md)。
+最近一次全平台 CI 通过：**16/16 job**（三桌面运行 + MinGW + sanitizers + fuzz 烟测 + protocols + 移动交叉编译），覆盖全部协议代码。设计依据见 [架构文档](docs/ARCHITECTURE.md)。
 
 ## ✨ 能力全景
 
