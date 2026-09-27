@@ -5,7 +5,7 @@
 An independent, coroutine-native C++23 networking library: a transport core,
 and protocols that ride on it. HTTP is one protocol family, not the purpose.
 
-### Design mandate (2026-09-23)
+### Design mandate (2026-09-23, updated 2026-09-27)
 
 - Design from networking requirements, not cpp-httplib feature parity or an
   existing consumer's API. Neither cpp-httplib nor a host framework constrains
@@ -20,9 +20,9 @@ and protocols that ride on it. HTTP is one protocol family, not the purpose.
 - Evaluate correctness, API usability, performance and resource bounds through
   executable tests, interoperability checks and reproducible benchmarks.
   Existing libraries are comparison evidence, not the specification.
-- Current phase develops Mira only. Consumer migration, removal of old
-  dependencies, and public release are later phases; keep this repository
-  private for now.
+- The library is public and released: hash-pinned source archives ship as
+  release assets for every version, and downstream consumers (Aria, AriaAgent,
+  AriaRead) pin those archives rather than vendoring or submoduling.
 
 ## Acceptance criteria, not a completeness score
 

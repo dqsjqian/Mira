@@ -27,22 +27,28 @@ struct ResolverOptions {
     std::size_t max_results{64};
 };
 
-/// getaddrinfo 的 EAI_* 错误独立于 errno/Winsock socket 错误。
-/// POSIX 系统解析返回 EAI_SYSTEM 时，resolve 改为返回当时 errno 的 socket_error。
+/// getaddrinfo EAI_* errors are independent of errno/Winsock socket errors.
+/// When a POSIX system resolve returns EAI_SYSTEM, resolve instead returns the
+/// socket_error for the errno value observed at that moment.
 [[nodiscard]] const std::error_category& resolver_category() noexcept;
 [[nodiscard]] Error resolver_error(int native_code) noexcept;
 
-/// 固定线程池系统解析器；不执行 DNS 缓存、重试或端点连接选择。
-/// 取消/超时只终止等待，不能中断已进入的系统 getaddrinfo。
-/// 析构取消所有等待并 join 工作线程，可能等待系统调用返回；不 detach。
-/// resolve 必须在相应 loop 线程调用；不得并发移动/析构和调用成员。
-/// 已启动的等待持有独立状态，允许另一个线程析构 Resolver 并阻塞 join。
+/// Fixed-size thread-pool system resolver; performs no DNS caching, retries,
+/// or endpoint connection selection. Cancellation/timeout only ends the wait
+/// and cannot interrupt a system getaddrinfo already entered. The destructor
+/// cancels all waits and joins the worker threads, possibly waiting for the
+/// system call to return; it never detaches. resolve must be called on the
+/// corresponding loop thread; do not move/destroy concurrently with member
+/// calls. A started wait holds independent state, so another thread may
+/// destroy the Resolver and block in join.
 class Resolver {
 public:
     using Endpoints = std::vector<Endpoint>;
-    /// 可注入同步解析函数，在线程池调用；必须线程安全，不得访问 loop。
-    /// max_results 为输出上限；框架仍会去重/验证/限制返回值。
-    /// 自定义 Backend 的内部内存和执行时长由调用者负责约束。
+    /// Injectable synchronous resolve function, invoked on the thread pool; it
+    /// must be thread-safe and must not access the loop. max_results is the
+    /// output cap; the framework still deduplicates/validates/clamps returned
+    /// values. The internal memory and execution duration of a custom Backend
+    /// are the caller's responsibility to bound.
     using Backend = std::function<Result<Endpoints>(const ResolveQuery&, std::size_t max_results)>;
 
     [[nodiscard]] static Result<Resolver> create(ResolverOptions options = {}, Backend backend = {});
@@ -52,11 +58,14 @@ public:
     Resolver& operator=(const Resolver&) = delete;
     ~Resolver();
 
-    /// 参数按值拥有；空 hostname/service、嵌入 NUL 或超过 4096 字节均拒绝。
-    /// 无其他工作时仍计入 loop.outstanding()，完成仅在 loop 线程交付。
-    /// 提交前 stop > deadline > 参数校验；交付时已发布结果 > 用户取消 >
-    /// timer 超时 > resolver/loop 关闭（cancelled）。结果限制超出则 limit_exceeded。
-    /// Task 可晚于 Resolver 销毁才启动，但 EventLoop 必须活到开始等待。
+    /// Parameters are owned by value; empty hostname/service, embedded NUL, or
+    /// sizes over 4096 bytes are all rejected. Still counts toward
+    /// loop.outstanding() when no other work exists; completion is delivered
+    /// only on the loop thread. Before submission: stop > deadline > parameter
+    /// validation; at delivery: published result > user cancellation > timer
+    /// timeout > resolver/loop shutdown (cancelled). Exceeding the result limit
+    /// yields limit_exceeded. A Task may start after the Resolver is destroyed,
+    /// but the EventLoop must live until the wait begins.
     [[nodiscard]] Task<Result<Endpoints>> resolve(EventLoop& loop, ResolveQuery query,
                                                  OperationOptions options = {});
 

@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""显式构建固定版本的 H2/H3 静态依赖；不由项目 CMake 自动调用。
+"""Explicitly build pinned-version H2/H3 static dependencies; not invoked
+automatically by the project's CMake.
 
-支持 Linux/macOS、Python 3.9+、CMake 和本机 C/C++ 工具链；Windows 未验证，
-因此拒绝运行。另需预先安装提供 SSL_set_quic_tls_cbs 的 OpenSSL 3.5+。
-仅固定这三个依赖的源码，不保证不同编译器/OpenSSL 下产物逐字节一致。
-默认所有写入均位于仓库 build/protocol-deps，不安装或修改系统 OpenSSL。
+Supports Linux/macOS, Python 3.9+, CMake, and the native C/C++ toolchain;
+Windows is unverified, so running there is refused. An OpenSSL 3.5+ providing
+SSL_set_quic_tls_cbs must also be preinstalled.
+Only the sources of these three dependencies are pinned; byte-for-byte
+identical outputs across different compilers/OpenSSL are not guaranteed.
+By default all writes stay inside the repository's build/protocol-deps; the
+system OpenSSL is neither installed nor modified.
 """
 
 from __future__ import annotations
@@ -23,8 +27,9 @@ import urllib.request
 
 
 REPO = Path(__file__).resolve().parents[2]
-# 官方 GitHub release asset 的 SHA256，亦与本地归档逐字节核验；许可证均为 MIT。
-# 每份发行归档根目录的 COPYING 是许可证原文。
+# SHA256 of the official GitHub release assets, also verified byte-for-byte
+# against local archives; all licenses are MIT.
+# The COPYING at the root of each release archive is the license text.
 DEPENDENCIES = (
     ("nghttp2", "1.70.0", "nghttp2/nghttp2",
      "e05cb1388eaca3830aded4ccf20044b6e1ac1a61411dcca11b0437c4285c8bc2"),
@@ -49,27 +54,29 @@ def download(cache: Path, name: str, version: str, project: str,
     archive = cache / filename
     if archive.exists():
         if not archive.is_file() or archive.is_symlink() or sha256(archive) != expected:
-            raise ValueError(f"缓存 SHA256 校验失败，未覆盖文件：{archive}")
-        print(f"复用已校验缓存：{filename}", flush=True)
+            raise ValueError(f"Cached archive failed SHA256 verification, file not overwritten: {archive}")
+        print(f"Reusing verified cache: {filename}", flush=True)
         return archive
     if offline:
-        raise ValueError(f"离线缓存缺失：{archive}")
+        raise ValueError(f"Offline cache missing: {archive}")
     url = f"https://github.com/{project}/releases/download/v{version}/{filename}"
-    print(f"下载：{url}\nSHA256：{expected}", flush=True)
-    # 下载中断或校验失败只删除本次临时文件，不覆盖已有归档。
+    print(f"Downloading: {url}\nSHA256: {expected}", flush=True)
+    # An interrupted download or failed verification only deletes this run's
+    # temporary files; existing archives are never overwritten.
     with tempfile.TemporaryDirectory(prefix="download-", dir=cache) as temporary:
         candidate = Path(temporary) / filename
         request = urllib.request.Request(url, headers={"User-Agent": "Mira-protocol-deps"})
         with urllib.request.urlopen(request, timeout=60) as response, candidate.open("wb") as output:
             shutil.copyfileobj(response, output)
         if sha256(candidate) != expected:
-            raise ValueError(f"下载 SHA256 校验失败：{url}")
+            raise ValueError(f"Download failed SHA256 verification: {url}")
         candidate.replace(archive)
     return archive
 
 
 def extract(archive: Path, destination: Path, root_name: str) -> Path:
-    # destination 是本次运行独占的空目录；先验证全部成员，再写入普通文件。
+    # destination is an empty directory exclusive to this run; all members are
+    # validated first, then regular files are written.
     with tarfile.open(archive, "r:xz") as package:
         members = package.getmembers()
         for member in members:
@@ -77,10 +84,10 @@ def extract(archive: Path, destination: Path, root_name: str) -> Path:
             if (path.is_absolute() or ".." in path.parts or "\\" in member.name
                     or not path.parts or path.parts[0] != root_name
                     or not (member.isdir() or member.isfile())):
-                raise ValueError(f"拒绝不安全归档成员：{member.name}")
+                raise ValueError(f"Unsafe archive member rejected: {member.name}")
             target = (destination / member.name).resolve()
             if destination.resolve() not in target.parents:
-                raise ValueError(f"拒绝路径越界：{member.name}")
+                raise ValueError(f"Path escaping the destination rejected: {member.name}")
         for member in members:
             target = destination / member.name
             if member.isdir():
@@ -89,7 +96,7 @@ def extract(archive: Path, destination: Path, root_name: str) -> Path:
             target.parent.mkdir(parents=True, exist_ok=True)
             source = package.extractfile(member)
             if source is None:
-                raise ValueError(f"无法读取归档成员：{member.name}")
+                raise ValueError(f"Cannot read archive member: {member.name}")
             with source, target.open("xb") as output:
                 shutil.copyfileobj(source, output)
             target.chmod(0o755 if member.mode & 0o111 else 0o644)
@@ -100,24 +107,24 @@ def positive_jobs(value: str) -> int:
     try:
         number = int(value)
     except ValueError as error:
-        raise argparse.ArgumentTypeError("--jobs 必须是 1 到 256 的整数") from error
+        raise argparse.ArgumentTypeError("--jobs must be an integer between 1 and 256") from error
     if not 1 <= number <= 256:
-        raise argparse.ArgumentTypeError("--jobs 必须是 1 到 256 的整数")
+        raise argparse.ArgumentTypeError("--jobs must be an integer between 1 and 256")
     return number
 
 
 def output_path(value: Path) -> Path:
     path = value.expanduser().resolve()
     if path in (Path.home(), REPO) or path in REPO.parents:
-        raise ValueError(f"拒绝以主目录或仓库根目录作为输出目录：{path}")
+        raise ValueError(f"Home directory or repository root rejected as output directory: {path}")
     for system in ("/usr", "/bin", "/sbin", "/etc", "/System", "/Library", "/opt"):
         root = Path(system)
         if path == root or root in path.parents:
-            raise ValueError(f"拒绝向系统目录安装：{path}")
+            raise ValueError(f"Install into a system directory rejected: {path}")
     if path.exists() and not path.is_dir():
-        raise ValueError(f"输出路径不是目录：{path}")
+        raise ValueError(f"Output path is not a directory: {path}")
     if ";" in str(path):
-        raise ValueError("输出路径不能包含 CMake 列表分隔符 ';'")
+        raise ValueError("Output path must not contain the CMake list separator ';'")
     return path
 
 
@@ -129,28 +136,28 @@ def run(command: list[str]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--path", type=Path, default=REPO / "build/protocol-deps",
-                        help="缓存和临时构建根目录，默认仓库 build/protocol-deps")
+                        help="cache and temporary build root directory, defaults to the repository's build/protocol-deps")
     parser.add_argument("--prefix", type=Path,
-                        help="安装目录，默认 <path>/prefix；不得指向系统目录")
+                        help="install directory, defaults to <path>/prefix; must not point at a system directory")
     parser.add_argument("--openssl-root", type=Path,
-                        help="已安装的 OpenSSL 3.5+ 根目录；省略则由 CMake 查找")
+                        help="root of an installed OpenSSL 3.5+; if omitted, CMake searches for it")
     parser.add_argument("--jobs", type=positive_jobs,
-                        default=min(os.cpu_count() or 1, 8), help="并行任务数，1 到 256")
+                        default=min(os.cpu_count() or 1, 8), help="number of parallel jobs, from 1 to 256")
     parser.add_argument("--offline", action="store_true",
-                        help="禁止下载，只使用 <path>/cache 中通过哈希校验的归档")
+                        help="forbid downloads, use only hash-verified archives in <path>/cache")
     args = parser.parse_args()
     if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
-        parser.error("仅支持 Linux/macOS；Windows 尚未验证")
+        parser.error("Only Linux/macOS are supported; Windows is not yet verified")
     if shutil.which("cmake") is None:
-        parser.error("请先安装 CMake 和 C/C++ 工具链")
+        parser.error("Please install CMake and a C/C++ toolchain first")
     work = output_path(args.path)
     prefix = output_path(args.prefix or work / "prefix")
     openssl = args.openssl_root.expanduser().resolve() if args.openssl_root else None
     if openssl and (";" in str(openssl) or not (openssl / "include/openssl/ssl.h").is_file()):
-        parser.error("--openssl-root 必须包含 include/openssl/ssl.h，且路径不能包含 ';'")
+        parser.error("--openssl-root must contain include/openssl/ssl.h and the path must not contain ';'")
     cache = work / "cache"
     if prefix == cache or cache in prefix.parents or prefix in cache.parents:
-        parser.error("--prefix 不得与归档缓存目录重叠")
+        parser.error("--prefix must not overlap the archive cache directory")
     cache.mkdir(parents=True, exist_ok=True)
     archives = [(name, version, download(cache, name, version, project, digest, args.offline))
                 for name, version, project, digest in DEPENDENCIES]
@@ -159,7 +166,8 @@ def main() -> None:
               "-DENABLE_LIB_ONLY=ON", "-DBUILD_TESTING=OFF"]
     if openssl:
         common.append(f"-DOPENSSL_ROOT_DIR={openssl}")
-    # 每次从固定归档重新解压和构建，避免复用被修改的源码或旧 CMakeCache。
+    # Re-extract and rebuild from the pinned archives on every run, avoiding
+    # reuse of modified sources or a stale CMakeCache.
     with tempfile.TemporaryDirectory(prefix="build-", dir=work) as temporary:
         staging = Path(temporary)
         for name, version, archive in archives:
@@ -176,7 +184,7 @@ def main() -> None:
             if name == "ngtcp2":
                 configuration = (build / "CMakeCache.txt").read_text()
                 if "HAVE_SSL_SET_QUIC_TLS_CBS:INTERNAL=1" not in configuration:
-                    raise ValueError("ngtcp2 ossl 后端需要 OpenSSL 3.5+ 的 SSL_set_quic_tls_cbs")
+                    raise ValueError("the ngtcp2 ossl backend requires SSL_set_quic_tls_cbs from OpenSSL 3.5+")
             run(["cmake", "--build", str(build), "--parallel", str(args.jobs)])
             run(["cmake", "--install", str(build)])
             license_dir = prefix / "share/licenses" / name
@@ -185,14 +193,14 @@ def main() -> None:
     for library in ("nghttp2", "nghttp3", "ngtcp2", "ngtcp2_crypto_ossl"):
         artifact = prefix / "lib" / f"lib{library}.a"
         if not artifact.is_file():
-            raise ValueError(f"未生成预期静态库：{artifact}")
-    print(f"完成。静态库、头文件及 MIT 许可证位于：{prefix}", flush=True)
-    print(f"项目配置时显式传入 -DCMAKE_PREFIX_PATH={shlex.quote(str(prefix))}", flush=True)
+            raise ValueError(f"Expected static library not produced: {artifact}")
+    print(f"Done. Static libraries, headers, and MIT licenses are located in: {prefix}", flush=True)
+    print(f"Pass -DCMAKE_PREFIX_PATH={shlex.quote(str(prefix))} explicitly when configuring the project", flush=True)
 
 
 if __name__ == "__main__":
     try:
         main()
     except (OSError, ValueError, tarfile.TarError, subprocess.CalledProcessError) as error:
-        print(f"错误：{error}", file=sys.stderr)
+        print(f"Error: {error}", file=sys.stderr)
         sys.exit(1)

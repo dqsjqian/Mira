@@ -76,7 +76,7 @@ bool pump(EventLoop& loop, bool& done) {
 }
 
 void test_system_and_validation() {
-    test::section("DNS 系统解析与输入拥有权");
+    test::section("DNS system resolution and input ownership");
     auto loop = EventLoop::create().value();
     auto resolver = Resolver::create().value();
     Answer answer;
@@ -116,7 +116,7 @@ void test_system_and_validation() {
 }
 
 void test_root_tracking_and_ownership() {
-    test::section("DNS root outstanding 与后台线程交付");
+    test::section("DNS root outstanding and background-thread delivery");
     auto loop = EventLoop::create().value();
     Gate gate;
     const auto loop_thread = std::this_thread::get_id();
@@ -142,8 +142,8 @@ void test_root_tracking_and_ownership() {
 
 void test_cancel_timeout_late_and_loop_shutdown() {
     for (int mode = 0; mode < 3; ++mode) {
-        test::section(mode == 0 ? "DNS 取消后 late completion" :
-                      mode == 1 ? "DNS 超时后 late completion" : "DNS loop 销毁后 late completion");
+        test::section(mode == 0 ? "DNS late completion after cancellation" :
+                      mode == 1 ? "DNS late completion after timeout" : "DNS late completion after loop destruction");
         Gate gate;
         auto resolver = Resolver::create({.workers = 1}, gate.backend()).value();
         auto loop = std::make_unique<EventLoop>(EventLoop::create().value());
@@ -168,13 +168,14 @@ void test_cancel_timeout_late_and_loop_shutdown() {
         CHECK(!answer && answer.error() == (mode == 1 ? Errc::timed_out : Errc::cancelled));
         if (loop) CHECK(loop->outstanding() == 0);
         loop.reset();
-        // worker 尚在执行，但协程/loop 已结束；释放后的结果必须仅由 Job 自己清理。
+        // The worker is still executing, but the coroutine/loop has ended;
+        // the result after release must be cleaned up by the Job alone.
         gate.release();
     }
 }
 
 void test_queue_bound_and_cancelled_queue() {
-    test::section("DNS 有界队列、过载与取消排队作业");
+    test::section("DNS bounded queue, overload, and cancelled queued jobs");
     Gate gate;
     auto resolver = Resolver::create({.workers = 1, .queue_capacity = 1}, gate.backend()).value();
     auto loop = EventLoop::create().value();
@@ -199,7 +200,7 @@ void test_queue_bound_and_cancelled_queue() {
 }
 
 void test_dedup_limit_and_exceptions() {
-    test::section("DNS 去重、结果上限与 worker 异常恢复");
+    test::section("DNS deduplication, result limit, and worker exception recovery");
     auto loop = EventLoop::create().value();
     auto resolver = Resolver::create({.workers = 1, .max_results = 2},
         [](const ResolveQuery& query, std::size_t) -> Answer {
@@ -231,7 +232,7 @@ void test_dedup_limit_and_exceptions() {
 }
 
 void test_result_priority() {
-    test::section("DNS 同批次已发布结果优先于取消");
+    test::section("DNS result published in the same batch wins over cancellation");
     Gate second_gate;
     auto resolver = Resolver::create({.workers = 1}, [&](const ResolveQuery& query, std::size_t limit) -> Answer {
         if (query.hostname == "first") return Resolver::Endpoints{Endpoint::loopback(80)};
@@ -252,7 +253,7 @@ void test_result_priority() {
 }
 
 void test_resolver_lifetime() {
-    test::section("DNS 延迟启动 Task 不借用 Resolver");
+    test::section("DNS lazily started Task does not borrow the Resolver");
     auto loop = EventLoop::create().value();
     auto resolver = std::make_unique<Resolver>(Resolver::create().value());
     auto task = resolver->resolve(loop, {"localhost", "80"});
@@ -262,7 +263,7 @@ void test_resolver_lifetime() {
     CHECK(loop.run_until_complete(collect(std::move(task), answer, done)).has_value());
     CHECK(done && !answer && answer.error() == Errc::cancelled);
 
-    test::section("DNS resolver 析构取消等待且 join worker");
+    test::section("DNS resolver destructor cancels waits and joins workers");
     Gate gate;
     auto owner = std::make_shared<int>(42);
     std::weak_ptr<int> lifetime = owner;

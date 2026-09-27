@@ -23,12 +23,13 @@ using Bytes = std::vector<std::byte>;
 
 namespace detail {
 
-/// QUIC v1 数据报的理论上限（varint length + 20 字节 AEAD tag 之内可达的最大 UDP 载荷）。
-/// quic::Connection 与 http3::Connection 都以此为单包缓冲尺寸，定义在引擎头里收口，
-/// 避免两份实现各自为政后悄然漂移。
+/// Theoretical upper bound for a QUIC v1 datagram (the largest UDP payload reachable within a
+/// varint length plus the 20-byte AEAD tag). quic::Connection and http3::Connection both use it
+/// as their single-packet buffer size; defining it here in the engine header keeps the two
+/// implementations from silently drifting apart.
 inline constexpr std::size_t kMaxDatagram = 65536;
 
-/// 引擎时间源：steady_clock 的单调纳秒。ngtcp2 的全部 now/expiry 均为此单位。
+/// Engine time source: monotonic nanoseconds from steady_clock. All ngtcp2 now/expiry values use this unit.
 inline std::uint64_t now_ns() noexcept {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                           std::chrono::steady_clock::now().time_since_epoch())
@@ -37,12 +38,12 @@ inline std::uint64_t now_ns() noexcept {
 
 }  // namespace detail
 
-/// ngtcp2 原生负码与引擎自有边界码共用的错误分类。
-/// -100000 段为引擎自有码（见 engine.cpp），其余为 ngtcp2 原生码。
+/// Error category shared by native ngtcp2 negative codes and engine-owned boundary codes.
+/// The -100000 range holds engine-owned codes (see engine.cpp); the rest are native ngtcp2 codes.
 [[nodiscard]] Error quic_error(int code) noexcept;
 
-/// 用加密安全随机源填充缓冲。失败返回 false，不填充部分数据。
-/// 供 QUIC 之上的协议模块（HTTP/3 等）复用，避免它们直接依赖 TLS 后端。
+/// Fills the buffer from a cryptographically secure random source. Returns false on failure, never fills partial data.
+/// Reused by protocol modules above QUIC (HTTP/3 etc.) so they do not depend on the TLS backend directly.
 [[nodiscard]] bool fill_random(std::uint8_t* destination, std::size_t length) noexcept;
 struct Options {
     bool server = false;
@@ -64,20 +65,22 @@ struct Event {
     std::uint64_t value = 0;
     bool fin = false;
 };
-/// 单线程、无 socket 的 QUIC v1 状态机。时间为单调纳秒；调用方负责发包和到期唤醒。
-/// 当前固定路径，不支持迁移、0-RTT 或 Retry 策略。OpenSSL ossl 后端属上游实验性支持。
+/// Single-threaded, socket-free QUIC v1 state machine. Time is monotonic nanoseconds; the caller
+/// owns sending packets and waking on expiry. The path is currently fixed: migration, 0-RTT, and
+/// Retry policies are not supported. The OpenSSL ossl backend is experimental upstream support.
 class Engine {
 public:
     static Result<Engine> client(Options options, std::uint64_t now);
-    /// initial 是对端首个数据报；工厂解析连接 ID 并消费该包。
-    /// 首个可见 CRYPTO 不是 offset 0 时可能返回 ERR_RETRY；监听器地址验证/Retry 策略尚未提供。
+    /// The initial is the peer's first datagram; the factory parses the connection ID and consumes that packet.
+    /// May return ERR_RETRY when the first visible CRYPTO is not at offset 0; listener address
+    /// validation / Retry policies are not provided yet.
     static Result<Engine>
     accept(Options options, std::span<const std::byte> initial, std::uint64_t now);
     Engine(Engine&&) noexcept;
     Engine& operator=(Engine&&) noexcept;
     ~Engine();
     Result<void> receive(std::span<const std::byte> packet, std::uint64_t now);
-    /// 返回一个拥有缓冲区的数据报；空表示暂时无包。应循环调用直到空或达到调度预算。
+    /// Returns an owning-buffer datagram; empty means no packet for now. Call in a loop until empty or the scheduling budget is reached.
     Result<Bytes> poll(std::uint64_t now);
     Result<void> handle_expiry(std::uint64_t now);
     std::uint64_t expiry() const noexcept;
@@ -88,10 +91,10 @@ public:
     bool closed() const noexcept;
     std::string negotiated_protocol() const;
     Result<std::int64_t> open_stream(bool unidirectional = false);
-    /// 复制并持有数据直到真实 ACK 或 stream_close；达到总发送预算返回背压错误。
+    /// Copies and holds the data until a real ACK or stream_close; returns a backpressure error once the total send budget is reached.
     Result<void> write(std::int64_t stream, std::span<const std::byte> bytes, bool fin);
     std::vector<Event> take_events();
-    /// 应用实际消费后恢复接收窗口（不自动把 take_events 当作消费）。
+    /// Restores the receive window after the application actually consumes (take_events does not count as consumption).
     Result<void> consume(std::int64_t stream, std::size_t bytes);
     Result<void> cancel(std::int64_t stream, std::uint64_t application_error);
     Result<Bytes> close(std::uint64_t application_error, std::uint64_t now);

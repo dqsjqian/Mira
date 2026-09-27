@@ -17,7 +17,7 @@ Result<std::optional<Line>> line(Buffer& input, std::size_t limit, bool bare_lf)
     const std::string_view text{reinterpret_cast<const char*>(bytes.data()), bytes.size()};
     const auto lf = text.find('\n');
     if (lf == std::string_view::npos) {
-        // 允许恰好位于边界的 CR 等待下一个 LF。
+        // Allow a CR sitting exactly at the boundary to wait for the next LF.
         const auto size = text.size() - (!text.empty() && text.back() == '\r' ? 1u : 0u);
         if (size > limit) return fail(ParseError::limit_exceeded);
         return std::optional<Line>{};
@@ -83,7 +83,8 @@ Result<void> ResponseParser::framing() {
     std::optional<std::uint64_t> length;
     if (cl) {
         for (auto value : headers.get_all("Content-Length")) {
-            // 不容忍空列表项，避免不同解析器对 framing 的理解分歧。
+            // Empty list items are not tolerated, to avoid parsers
+            // disagreeing on framing.
             for (;;) {
                 const auto comma = value.find(',');
                 const auto n = number(grammar::trim_ows(value.substr(0, comma)), 10);

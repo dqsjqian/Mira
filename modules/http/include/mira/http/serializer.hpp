@@ -66,8 +66,10 @@ enum class SerializeError {
                                                Framing framing,
                                                std::uint64_t body_size = 0);
 
-/// 请求仅支持 origin-form 和 OPTIONS *；不支持代理 absolute-form、CONNECT、Upgrade、Expect。
-/// HTTP/1.1 必须恰好一个有效 Host；framing 完全由序列化器拥有。
+/// Requests support only origin-form and OPTIONS *; proxy absolute-form,
+/// CONNECT, Upgrade, and Expect are not supported.
+/// HTTP/1.1 requires exactly one valid Host; framing is owned entirely by
+/// the serializer.
 [[nodiscard]] Result<void> write_request_head(Buffer& out, const Request& request,
                                               std::uint64_t body_size = 0,
                                               Limits limits = {});

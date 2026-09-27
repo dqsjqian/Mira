@@ -11,16 +11,23 @@
 
 namespace Mira {
 
-/// 单线程结构化任务所有权：子任务立即启动，join 等待其帧全部释放。
+/// Single-threaded structured task ownership: child tasks start immediately,
+/// and join waits for all of their frames to be released.
 ///
-/// scope、子任务完成和 stop 回调必须在同一线程执行；不提供跨线程同步。
-/// stop token 只是协作信号，不会自动取消事件循环 I/O。子任务引用的资源
-/// 必须存活至 join 完成。传入协程 lambda 时，调用者仍须保持闭包存活。
+/// The scope, child-task completion, and stop callbacks must all run on the
+/// same thread; no cross-thread synchronisation is provided. The stop token
+/// is a cooperative signal only — it does not automatically cancel event
+/// loop I/O. Resources referenced by a child task must stay alive until join
+/// completes. When passing a coroutine lambda, the caller must still keep
+/// the closure alive.
 ///
-/// join 只能调用一次，调用即关闭 spawn；返回的 Task 必须被驱动至完成。
-/// 从未 spawn/join 的空 scope 可直接析构；其余必须在 join 完成后析构
-/// （即使 join 重抛子任务异常）。提前析构
-/// 或销毁正在等待的 join 会 terminate，而不会销毁仍被 I/O 引用的子帧。
+/// join may be called once, and calling it closes the scope to further
+/// spawns; the returned Task must be driven to completion. A scope that
+/// never spawned or joined may be destructed directly; every other scope
+/// must be destructed after join completes (even if join rethrows a child
+/// exception). Destroying one early, or destroying a join that is still
+/// waiting, terminates rather than destroying child frames still referenced
+/// by I/O.
 class TaskScope final {
 public:
     TaskScope() = default;
@@ -33,13 +40,15 @@ public:
         if (!joined_ && (used_ || joining_)) {
             std::terminate();
         }
-        // 退休队列里只剩已完成的 runner 帧；此刻其执行链早已返回。
+        // The retired queue holds only finished runner frames; by this point
+        // their execution chains have long returned.
         for (auto runner : retired_) {
             runner.destroy();
         }
     }
 
-    /// 接管一个未启动的非空 Task；完成的子帧不会积存在 scope 内。
+    /// Take over a not-yet-started, non-null Task; finished child frames do
+    /// not accumulate inside the scope.
     void spawn(Task<void> task) {
         if (joining_) {
             throw std::logic_error("Mira::TaskScope::spawn: scope is closed");
@@ -54,7 +63,8 @@ public:
         runner.start(*this);
     }
 
-    /// 调用时关闭接纳；等待所有子任务清理后重抛第一个异常。
+    /// Closes the scope to further spawns; waits for all child tasks to
+    /// clean up, then rethrows the first exception.
     [[nodiscard]] Task<void> join() {
         if (joining_) {
             throw std::logic_error("Mira::TaskScope::join: join already requested");
@@ -71,14 +81,17 @@ public:
     }
 
     bool request_stop() noexcept {
-        // 回调可同步完成最后一个子任务，继而恢复父任务并销毁 scope。
-        // 局部副本使 stop 状态独立存活，回调后不再访问 this。
+        // A callback may synchronously complete the last child task, which
+        // then resumes the parent and destroys the scope. The local copy
+        // keeps the stop state alive independently, so this is not accessed
+        // after the callbacks.
         auto source = stop_source_;
         return source.request_stop();
     }
 
 private:
-    // 仅作 Task 的启动/完成桥接，不公开第二套异步任务 API。
+    // Only a start/completion bridge for Task; this is not a second async
+    // task API.
     struct Runner {
         struct promise_type {
             TaskScope* scope{};
@@ -94,12 +107,16 @@ private:
 
                 std::coroutine_handle<>
                 await_suspend(std::coroutine_handle<promise_type> self) const noexcept {
-                    // 已到最终挂起边界。 runner 帧绝不能在这里销毁：本帧
-                    // 里还驻留着 co_await 子任务时的唤醒机器码与局部状态，
-                    // MSVC（含协程帧合并优化）会在销毁后的收尾路径上触碰
-                    // 它们（ASan heap-use-after-free）。帧移交给 scope 的
-                    // 退休队列，由 spawn 的 resume 返回后或 scope 析构时
-                    // 在安全点销毁。
+                    // The final suspension boundary has been reached. The
+                    // runner frame must never be destroyed here: it still
+                    // hosts the wakeup machinery and local state from
+                    // co_awaiting the child task, and MSVC (including its
+                    // coroutine frame merging optimisation) touches them on
+                    // the wrap-up path after destruction (ASan
+                    // heap-use-after-free). The frame is handed over to the
+                    // scope's retired queue, to be destroyed at a safe
+                    // point — after spawn's resume returns, or when the
+                    // scope is destructed.
                     auto* owner = self.promise().scope;
                     self.promise().retired = true;
                     owner->retire(self);
@@ -131,8 +148,11 @@ private:
             auto running = std::exchange(handle, {});
             scope.frame_guard_ = running.address();
             running.resume();
-            // 子任务同步完成时（帧已入退休队列），resume 已经返回，此处在
-            // 栈上安全销毁；异步完成的帧由 scope 析构统一销毁。
+            // When the child completes synchronously (the frame is already
+            // in the retired queue), resume has returned, so it is safe to
+            // destroy it here on the stack; frames that complete
+            // asynchronously are destroyed together by the scope's
+            // destructor.
             if (running && running.promise().retired) {
                 scope.reclaim(running);
             }
@@ -161,7 +181,8 @@ private:
 
     static Runner run_child(TaskScope* scope, Task<void> task) {
         try {
-            // Task 的拥有型 awaiter 在完整表达式结束时释放子任务帧。
+            // Task's owning awaiter releases the child frame at the end of
+            // the full expression.
             co_await std::move(task);
         } catch (...) {
             if (!scope->failure_) {
@@ -192,12 +213,14 @@ private:
     void* frame_guard_ = nullptr;  // MSVC HALO escape hatch, see Runner::start
     std::vector<std::coroutine_handle<>> retired_;
 
-    /// runner 帧登记退休：不在自身执行链里销毁，由安全点统一回收。
+    /// Register a runner frame as retired: it is not destroyed inside its
+    /// own execution chain; safe points reclaim them all.
     void retire(std::coroutine_handle<> runner) {
         retired_.push_back(runner);
     }
 
-    /// start 的 resume 返回后回收同步完成的 runner 帧。
+    /// Reclaim a synchronously completed runner frame after start's resume
+    /// has returned.
     void reclaim(std::coroutine_handle<> runner) {
         for (std::size_t i = retired_.size(); i-- > 0;) {
             if (retired_[i] == runner) {
@@ -206,7 +229,8 @@ private:
                 return;
             }
         }
-        runner.destroy();  // 不在队列里（例如同步完成未入队），直接销毁
+        runner.destroy();  // not in the queue (e.g. completed synchronously
+                           // without enqueuing), destroy it directly
     }
     std::coroutine_handle<> waiter_{};
     std::size_t pending_{0};

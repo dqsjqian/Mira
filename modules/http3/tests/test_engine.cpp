@@ -80,11 +80,11 @@ int main(int argc, char** argv) {
         };
         for (int i = 0; i < 1000 && !(client.ready() && server.ready()); ++i)
             drive();
-        if (!client.ready() || !server.ready()) throw std::runtime_error("HTTP3 未就绪");
+        if (!client.ready() || !server.ready()) throw std::runtime_error("HTTP3 not ready");
         for (std::int64_t invalid_id : {std::int64_t{-1}, INT64_MAX, std::int64_t{1} << 62,
                                        std::int64_t{2}, std::int64_t{3}, std::int64_t{4000}}) {
             if (client.cancel(invalid_id) || server.cancel(invalid_id))
-                throw std::runtime_error("HTTP3 接受了非法取消流编号");
+                throw std::runtime_error("HTTP3 accepted an invalid cancel stream id");
         }
         for (int round = 0; round < 100; ++round) {
             quic::Bytes body(20000, std::byte(static_cast<unsigned char>(round)));
@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
                         if (!std::all_of(e.data.begin(), e.data.end(), [&](std::byte b) {
                                 return b == std::byte(static_cast<unsigned char>(round));
                             }))
-                            throw std::runtime_error("request body 损坏");
+                            throw std::runtime_error("request body corrupted");
                         incoming += e.data.size();
                         require(server.consume(id, e.data.size()));
                     }
@@ -127,7 +127,7 @@ int main(int argc, char** argv) {
                         if (!std::all_of(e.data.begin(), e.data.end(), [&](std::byte b) {
                                 return b == std::byte(static_cast<unsigned char>(round));
                             }))
-                            throw std::runtime_error("response body 损坏");
+                            throw std::runtime_error("response body corrupted");
                         outgoing += e.data.size();
                         require(client.consume(id, e.data.size()));
                     }
@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (!response_end || !status || incoming != body.size() || outgoing != body.size())
-                throw std::runtime_error("HTTP3 请求响应不完整 round=" + std::to_string(round) + " incoming=" + std::to_string(incoming) + " outgoing=" + std::to_string(outgoing));
+                throw std::runtime_error("HTTP3 request/response incomplete round=" + std::to_string(round) + " incoming=" + std::to_string(incoming) + " outgoing=" + std::to_string(outgoing));
             for (int i = 0; i < 30; ++i) {
                 drive();
                 client.take_events();
@@ -145,11 +145,11 @@ int main(int argc, char** argv) {
         http3::Headers get{
             {":method", "GET"}, {":scheme", "https"}, {":authority", "localhost"}, {":path", "/"}};
         quic::Bytes too_big(4 * 1024 * 1024 + 1);
-        if (client.request(get, wire(too_big))) throw std::runtime_error("body 预算未生效");
+        if (client.request(get, wire(too_big))) throw std::runtime_error("body budget not enforced");
         auto too_many = get;
         for (int i = 0; i < 129; ++i)
             too_many.emplace_back("x-extra", "value");
-        if (client.request(too_many)) throw std::runtime_error("header 数量预算未生效");
+        if (client.request(too_many)) throw std::runtime_error("header count budget not enforced");
         auto canceled = require(client.request(get));
         auto survivor = require(client.request(get));
         require(client.cancel(canceled));
@@ -169,22 +169,22 @@ int main(int argc, char** argv) {
                 if (e.stream_id == survivor && e.kind == http3::Event::Kind::end)
                     survivor_done = true;
         }
-        if (!survivor_done || !reset_seen) throw std::runtime_error("HTTP3 取消未隔离其他并发流");
-        if (chaos && !drops) throw std::runtime_error("HTTP3 丢包未触发");
+        if (!survivor_done || !reset_seen) throw std::runtime_error("HTTP3 cancel failed to isolate other concurrent streams");
+        if (chaos && !drops) throw std::runtime_error("HTTP3 packet drops never triggered");
         require(server.shutdown_notice());
         for (int i = 0; i < 100 && !client.peer_goaway(); ++i)
             drive();
-        if (!client.peer_goaway()) throw std::runtime_error("GOAWAY 未抵达");
+        if (!client.peer_goaway()) throw std::runtime_error("GOAWAY did not arrive");
         require(server.shutdown());
         require(server.shutdown());
-        if (server.shutdown_notice()) throw std::runtime_error("final GOAWAY 后接受 notice");
-        if (!server.ready()) throw std::runtime_error("GOAWAY 错误时序污染连接");
+        if (server.shutdown_notice()) throw std::runtime_error("notice accepted after final GOAWAY");
+        if (!server.ready()) throw std::runtime_error("GOAWAY wrong ordering polluted the connection");
         if (client.request({{":method", "GET"},
                             {":scheme", "https"},
                             {":authority", "localhost"},
                             {":path", "/"}}))
-            throw std::runtime_error("GOAWAY 后仍接新请求");
-        std::cout << "HTTP3 真实 QUIC 加密 100轮 POST 20KB 双向 body、QPACK、GOAWAY 通过\n";
+            throw std::runtime_error("new request accepted after GOAWAY");
+        std::cout << "HTTP3 real QUIC encrypted 100-round POST with 20KB bidirectional body, QPACK, GOAWAY passed\n";
     } catch (const std::exception& ex) {
         std::cerr << ex.what() << '\n';
         return 1;

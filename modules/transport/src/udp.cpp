@@ -17,7 +17,8 @@ Socket::~Socket() {
 Socket& Socket::operator=(Socket&& other) noexcept {
     Socket previous;
     if (this != &other) {
-        // 新状态先就位；旧状态取消可恢复用户代码，此后不再访问成员。
+        // The new state is in place first; cancelling the old state may resume
+        // user code, after which members are no longer accessed.
         previous.state_ = std::exchange(state_, std::move(other.state_));
     }
     return *this;
@@ -80,7 +81,8 @@ bool Socket::is_open() const noexcept {
 }
 
 void Socket::close() noexcept {
-    // detach 可能同步恢复协程并销毁 wrapper；之后只使用局部状态。
+    // detach may synchronously resume coroutines and destroy the wrapper;
+    // only local state is used afterwards.
     auto state = std::exchange(state_, {});
     if (!state || state->handle == invalid_handle) return;
     const NativeHandle handle = std::exchange(state->handle, invalid_handle);

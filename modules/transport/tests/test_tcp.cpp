@@ -459,7 +459,8 @@ void test_pending_accept_close(bool destroy_owner) {
             if (!accepted) {
                 error = accepted.error();
             }
-            // detach 可能同步恢复续体；外层 close 必须已先放弃句柄所有权。
+            // detach may synchronously resume the continuation; the outer
+            // close must have already given up handle ownership.
             CHECK(owner->native_handle() == invalid_handle);
             owner->close();
             if (destroy) {
@@ -525,7 +526,8 @@ struct LoopbackPair {
         const bool completed = pump_until(loop, done, 2);
         CHECK(completed);
         if (!completed) {
-            // 超时后不允许挂起任务继续引用已销毁的局部状态。
+            // After a timeout, suspended tasks must not keep referencing
+            // destroyed local state.
             std::terminate();
         }
         return server.valid() && client.valid();
@@ -565,7 +567,8 @@ void test_pending_read_close(bool destroy_owner) {
             CHECK(owner->native_handle() == invalid_handle);
             owner->close();
             if (destroy) {
-                // 续体可销毁正在执行 close 的对象，外层 close 不可再读 this。
+                // The continuation may destroy the object executing close; the
+                // outer close must not read this afterwards.
                 owner.reset();
             } else {
                 Result<std::size_t> again = co_await owner->read_some(buffer);

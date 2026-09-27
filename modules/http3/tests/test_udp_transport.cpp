@@ -48,7 +48,7 @@ Task<void> server_side(transport::udp::Socket& server_socket,
                        const Endpoint& server_address, std::unique_ptr<H3Connection>& server) {
         auto datagram =
             co_await server_socket.receive_from(initial_buffer, {.deadline = Clock::now() + 5s});
-        check(datagram.has_value(), "服务端未收到 Initial");
+        check(datagram.has_value(), "server did not receive the Initial");
         initial.assign(initial_buffer.data(), initial_buffer.data() + datagram->size);
         // Engine::accept requires both endpoints: the local one we bound,
         // the remote learned from the Initial datagram's source address.
@@ -57,20 +57,20 @@ Task<void> server_side(transport::udp::Socket& server_socket,
         auto accepted = co_await H3Connection::serve(std::move(server_socket), server_options,
                                                     http3::Limits{}, initial,
                                                     {.deadline = Clock::now() + 10s});
-        check(accepted.has_value(), "服务端握手失败");
+        check(accepted.has_value(), "server handshake failed");
         if (!accepted) co_return;
         server = std::make_unique<H3Connection>(std::move(*accepted));
 
-        // 等一个请求头，回显 body，再等流结束。
+        // Wait for a request head, echo the body, then wait for end of stream.
         for (;;) {
             auto head = co_await server->await_head(0, {.deadline = Clock::now() + 10s});
-            check(head.has_value(), "服务端未收到请求头");
+            check(head.has_value(), "server did not receive the request head");
             if (!head) co_return;
             Bytes body;
             bool fin = false;
             while (!fin) {
                 auto chunk = co_await server->read_body(0, {.deadline = Clock::now() + 10s});
-                check(chunk.has_value(), "服务端读取 body 失败");
+                check(chunk.has_value(), "server body read failed");
                 if (!chunk) co_return;
                 require(server->consume(0, chunk->data.size()));
                 body.insert(body.end(), chunk->data.begin(), chunk->data.end());
@@ -93,12 +93,12 @@ Task<void> client_side(EventLoop& loop, quic::Options& client_options,
                        std::unique_ptr<H3Connection>& client) {
         auto connected = co_await H3Connection::connect(loop, client_options, http3::Limits{},
                                                           {.deadline = Clock::now() + 10s});
-        check(connected.has_value(), "客户端握手失败");
+        check(connected.has_value(), "client handshake failed");
         if (!connected) co_return;
         client = std::make_unique<H3Connection>(std::move(*connected));
 
         Bytes payload(20000, std::byte{0x48});
-        payload[11] = std::byte{0};  // 二进制安全
+        payload[11] = std::byte{0};  // Binary safety.
         const std::int64_t stream = require(co_await client->request(
             {{":method", "POST"},
              {":scheme", "https"},
@@ -107,30 +107,30 @@ Task<void> client_side(EventLoop& loop, quic::Options& client_options,
             wire(payload)));
 
         auto head = co_await client->await_head(stream, {.deadline = Clock::now() + 10s});
-        check(head.has_value(), "客户端未收到响应头");
+        check(head.has_value(), "client did not receive the response head");
         if (!head) co_return;
         bool status_ok = false;
         for (const auto& [name, value] : head->fields)
             if (name == ":status" && value == "200") status_ok = true;
-        check(status_ok, "响应状态不是 200");
+        check(status_ok, "response status is not 200");
 
         std::uint64_t total = 0;
         bool fin = false;
         while (!fin) {
             auto chunk = co_await client->read_body(stream, {.deadline = Clock::now() + 10s});
             if (!chunk)
-                throw std::runtime_error(std::string("客户端读取 body 失败: ") +
+                throw std::runtime_error(std::string("client body read failed: ") +
                                          chunk.error().message() + " (" +
                                          std::to_string(chunk.error().value()) + ")");
             if (!chunk) co_return;
             require(client->consume(stream, chunk->data.size()));
             check(std::all_of(chunk->data.begin(), chunk->data.end(),
                               [](std::byte b) { return b == std::byte{0x48} || b == std::byte{0}; }),
-                  "回显数据损坏");
+                  "echoed data corrupted");
             total += chunk->data.size();
             fin = chunk->fin;
         }
-        check(total == payload.size(), "回显字节数不符");
+        check(total == payload.size(), "echoed byte count mismatch");
         require(co_await client->close(0, {.deadline = Clock::now() + 10s}));
 }
 
@@ -173,7 +173,7 @@ int main(int argc, char** argv) {
     if (!loop) return 2;
     try {
         static_cast<void>(loop->run_until_complete(run(*loop, argv[1], argv[2])));
-        std::cout << "HTTP/3 over UDP loopback：握手、POST/回显 20KB、流控与关闭通过\n";
+        std::cout << "HTTP/3 over UDP loopback: handshake, POST/echo 20KB, flow control, and close passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

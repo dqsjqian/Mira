@@ -24,7 +24,8 @@ struct Engine::Impl {
 
     Result<Step> classify(int result, std::size_t transferred = 0) {
         if (result == 1) return Step{Status::complete, transferred};
-        // 必须紧邻 SSL 调用；不可跨 await 或任何可能修改线程错误队列的调用。
+        // Must sit immediately after the SSL call; it cannot cross an await or
+        // any call that might modify the thread's error queue.
         const int error = SSL_get_error(ssl, result);
         switch (error) {
         case SSL_ERROR_WANT_READ:
@@ -156,7 +157,8 @@ Result<Engine::Step> Engine::shutdown() {
     if (impl_->sent_shutdown) return Step{Status::complete};
     ERR_clear_error();
     const int result = SSL_shutdown(impl_->ssl);
-    // 返回 0 表示本方通知已发送，不要求对方通知已经抵达。
+    // A return of 0 means our notification has been sent; it does not require
+    // the peer's notification to have arrived.
     if (result >= 0) {
         impl_->sent_shutdown = true;
         return Step{Status::complete};

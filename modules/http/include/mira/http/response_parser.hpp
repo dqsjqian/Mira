@@ -4,21 +4,26 @@
 
 namespace Mira::http {
 
-/// 独立增量响应解析器。每个 1xx 也是一条完整消息；最终响应需 reset 后继续解析。
-/// 101 和 CONNECT 的 2xx 返回 not_supported，不消费隧道字节。
-/// 严格拒绝 obs-fold（即使 Limits 的兼容开关打开）、非 chunked 传输编码和歧义 framing。
-/// limits 的 header count/total 在头部和 trailers 间共享。
+/// Standalone incremental response parser. Each 1xx is itself a complete
+/// message; parsing of the final response continues only after a reset.
+/// 101 and a 2xx to CONNECT return not_supported, without consuming tunnel bytes.
+/// Strictly rejects obs-fold (even when the Limits compatibility switch is on),
+/// non-chunked transfer encodings, and ambiguous framing.
+/// The header count/total from limits is shared between headers and trailers.
 class ResponseParser {
 public:
     explicit ResponseParser(Method method = Method::get, Limits limits = {}) noexcept
         : limits_(limits), method_(method) {}
 
-    /// eof=true 表示输入后不再有字节。固定长度/chunked 的提前 EOF 返回 Errc::eof。
+    /// eof=true means no more bytes follow the input. A premature EOF on
+    /// fixed-length/chunked returns Errc::eof.
     [[nodiscard]] Result<ParseStep> parse(Buffer& input, bool eof = false);
-    /// 仅在完整消费 complete 后重置。不得在 body span 仍在使用时修改 input。
+    /// Reset only after complete has been fully consumed. Do not modify input
+    /// while a body span is still in use.
     void reset(Method method = Method::get);
     [[nodiscard]] const Response& response() const noexcept { return response_; }
-    /// 指向 input；有效期至下次 parse/reset 或调用者修改 input。
+    /// Points into input; valid until the next parse/reset or until the caller
+    /// modifies input.
     [[nodiscard]] std::span<const std::byte> body() const noexcept { return body_; }
     [[nodiscard]] const HeaderMap& trailers() const noexcept { return trailers_; }
     [[nodiscard]] std::uint64_t body_bytes_seen() const noexcept { return seen_; }

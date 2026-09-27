@@ -35,15 +35,15 @@ int main(int argc, char** argv) {
             if (server.expiry() <= now) require(server.handle_expiry(now));
         };
         for (int i=0; i<1000 && !(client.handshake_complete() && server.ready()); ++i) drive();
-        if (!server.ready()) throw std::runtime_error("HTTP3 握手失败");
+        if (!server.ready()) throw std::runtime_error("HTTP3 handshake failed");
         const auto control = require(client.open_stream(true));
-        // 控制流类型 0，空 SETTINGS；请求采用仅静态表的真实 QPACK 字段段。
+        // Control stream type 0, empty SETTINGS; the request uses a real QPACK field section with the static table only.
         require(client.write(control, std::vector<std::byte>{std::byte{0},std::byte{4},std::byte{0}}, false));
         const std::vector<std::byte> request{std::byte{1},std::byte{16},std::byte{0},std::byte{0},std::byte{0xd1},std::byte{0xd7},std::byte{0x50},std::byte{9},std::byte{'l'},std::byte{'o'},std::byte{'c'},std::byte{'a'},std::byte{'l'},std::byte{'h'},std::byte{'o'},std::byte{'s'},std::byte{'t'},std::byte{0xc1}};
         for(int round=0; round<4; ++round) {
             auto id = require(client.open_stream());
             if(round == 3) {
-                // PRIORITY_UPDATE_REQUEST_STREAM (0xf0700)，目标是已获 QUIC 授权的新流。
+                // PRIORITY_UPDATE_REQUEST_STREAM (0xf0700), targeting a new stream already authorized by QUIC.
                 require(client.write(control, std::vector<std::byte>{std::byte{0x80},std::byte{0x0f},std::byte{0x07},std::byte{0x00},std::byte{4},std::byte{static_cast<unsigned char>(id)},std::byte{'u'},std::byte{'='},std::byte{'3'}}, false));
             }
             require(client.write(id, request, true));
@@ -52,10 +52,10 @@ int main(int argc, char** argv) {
                 drive();
                 for(auto& e : server.take_events()) if(e.kind == http3::Event::Kind::end && e.stream_id == id) ended = true;
             }
-            if(!ended) throw std::runtime_error("动态流额度下请求无进展");
+            if(!ended) throw std::runtime_error("request made no progress under dynamic stream credit");
             require(server.respond(id, {{":status","204"}}));
             for(int i=0; i<100; ++i) { drive(); server.take_events(); }
         }
-        std::cout << "累计 MAX_STREAMS 后合法 PRIORITY_UPDATE 通过\n";
+        std::cout << "Legal PRIORITY_UPDATE after accumulated MAX_STREAMS passed\n";
     } catch(const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

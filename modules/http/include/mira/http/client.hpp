@@ -13,18 +13,24 @@ namespace Mira::http {
 struct ClientOptions {
     Limits limits{};
     std::size_t read_chunk = 8 * 1024;
-    /// 输入缓冲硬上限，与累计 body 限制独立；不足容纳一行时明确失败。
+    /// Hard cap on the input buffer, independent of the cumulative body limit;
+    /// fails explicitly when it cannot hold one line.
     std::size_t max_buffer_size = 64 * 1024;
     std::size_t max_informational_responses = 16;
-    /// 一次交换（发送、1xx、最终响应及 body）的总时限，不逐 read 刷新。
+    /// Overall deadline for one exchange (send, 1xx, final response and body),
+    /// not refreshed per read.
     Clock::duration request_timeout = Clock::duration::zero();
 };
 
-/// 顺序 HTTP/1 客户端，不拥有 stream。stream 和本对象必须活到全部任务完成。
-/// 仅在同一 event loop 使用；并发调用返回 invalid_argument。
-/// 必须 read_body 到空 span 才可发下一请求。取消/错误后永不复用；调用者负责 close。
-/// 不做 DNS、连接池、重试、重定向、解压、代理、CONNECT、Upgrade 或 Expect 握手。
-/// 请求 body 为借用的已知长度 span；响应 body 为真正按需读取、零收集的 span。
+/// Sequential HTTP/1 client that does not own the stream. The stream and this
+/// object must stay alive until all tasks complete. Use only on a single event
+/// loop; concurrent calls return invalid_argument. read_body must be drained
+/// to an empty span before the next request can be sent. Never reused after
+/// cancellation or error; the caller is responsible for closing. No DNS,
+/// connection pooling, retries, redirects, decompression, proxies, CONNECT,
+/// Upgrade, or Expect handshake. The request body is a borrowed, known-length
+/// span; the response body is a span that is truly read on demand, collecting
+/// nothing.
 template<BoundedStream Stream>
 class ClientConnection {
 public:
@@ -33,18 +39,20 @@ public:
     ClientConnection(const ClientConnection&) = delete;
     ClientConnection& operator=(const ClientConnection&) = delete;
     ~ClientConnection() {
-        // The class documents "stream 和本对象必须活到全部任务完成" as a
-        // borrow contract; dying mid-exchange means the in-flight coroutine
-        // owns a parser and a stream pointer that are about to evaporate.
-        // Terminate with a diagnosis, matching the library-wide contract
-        // style (Task, tls::Stream) instead of dangling silently.
+        // The class documents "the stream and this object must stay alive
+        // until all tasks complete" as a borrow contract; dying mid-exchange
+        // means the in-flight coroutine owns a parser and a stream pointer
+        // that are about to evaporate. Terminate with a diagnosis, matching
+        // the library-wide contract style (Task, tls::Stream) instead of
+        // dangling silently.
         if (busy_ || active_) {
             std::fputs("Mira: http::ClientConnection destroyed mid-exchange\n", stderr);
             std::abort();
         }
     }
 
-    /// request 和 body 必须活到此任务完成；返回时最终响应头可用，但 body 尚未读取完。
+    /// request and body must stay alive until this task completes; on return
+    /// the final response head is available, but the body has not been fully read.
     [[nodiscard]] Task<Result<void>>
     start(const Request& request, std::span<const std::byte> body = {}, OperationOptions io = {}) {
         if (busy_ || active_ || !reusable_) co_return fail(Errc::invalid_argument);
@@ -64,7 +72,8 @@ public:
         Buffer head;
         const auto serialized = write_request_head(head, request, body.size(), options_.limits);
         if (!serialized) co_return fail(serialized.error());
-        // 不预读、不过量分配；固定 reserve 避免 Buffer 几何扩容超过输入预算。
+        // No read-ahead and no over-allocation; the fixed reserve keeps
+        // Buffer's geometric growth from exceeding the input budget.
         if (input_.capacity() == 0) input_ = Buffer{options_.max_buffer_size};
         active_ = true;
         reusable_ = should_keep_alive(request);
@@ -97,8 +106,10 @@ public:
         co_return Result<void>{};
     }
 
-    /// 返回一个 body 片段；空片段表示完成。span 有效期至下次 start/read_body 或对象析构。
-    /// 只读 body 完成后 trailers() 才完整；忽略 body 时应循环 drain 或关闭底层 stream。
+    /// Returns one body fragment; an empty fragment means completion. The span
+    /// is valid until the next start/read_body or the object's destruction.
+    /// trailers() is complete only after the body has been fully read; when
+    /// ignoring the body, either drain it in a loop or close the underlying stream.
     [[nodiscard]] Task<Result<std::span<const std::byte>>> read_body() {
         if (busy_ || !active_) co_return fail(Errc::invalid_argument);
         Guard guard{busy_};
@@ -108,7 +119,8 @@ public:
         if (*step != ParseStep::complete)
             co_return invalidate(make_error_code(Errc::invalid_argument));
         active_ = false;
-        // 未发送下一请求却收到多余字节：不可将其误作下一次响应。
+        // Extra bytes arrive although no next request was sent: they must not
+        // be mistaken for the next response.
         if (!input_.empty()) reusable_ = false;
         co_return std::span<const std::byte>{};
     }

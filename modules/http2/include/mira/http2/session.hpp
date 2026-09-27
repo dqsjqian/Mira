@@ -37,9 +37,10 @@ struct Stream {
     Error error;
 };
 
-// 单线程、无 I/O 的 HTTP/2 prior-knowledge 引擎。TLS 调用方必须先确认 ALPN=h2。
-// 已关闭的流仍占配额，直到 release；body 仅在 take_body 后归还流控额度。
-// 不支持 server push、CONNECT、h2c Upgrade 和发送 informational/trailer。
+// Single-threaded, I/O-free HTTP/2 prior-knowledge engine. TLS callers must confirm ALPN=h2 first.
+// Closed streams still count against the quota until release; body flow-control credit is returned
+// only after take_body. Server push, CONNECT, h2c Upgrade, and sending informational/trailers are
+// not supported.
 class Session {
 public:
     static Result<Session> create(Role role, Limits limits = {});
@@ -74,7 +75,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// nghttp2 的负错误码保留在独立 error_category 中。
+// nghttp2 negative error codes are kept in a separate error_category.
 Error engine_error(int code) noexcept;
 
 } // namespace Mira::http2

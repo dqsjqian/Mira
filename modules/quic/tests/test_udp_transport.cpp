@@ -46,7 +46,7 @@ Task<void> server_side(transport::udp::Socket& server_socket,
         // serves exactly one client per socket.
         auto datagram =
             co_await server_socket.receive_from(initial_buffer, {.deadline = Clock::now() + 5s});
-        check(datagram.has_value(), "服务端未收到 Initial");
+        check(datagram.has_value(), "server did not receive the Initial");
         initial.assign(initial_buffer.data(), initial_buffer.data() + datagram->size);
         // Engine::accept requires both endpoints: the local one we bound,
         // the remote learned from the Initial datagram's source address.
@@ -55,10 +55,10 @@ Task<void> server_side(transport::udp::Socket& server_socket,
         auto accepted =
             co_await UdpConnection::serve(std::move(server_socket), server_options, initial,
                                            {.deadline = Clock::now() + 10s});
-        if (!accepted) throw std::runtime_error(std::string("服务端握手失败: ") + accepted.error().message() + " (" + std::to_string(accepted.error().value()) + ")");
+        if (!accepted) throw std::runtime_error(std::string("server handshake failed: ") + accepted.error().message() + " (" + std::to_string(accepted.error().value()) + ")");
         if (!accepted) co_return;
         server = std::make_unique<UdpConnection>(std::move(*accepted));
-        check(server->negotiated_protocol() == "h3", "服务端 ALPN 不符");
+        check(server->negotiated_protocol() == "h3", "server ALPN mismatch");
 
         // Echo the stream, then say goodbye on the same one.
         std::uint64_t total = 0;
@@ -66,14 +66,14 @@ Task<void> server_side(transport::udp::Socket& server_socket,
         quic::Bytes reply;
         while (!fin) {
             auto chunk = co_await server->read(0, {.deadline = Clock::now() + 10s});
-            check(chunk.has_value(), "服务端读取失败");
+            check(chunk.has_value(), "server read failed");
             if (!chunk) co_return;
             require(server->consume(0, chunk->data.size()));
             total += chunk->data.size();
             fin = chunk->fin;
             reply.insert(reply.end(), chunk->data.begin(), chunk->data.end());
         }
-        check(total == 200000, "服务端收到的字节数不符");
+        check(total == 200000, "server received a wrong number of bytes");
         require(co_await server->write(0, reply, true, {.deadline = Clock::now() + 10s}));
 
         // Keep pumping until the client closes the connection: destroying
@@ -88,14 +88,14 @@ Task<void> client_side(EventLoop& loop, quic::Options& client_options,
                        std::unique_ptr<UdpConnection>& client) {
         auto connected =
             co_await UdpConnection::connect(loop, client_options, {.deadline = Clock::now() + 10s});
-        if (!connected) throw std::runtime_error(std::string("客户端握手失败: ") + connected.error().message() + " (" + std::to_string(connected.error().value()) + ")");
+        if (!connected) throw std::runtime_error(std::string("client handshake failed: ") + connected.error().message() + " (" + std::to_string(connected.error().value()) + ")");
         if (!connected) co_return;
         client = std::make_unique<UdpConnection>(std::move(*connected));
-        check(client->negotiated_protocol() == "h3", "客户端 ALPN 不符");
+        check(client->negotiated_protocol() == "h3", "client ALPN mismatch");
 
         const std::int64_t stream = require(client->open_stream());
         quic::Bytes payload(200000, std::byte{0x5a});
-        payload[7] = std::byte{0};  // 二进制安全：中间有零
+        payload[7] = std::byte{0};  // Binary safety: a zero in the middle.
         // FIN rides with the payload: the server echoes what it received
         // only after seeing the end of stream, so splitting them deadlocks.
         require(co_await client->write(stream, payload, true,
@@ -105,16 +105,16 @@ Task<void> client_side(EventLoop& loop, quic::Options& client_options,
         bool fin = false;
         while (!fin) {
             auto chunk = co_await client->read(stream, {.deadline = Clock::now() + 10s});
-            if (!chunk) throw std::runtime_error(std::string("客户端读取失败: ") + chunk.error().message() + " (" + std::to_string(chunk.error().value()) + ")");
+            if (!chunk) throw std::runtime_error(std::string("client read failed: ") + chunk.error().message() + " (" + std::to_string(chunk.error().value()) + ")");
             if (!chunk) co_return;
             require(client->consume(stream, chunk->data.size()));
             check(std::all_of(chunk->data.begin(), chunk->data.end(),
                               [](std::byte b) { return b == std::byte{0x5a} || b == std::byte{0}; }),
-                  "回显数据损坏");
+                  "echoed data corrupted");
             total += chunk->data.size();
             fin = chunk->fin;
         }
-        check(total == payload.size(), "客户端回显字节数不符");
+        check(total == payload.size(), "client echoed byte count mismatch");
         require(co_await client->close(0, {.deadline = Clock::now() + 10s}));
 }
 
@@ -150,19 +150,20 @@ Task<void> run(EventLoop& loop, const char* certificate, const char* key) {
     co_await scope.join();
 }
 
-// 评审报告 Critical 回归：对端静默 + 调用方预算已过期。
+// Review-report Critical regression: silent peer + the caller's budget already expired.
 //
-// 修复前的行为：do_pump 把 timed_out 一律当引擎定时器到期“处理成功”，
-// read 的 for(;;) 拿不到 chunk 再来一轮，而 loop 对过期 deadline 的提交
-// 是同步拒绝（不挂起）——循环在同一次 dispatch 里同步空转，loop 线程上
-// 的 posted work、定时器、其他连接全部饿死，且无任何诊断。
+// Behavior before the fix: do_pump treated every timed_out as "engine timer handled
+// successfully", so read's for(;;) got no chunk and started another round, while the loop's
+// submission of an already-expired deadline is rejected synchronously (without suspending) —
+// the loop spun synchronously inside a single dispatch, starving posted work, timers, and
+// other connections on the loop thread, with no diagnosis at all.
 //
-// 修复后的契约：调用方预算到期 → 该操作立刻以 timed_out 失败返回；
-// 引擎自己的定时器到期才走 handle_expiry 继续泵。
+// Contract after the fix: caller budget expiry → the operation fails immediately with
+// timed_out; only the engine's own timer expiry goes through handle_expiry to keep pumping.
 Task<void> silent_peer_budget(EventLoop& loop, const char* certificate) {
     // A socket that receives our Initial and never answers: the black-hole peer.
     auto black_hole = transport::udp::Socket::bind(loop, Endpoint::loopback(0));
-    if (!black_hole) throw std::runtime_error("黑洞套接字绑定失败");
+    if (!black_hole) throw std::runtime_error("black-hole socket bind failed");
 
     quic::Options options;
     options.local = Endpoint::loopback(0);
@@ -177,11 +178,11 @@ Task<void> silent_peer_budget(EventLoop& loop, const char* certificate) {
     auto connected =
         co_await UdpConnection::connect(loop, options, {.deadline = Clock::now() + 300ms});
     const auto handshake_elapsed = Clock::now() - handshake_began;
-    check(!connected.has_value(), "静默对端竟然完成了握手");
+    check(!connected.has_value(), "silent peer unexpectedly completed the handshake");
     if (!connected.has_value()) {
-        check(connected.error() == Errc::timed_out, "握手失败码必须是 timed_out");
+        check(connected.error() == Errc::timed_out, "handshake failure code must be timed_out");
     }
-    check(handshake_elapsed < 5s, "握手超时必须按时返回，不得空转卡死");
+    check(handshake_elapsed < 5s, "handshake timeout must return on time, not spin and hang");
 
     // Leave the loop healthy: the caller (main, outside any coroutine) checks
     // afterwards that posted work still runs, i.e. the failed pump released
@@ -191,7 +192,7 @@ Task<void> silent_peer_budget(EventLoop& loop, const char* certificate) {
 
 }  // namespace
 
-// 检查点：见 test/timeout-expectations.md（评审报告 C1 回归）
+// Checkpoint: see test/timeout-expectations.md (review report C1 regression)
 int main(int argc, char** argv) {
     if (argc < 3) return 2;
     auto loop = EventLoop::create();
@@ -205,10 +206,10 @@ int main(int argc, char** argv) {
         // would still be inside it) and this posted work would never run.
         bool posted_ran = false;
         loop->post([&posted_ran] { posted_ran = true; });
-        check(loop->run_once(100ms).has_value(), "loop 仍然可跑");
-        check(posted_ran, "posted work 未被饿死");
+        check(loop->run_once(100ms).has_value(), "loop is still runnable");
+        check(posted_ran, "posted work was starved");
 
-        std::cout << "QUIC over UDP loopback：握手、200KB 双向流、流控、关闭与预算超时通过\n";
+        std::cout << "QUIC over UDP loopback: handshake, 200KB bidirectional streams, flow control, close, and budget timeout passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

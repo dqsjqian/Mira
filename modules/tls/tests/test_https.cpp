@@ -37,7 +37,7 @@ std::span<const std::byte> bytes_of(std::string_view text) {
 
 void require(bool condition) {
     if (!condition) {
-        throw std::runtime_error("TLS 测试证书生成失败");
+        throw std::runtime_error("TLS test certificate generation failed");
     }
 }
 
@@ -186,7 +186,8 @@ struct DetachedTask {
     };
 };
 
-// 限制每次密文 I/O 的长度，确保 TLS record 与 TCP 分片边界无关。
+// Limits the length of each ciphertext I/O so TLS records are independent of
+// TCP fragmentation boundaries.
 struct FragmentedSocket {
     tcp::Socket& socket;
     std::size_t limit;
@@ -415,7 +416,8 @@ void run_exchange(const Certificates& certificates,
     if (!server_context || !client_context) {
         return;
     }
-    // 状态先于 loop 创建，取消回调执行时所有引用仍然有效。
+    // The state is created before the loop so every reference is still valid
+    // when cancellation callbacks run.
     Exchange exchange;
     exchange.protocol = protocol;
     exchange.payload.resize(payload_size);
@@ -541,7 +543,7 @@ struct RecordingTransport {
 };
 
 void test_options_reach_the_underlying_stream(const Certificates& certificates) {
-    test::section("TLS 把同一个绝对 deadline 交给每一次底层读写");
+    test::section("TLS hands the same absolute deadline to every underlying read and write");
 
     Result<tls::Context> context = tls::Context::client(certificates.ca);
     CHECK(context.has_value());
@@ -600,7 +602,7 @@ DetachedTask start_handshake(tls::Stream<ControlledTransport>& stream, Error& er
 }
 
 void test_concurrent_operations(const Certificates& certificates) {
-    test::section("TLS 重叠操作与零进度密文写入");
+    test::section("TLS overlapping operations and zero-progress ciphertext writes");
     auto context = tls::Context::client(certificates.ca);
     CHECK(context.has_value());
     if (!context) {
@@ -688,7 +690,8 @@ DetachedTask run_alpn_peer(EventLoop& loop,
         co_return;
     }
     exchange.negotiated[peer] = stream->negotiated_protocol();
-    // ALPN 只选择名称，这里传递任意应用数据，不假装实现 HTTP/2。
+    // ALPN only selects the name; arbitrary application data is exchanged here,
+    // without pretending to implement HTTP/2.
     if (peer == 0) {
         const auto sent = co_await write_all(*stream, bytes_of("alpn"));
         CHECK(sent.has_value());
@@ -728,7 +731,8 @@ void run_alpn_exchange(const Certificates& certificates,
                    ? tls::Context::server_alpn(certificates.server, certificates.key, copied)
                    : tls::Context::client_alpn(certificates.ca, copied);
     };
-    // 配置输入在握手前销毁，验证 API 复制数据而不保留 string_view。
+    // The configuration inputs are destroyed before the handshake, verifying that
+    // the API copies the data instead of retaining string_views.
     auto server = make_owned_context(server_protocols, true);
     auto client = make_owned_context(client_protocols, false);
     CHECK(server.has_value());
@@ -771,20 +775,51 @@ void test_alpn(const Certificates& certificates) {
     constexpr std::array<std::string_view, 2> reversed{"http/1.1", "h2"};
     constexpr std::array<std::string_view, 1> http1{"http/1.1"};
     constexpr std::array<std::string_view, 1> unmatched{"other/1"};
-    run_alpn_exchange(certificates, "ALPN h2 按服务器而非客户端优先顺序选择", server, reversed, "h2");
-    run_alpn_exchange(certificates, "ALPN 客户端只提供 HTTP/1.1 时回退", server, http1, "http/1.1");
-    run_alpn_exchange(certificates, "ALPN 客户端无扩展时允许无协商", server, {}, "");
-    run_alpn_exchange(certificates, "ALPN 服务端禁用时允许无协商", {}, reversed, "");
-    run_alpn_exchange(certificates, "ALPN 无共同协议发送 fatal alert", server, unmatched, "", true);
-    run_alpn_exchange(certificates, "ALPN Context 早析构后 SSL_CTX 仍保留列表", server, reversed,
-                      "h2", false, true);
+    run_alpn_exchange(certificates,
+                      "ALPN selects h2 by server rather than client preference order",
+                      server,
+                      reversed,
+                      "h2");
+    run_alpn_exchange(certificates,
+                      "ALPN falls back when the client offers only HTTP/1.1",
+                      server,
+                      http1,
+                      "http/1.1");
+    run_alpn_exchange(certificates,
+                      "ALPN allows no negotiation when the client sends no extension",
+                      server,
+                      {},
+                      "");
+    run_alpn_exchange(certificates,
+                      "ALPN allows no negotiation when the server disables it",
+                      {},
+                      reversed,
+                      "");
+    run_alpn_exchange(certificates,
+                      "ALPN sends a fatal alert when no protocol is shared",
+                      server,
+                      unmatched,
+                      "",
+                      true);
+    run_alpn_exchange(certificates,
+                      "ALPN SSL_CTX still retains the list after early Context destruction",
+                      server,
+                      reversed,
+                      "h2",
+                      false,
+                      true);
     const std::string binary{"h\0\xff", 3};
     const std::array<std::string_view, 2> binary_server{binary, "h2"};
     const std::array<std::string_view, 2> binary_client{"h2", binary};
-    run_alpn_exchange(certificates, "ALPN 二进制协议名保留 NUL 与高位字节", binary_server,
-                      binary_client, binary, false, true);
+    run_alpn_exchange(certificates,
+                      "ALPN binary protocol names preserve NUL and high bytes",
+                      binary_server,
+                      binary_client,
+                      binary,
+                      false,
+                      true);
 
-    test::section("ALPN 列表校验与编码长度边界");
+    test::section("ALPN list validation and encoded length boundaries");
     const auto invalid = [&certificates](std::span<const std::string_view> protocols) {
         const auto client = tls::Context::client_alpn(certificates.ca, protocols);
         const auto server_context =
@@ -808,7 +843,10 @@ void test_alpn(const Certificates& certificates) {
 
     const std::string longest(255, 'x');
     const std::array<std::string_view, 1> longest_protocol{longest};
-    run_alpn_exchange(certificates, "ALPN 255 字节名称可协商", longest_protocol, longest_protocol,
+    run_alpn_exchange(certificates,
+                      "ALPN 255-byte name is negotiable",
+                      longest_protocol,
+                      longest_protocol,
                       longest);
     std::vector<std::string> names;
     names.reserve(256);
@@ -818,7 +856,7 @@ void test_alpn(const Certificates& certificates) {
     }
     std::vector<std::string_view> protocols;
     for (const auto& protocol : names) protocols.push_back(protocol);
-    invalid(protocols);  // 256 * (255 + 1) = 65536。
+    invalid(protocols);  // 256 * (255 + 1) = 65536.
     protocols.back() = protocols.back().substr(0, 254);
     CHECK(tls::Context::client_alpn(certificates.ca, protocols).has_value());
     CHECK(tls::Context::server_alpn(certificates.server, certificates.key, protocols).has_value());
@@ -865,9 +903,10 @@ DetachedTask run_mtls_peer(EventLoop& loop,
         for (;;) {
             const auto read = co_await stream->read_some(buffer);
             if (!read) {
-                // TLS 1.3 客户端可能在服务端拒绝前完成握手：拒绝以 fatal
-                // alert 形式出现在第一次读上，而不是握手失败。只有 eof
-                // 表示数据完整到达。
+                // A TLS 1.3 client may finish its handshake before the server
+                // rejects it: the rejection surfaces as a fatal alert on the
+                // first read, not as a handshake failure. Only eof means the
+                // data arrived intact.
                 if (read.error() != Errc::eof) exchange.errors[peer] = read.error();
                 break;
             }
@@ -909,7 +948,8 @@ void run_mtls_exchange(std::string_view name,
     }
     CHECK(exchange.done == 2);
     if (expect_failure) {
-        // 服务端验证客户端证书失败 → fatal alert；两侧都以协议错误收场。
+        // Server-side client certificate verification failure → fatal alert;
+        // both sides end with a protocol error.
         CHECK(exchange.errors[0] == tls::Errc::protocol_error);
         CHECK(exchange.errors[1] == tls::Errc::protocol_error);
     } else {
@@ -919,7 +959,7 @@ void run_mtls_exchange(std::string_view name,
 }
 
 void test_mtls(const Certificates& certificates) {
-    test::section("mTLS 客户端证书验证与协议版本配置");
+    test::section("mTLS client certificate verification and protocol version configuration");
     const auto server_config = [&certificates] {
         tls::Context::ServerConfig config;
         config.cert_file = certificates.server;
@@ -932,7 +972,7 @@ void test_mtls(const Certificates& certificates) {
         return config;
     };
 
-    // 未出示证书的客户端被强制模式拒绝。
+    // A client that presents no certificate is rejected in mandatory mode.
     auto require_cert = server_config();
     require_cert.client_ca_file = certificates.ca;
     auto server_ctx = tls::Context::server(require_cert);
@@ -940,10 +980,11 @@ void test_mtls(const Certificates& certificates) {
     CHECK(server_ctx.has_value());
     CHECK(anonymous.has_value());
     if (server_ctx && anonymous)
-        run_mtls_exchange("mTLS 未出示证书的客户端握手被拒",
+        run_mtls_exchange("mTLS handshake rejected for a client presenting no certificate",
                           std::move(*server_ctx), std::move(*anonymous), true);
 
-    // 出示 CA 签发证书的客户端验证通过，并完成应用数据往返。
+    // A client presenting a certificate issued by the CA passes verification and
+    // completes an application data round trip.
     auto presenting = client_config();
     presenting.cert_file = certificates.client;
     presenting.key_file = certificates.client_key;
@@ -952,10 +993,11 @@ void test_mtls(const Certificates& certificates) {
     CHECK(server_ctx.has_value());
     CHECK(client_ctx.has_value());
     if (server_ctx && client_ctx)
-        run_mtls_exchange("mTLS 客户端证书验证通过并可交换数据",
+        run_mtls_exchange("mTLS client certificate verifies and data can be exchanged",
                           std::move(*server_ctx), std::move(*client_ctx), false);
 
-    // min_version 只接受 1.2/1.3；1.3 服务端与普通客户端正常握手。
+    // min_version accepts only 1.2/1.3; a 1.3 server handshakes normally with
+    // a plain client.
     auto outdated = server_config();
     outdated.min_version = "1.1";
     const auto rejected = tls::Context::server(outdated);
@@ -967,10 +1009,10 @@ void test_mtls(const Certificates& certificates) {
     CHECK(modern_ctx.has_value());
     CHECK(plain_client.has_value());
     if (modern_ctx && plain_client)
-        run_mtls_exchange("min_version 1.3 与 TLS 1.3 客户端正常握手",
+        run_mtls_exchange("min_version 1.3 handshakes normally with a TLS 1.3 client",
                           std::move(*modern_ctx), std::move(*plain_client), false);
 
-    // 客户端证书与私钥必须成对出现。
+    // The client certificate and private key must appear as a pair.
     auto half = client_config();
     half.cert_file = certificates.client;
     const auto missing_key = tls::Context::client(half);
@@ -982,7 +1024,7 @@ void test_mtls(const Certificates& certificates) {
 }
 
 void test_configuration(const Certificates& certificates) {
-    test::section("TLS 配置错误与错误域");
+    test::section("TLS configuration errors and error domains");
     const auto missing = (certificates.directory / "does-not-exist.pem").string();
     const auto client = tls::Context::client(missing);
     CHECK(!client && client.error() == tls::Errc::configuration_error);
@@ -1004,8 +1046,8 @@ int main() {
         test_alpn(certificates);
         test_concurrent_operations(certificates);
         test_options_reach_the_underlying_stream(certificates);
-        run_exchange(certificates, "HTTPS DNS 身份验证与 close_notify", "localhost");
-        run_exchange(certificates, "HTTPS IP SAN 身份验证", "127.0.0.1");
+        run_exchange(certificates, "HTTPS DNS identity verification and close_notify", "localhost");
+        run_exchange(certificates, "HTTPS IP SAN identity verification", "127.0.0.1");
         run_exchange(certificates,
                      "HTTPS ALPN http/1.1",
                      "localhost",
@@ -1015,7 +1057,7 @@ int main() {
                      4096,
                      "http/1.1");
         run_exchange(certificates,
-                     "ALPN 不匹配必须失败",
+                     "ALPN mismatch must fail",
                      "localhost",
                      Scenario::alpn_failure,
                      false,
@@ -1023,18 +1065,25 @@ int main() {
                      4,
                      "http/1.1");
         run_exchange(certificates,
-                     "HTTPS 大数据与短密文 I/O",
+                     "HTTPS large payload with short ciphertext I/O",
                      "localhost",
                      Scenario::https,
                      false,
                      113,
                      192 * 1024);
-        run_exchange(certificates, "TLS 未知 CA 拒绝", "localhost", Scenario::verify_failure, true);
+        run_exchange(certificates,
+                     "TLS rejects unknown CA",
+                     "localhost",
+                     Scenario::verify_failure,
+                     true);
         run_exchange(
-            certificates, "TLS DNS 主机名不匹配", "wrong.example", Scenario::verify_failure);
-        run_exchange(certificates, "TLS IP SAN 不匹配", "127.0.0.2", Scenario::verify_failure);
+            certificates, "TLS DNS hostname mismatch", "wrong.example", Scenario::verify_failure);
+        run_exchange(certificates, "TLS IP SAN mismatch", "127.0.0.2", Scenario::verify_failure);
         run_exchange(
-            certificates, "TLS 裸 TCP EOF 不得视为正常关闭", "localhost", Scenario::truncated);
+            certificates,
+            "TLS bare TCP EOF must not count as a clean close",
+            "localhost",
+            Scenario::truncated);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         CHECK(false);

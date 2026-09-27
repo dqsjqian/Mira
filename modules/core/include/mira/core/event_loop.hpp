@@ -81,8 +81,9 @@ public:
     [[nodiscard]] Result<void> attach(NativeHandle handle);
 
     /// Stop tracking `handle`. Call before closing it.
-    /// POSIX 上可能同步恢复等待协程；续体不得销毁或替换此 loop，
-    /// 也不得重入 run_once。与正常 dispatch 一样，违反时 terminate。
+    /// On POSIX this may synchronously resume a waiting coroutine; the
+    /// continuation must not destroy or replace this loop, and must not
+    /// re-enter run_once. As with normal dispatch, violations terminate.
     void detach(NativeHandle handle);
 
     /// Read once into `destination`, resolving with the byte count.
@@ -142,21 +143,27 @@ public:
                                              std::span<const std::byte> address,
                                              OperationOptions options = {});
 
-    /// 数据报完成结果；地址是不透明的 sockaddr 字节，不依赖 transport。
+    /// Datagram completion result; the address is opaque sockaddr bytes,
+    /// with no dependency on the transport.
     struct DatagramResult {
         std::size_t size{0};
         alignas(std::max_align_t) std::array<std::byte, 128> address{};
         std::size_t address_size{0};
     };
 
-    /// 接收一整个数据报。零长包成功；零长 destination 仍消费一个包。
-    /// 缓冲不足返回 std::errc::message_size，整包已消费，尾部不会再次返回。
-    /// 同一 handle 每个方向只允许一个在途数据报操作，否则 invalid_argument。
-    /// buffer 借用到完成；取消不撤回已发生的 I/O，IOCP 排空完成包后才返回。
+    /// Receive one whole datagram. A zero-length packet succeeds; a
+    /// zero-length destination still consumes one packet. An undersized
+    /// buffer reports std::errc::message_size with the whole packet
+    /// consumed — the tail is never returned again. Only one datagram
+    /// operation per direction may be in flight on the same handle,
+    /// otherwise invalid_argument. The buffer is borrowed until completion;
+    /// cancellation does not revoke I/O that already happened, and on IOCP
+    /// the completion packet is drained before returning.
     [[nodiscard]] Task<Result<DatagramResult>> receive_from(
         NativeHandle handle, std::span<std::byte> destination, OperationOptions options = {});
 
-    /// 发送单个数据报（包括零长包）。地址字节与 buffer 均借用到完成。
+    /// Send a single datagram (zero-length packets included). The address
+    /// bytes and the buffer are both borrowed until completion.
     [[nodiscard]] Task<Result<std::size_t>> send_to(
         NativeHandle handle, std::span<const std::byte> source,
         std::span<const std::byte> address, OperationOptions options = {});

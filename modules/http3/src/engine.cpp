@@ -11,7 +11,7 @@
 
 namespace Mira::http3 {
 namespace {
-// 引擎自有错误码，远离 nghttp3 原生负码区间，避免与依赖库冲突。
+// Engine-owned error codes, placed far away from the native nghttp3 negative-code range to avoid clashing with the dependency.
 constexpr int invalid = -110000;
 
 class Http3Category final : public std::error_category {
@@ -25,7 +25,7 @@ public:
 }  // namespace
 
 Error http3_error(int code) noexcept {
-    // 与 quic_error 相同：category 必须有静态存储期，不能是临时对象。
+    // Same as quic_error: the category must have static storage duration, not be a temporary.
     static const Http3Category category{};
     return {code, category};
 }
@@ -181,8 +181,8 @@ struct Engine::Impl {
         try {
             auto& b = self(p).streams.at(id).output;
             if (count == 0) return NGHTTP3_ERR_CALLBACK_FAILURE;
-            // nghttp3 的 C API 收非 const uint8_t*（只读使用）；库级字节是
-            // std::byte，const_cast 只标记库边界，不授予修改。
+            // nghttp3's C API takes non-const uint8_t* (used read-only); the library-wide byte
+            // is std::byte, so the const_cast only marks the library boundary and grants no mutation.
             vec[0].base = const_cast<std::uint8_t*>(
                 reinterpret_cast<const std::uint8_t*>(b.data()));
             vec[0].len = b.size();
@@ -328,7 +328,7 @@ Result<Engine> Engine::create(quic::Engine transport, bool server, Limits limits
     cb.acked_stream_data = Impl::ack;
     cb.stream_close = Impl::stream_close;
     cb.rand = [](std::uint8_t* p, std::size_t n) {
-        // 随机源由 QUIC 模块提供，HTTP/3 不直接依赖 TLS 后端。
+        // The random source comes from the QUIC module; HTTP/3 does not depend on the TLS backend directly.
         if (!quic::fill_random(p, n)) std::terminate();
     };
     nghttp3_settings settings;
@@ -381,7 +381,7 @@ Result<quic::Bytes> Engine::poll(std::uint64_t now) {
                 std::span<const std::byte>{bytes.data(), bytes.size()},
                 fin != 0 && bytes.size() == available);
             if (!r) {
-                // -100001 是 QUIC 引擎的发送预算背压：本轮暂停输出，等下次 poll 重试。
+                // -100001 is the QUIC engine's send-budget backpressure: pause output this round and retry on the next poll.
                 if (r.error().value() == -100001) break;
                 s.failed = true;
                 return std::unexpected(r.error());

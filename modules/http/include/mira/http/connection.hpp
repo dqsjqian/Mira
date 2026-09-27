@@ -59,7 +59,8 @@ struct ServerOptions {
     /// Parser bounds; see `limits.hpp`. Closed by default.
     Limits limits{};
 
-    /// 外部取消透传到每次读取、响应写入及错误响应。
+    /// External cancellation is forwarded to every read, response write, and
+    /// error response.
     std::stop_token stop{};
 
     /// Maximum requests served on one connection before closing it.

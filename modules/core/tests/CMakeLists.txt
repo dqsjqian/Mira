@@ -39,7 +39,8 @@ mira_add_terminate_tests(task_contract mira_core_tests
 mira_add_terminate_tests(event_loop mira_event_loop_tests
     destroy-during-dispatch reentrant-run-once root-task-deadlock)
 
-# 仅 POSIX detach 同步恢复 readiness 等待者；IOCP 取消通过完成包排空。
+# POSIX-only: detach synchronously resumes readiness waiters; IOCP
+# cancellation drains through completions instead.
 if(NOT WIN32)
     mira_add_terminate_tests(event_loop mira_event_loop_tests
         destroy-during-detach reentrant-run-once-during-detach)

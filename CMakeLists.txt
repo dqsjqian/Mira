@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(Mira
-    VERSION 0.3.0
+    VERSION 0.4.0
     DESCRIPTION "Coroutine-native C++23 networking library — transport, protocols, and nothing else"
     LANGUAGES CXX
 )
@@ -83,8 +83,9 @@ function(mira_install_module target)
         return()
     endif()
 
-    # Export-set 名字与目标一一对应，用映射表而非 if/elseif 阶梯：
-    # 新模块接入只需加一行 "target=exportSet"，不再多一条分支。
+    # Export-set names map one-to-one to targets via a lookup table rather
+    # than an if/elseif ladder: a new module joins with one "target=exportSet"
+    # line, not one more branch.
     set(export_set miraTargets)
     foreach(entry
             "mira_tls=miraTlsTargets"

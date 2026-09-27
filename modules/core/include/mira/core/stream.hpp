@@ -136,8 +136,13 @@ writev_all(S& stream, std::span<const std::span<const std::byte>> pieces) {
     }
     std::size_t piece = 0;
     std::size_t offset = 0;
+    // Rebuilt every short write, so it is allocated once and reused: a
+    // loop that pays malloc per iteration is a benchmark regression waiting
+    // to be filed, and `clear()` keeps the capacity across rounds.
+    std::vector<std::span<const std::byte>> tail;
+    tail.reserve(pieces.size() - piece);
     while (piece < pieces.size()) {
-        std::vector<std::span<const std::byte>> tail;
+        tail.clear();
         // The tail always starts with the current piece — `subspan(offset)`
         // is the whole piece when nothing of it has been written yet.
         tail.push_back(pieces[piece].subspan(offset));
@@ -186,8 +191,10 @@ Task<Result<void>> writev_all(S& stream,
     }
     std::size_t piece = 0;
     std::size_t offset = 0;
+    std::vector<std::span<const std::byte>> tail;
+    tail.reserve(pieces.size() - piece);
     while (piece < pieces.size()) {
-        std::vector<std::span<const std::byte>> tail;
+        tail.clear();
         tail.push_back(pieces[piece].subspan(offset));
         tail.insert(tail.end(), pieces.begin() + static_cast<std::ptrdiff_t>(piece) + 1,
                     pieces.end());

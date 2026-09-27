@@ -10,22 +10,25 @@
 
 namespace Mira::http2 {
 
-// 适配器不拥有底层流；底层流和 Connection 必须存活且保持地址直到任务结束。
-// 同一实例只允许一个未完成操作，包括挂起期间；此时不得访问 session()，
-// 不得从其他任务重叠调用 read/flush/pump，也不可移动或析构 Connection。
-// pump 一次执行输出、一次输入和协议应答输出。调用方轮询各 stream
-// 并 take_body，驱动所有并发请求；不在单个请求上串行阻塞。
-// output() 的 vector 由 flush 协程帧独立持有，跨 write_all 挂起不借用引擎内存。
-// I/O 取消/deadline 终止连接；单流取消请用 Session::cancel。
+// The adapter does not own the underlying stream; the stream and the Connection must stay alive
+// and at a stable address until the task finishes. Only one outstanding operation is allowed per
+// instance, including while suspended; during that time session() must not be accessed, read/flush/
+// pump must not be called concurrently from other tasks, and the Connection must not be moved or
+// destroyed. A single pump performs one round of output, one round of input, and protocol-reply
+// output. The caller polls each stream and take_body to drive all concurrent requests; it never
+// blocks serially on a single request. The vector returned by output() is owned independently by
+// the flush coroutine frame, so suspending across write_all does not borrow engine memory.
+// I/O cancellation or a deadline terminates the connection; to cancel a single stream use
+// Session::cancel.
 template<BoundedStream Transport>
 class Connection {
 public:
     Connection(Transport& transport, Session session)
         : transport_(&transport), session_(std::move(session)) {}
 
-    // 契约与 tls::Stream、http::ClientConnection 同款：带未完成 I/O 析构
-    // 意味着挂起的协程帧还持有 transport_ 与引擎借用，继续运行就是
-    // use-after-free。与其无声 UB，不如当场诊断终止。
+    // Same contract as tls::Stream and http::ClientConnection: destroying with I/O still in flight
+    // means a suspended coroutine frame still borrows transport_ and the engine, so letting it
+    // run on would be use-after-free. Rather than silent UB, diagnose and abort on the spot.
     ~Connection() {
         if (in_flight_) {
             std::fputs("Mira::http2::Connection destroyed with an operation still in flight\n",
@@ -60,7 +63,7 @@ public:
     }
 
 private:
-    // 以下三个 *_locked 假定调用方已持有 in-flight 防护（公共入口或 pump）。
+    // The three *_locked helpers below assume the caller already holds the in-flight guard (a public entry point or pump).
     Task<Result<void>> flush_locked(OperationOptions options) {
         while (session_.wants_write()) {
             auto bytes = session_.output();
@@ -86,8 +89,8 @@ private:
         co_return session_.receive(std::span<const std::byte>(bytes.data(), *result));
     }
 
-    // co_await 之间没有栈展开兜底，提前 co_return 会跳过顺序复位代码，
-    // 所以用 RAII 守卫保证任何退出路径都清掉 in-flight 标记。
+    // There is no stack-unwinding safety net between co_awaits, and an early co_return would skip
+    // the sequential reset code, so an RAII guard clears the in-flight flag on every exit path.
     struct Guard {
         bool& flag;
         explicit Guard(bool& f) noexcept : flag(f) { flag = true; }
@@ -98,7 +101,7 @@ private:
 
     Transport* transport_;
     Session session_;
-    bool in_flight_ = false;  // 一个未完成的 flush/read/pump 挂起期间为 true
+    bool in_flight_ = false;  // true while one flush/read/pump is outstanding or suspended
 };
 
 } // namespace Mira::http2

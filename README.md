@@ -188,7 +188,7 @@ auto client = Mira::tls::Context::client({
 | Windows | IOCP | 桌面 loopback 运行 CI，独立 TLS 矩阵 |
 | iOS / Android | kqueue / epoll | 全部非 TLS 模块交叉编译覆盖；Android 需 **NDK 29+** |
 
-最近一次全平台 CI 通过：**13/13 job**（三桌面运行 + sanitizers + protocols + 移动交叉编译），覆盖全部协议代码。设计依据见 [架构文档](docs/ARCHITECTURE.md)。
+最近一次全平台 CI 通过：**15/15 job**（三桌面运行 + sanitizers + fuzz 烟测 + protocols + 移动交叉编译），覆盖全部协议代码。设计依据见 [架构文档](docs/ARCHITECTURE.md)。
 
 ## ✨ 能力全景
 
@@ -235,7 +235,7 @@ cmake --build build/tls -j && ctest --test-dir build/tls --output-on-failure
 
 ### 📦 在自己的项目中使用
 
-推荐与 Aria、AriaAgent 相同的**哈希钉定发布档**方式：CI 会把每个版本的源码包发布到 GitHub Release，取回、校验 SHA256、再 `add_subdirectory`，配置期不引入任何子模块或 vendored 目录：
+推荐与 Aria、AriaAgent 相同的**哈希钉定发布档**方式：每个版本的源码包随 GitHub Release 发布，取回、校验 SHA256、再 `add_subdirectory`，配置期不引入任何子模块或 vendored 目录：
 
 ```cmake
 include(ariaFetchPinned)  # 或你自己仓库里的等价「下载 + SHA256 校验」原语

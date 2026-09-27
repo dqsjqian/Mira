@@ -54,7 +54,7 @@ struct Script {
     }
 };
 Task<void> scripted() {
-    test::section("短读短写、1xx、真正流式读取、绝对预算");
+    test::section("short reads and writes, 1xx, true streaming reads, absolute deadlines");
     Script stream;
     stream.input = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nX: y\r\n\r\n"
                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: "
@@ -87,7 +87,7 @@ Task<void> scripted() {
         CHECK_VALUE(io.stop == stop.get_token());
     }
 
-    test::section("顺序复用和 HEAD framing");
+    test::section("sequential reuse and HEAD framing");
     stream.input += "HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n";
     req.method = Method::head;
     CHECK_VALUE(co_await client.start(req));
@@ -103,7 +103,7 @@ Task<void> scripted() {
     CHECK_VALUE(!(co_await client.start(req)));
 }
 Task<void> limits_and_errors() {
-    test::section("错误后禁复用、EOF、取消和所有资源预算");
+    test::section("no reuse after error, EOF, cancellation, and all resource budgets");
     const std::vector<std::string> broken{
         "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabc",
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n",
@@ -225,7 +225,7 @@ struct FragmentedSocket {
     }
 };
 Task<void> loopback(EventLoop& loop) {
-    test::section("真实 TCP 客户端/服务端、确定性碎片及 keep-alive");
+    test::section("real TCP client/server, deterministic fragmentation, and keep-alive");
     auto listener = tcp::Listener::bind(loop, Endpoint::loopback(0));
     CHECK_VALUE(listener);
     if (!listener) co_return;
@@ -286,9 +286,9 @@ Task<void> loopback(EventLoop& loop) {
     co_await scope.join();
 }
 Task<void> tcp_cancel(EventLoop& loop, bool timeout, bool server_side) {
-    test::section(server_side ? "服务端外部取消"
-                  : timeout   ? "TCP 待读总 deadline"
-                              : "TCP 待读主动取消");
+    test::section(server_side ? "server-side external cancellation"
+                  : timeout   ? "TCP pending-read overall deadline"
+                              : "TCP pending-read active cancellation");
     auto listener = tcp::Listener::bind(loop, Endpoint::loopback(0));
     CHECK_VALUE(listener);
     if (!listener) co_return;
@@ -361,7 +361,7 @@ Task<void> tcp_cancel(EventLoop& loop, bool timeout, bool server_side) {
     co_await scope.join();
 }
 Task<void> raw_loopback(EventLoop& loop) {
-    test::section("真实 TCP 原始响应互操作及负测");
+    test::section("real TCP raw response interop and negative tests");
     const std::vector<std::string> wires{
         "HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
         "HTTP/1.0 200 OK\r\n\r\nok",

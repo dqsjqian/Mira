@@ -209,7 +209,8 @@ Result<void> write_request_head(Buffer& out, const Request& request,
         return fail(SerializeError::invalid_header);
     }
     if (const auto host = request.headers.get("Host")) {
-        // 保守 authority 子集：ASCII reg-name / 方括号 IPv6，以及可选十进制端口。
+        // Conservative authority subset: ASCII reg-name / bracketed IPv6,
+        // plus an optional decimal port.
         auto authority = *host;
         if (authority.empty()) return fail(SerializeError::invalid_header);
         std::string_view port;

@@ -10,8 +10,9 @@
 
 namespace Mira::tls {
 
-/// 同步 memory BIO 状态机，不持有 socket，不执行任何异步 I/O。
-/// 单实例调用须串行；每次 step 后先排空密文，再提供所需输入。
+/// Synchronous memory-BIO state machine; it holds no socket and performs no
+/// asynchronous I/O. Calls on a single instance must be serialized; after each
+/// step, drain the ciphertext first, then supply whatever input is needed.
 class Engine {
 public:
     enum class Status { complete, want_input, want_output, eof };
@@ -32,16 +33,20 @@ public:
     [[nodiscard]] Result<Step> handshake();
     [[nodiscard]] Result<Step> read(std::span<std::byte> destination);
     [[nodiscard]] Result<Step> write(std::span<const std::byte> source);
-    /// complete 仅表示本方 close_notify 已生成，调用方仍须排空密文。
+    /// complete only means our close_notify has been generated; the caller must
+    /// still drain the ciphertext.
     [[nodiscard]] Result<Step> shutdown();
-    /// 握手完成前或未协商 ALPN 时为空；视图由本 Engine 持有，析构后失效。
+    /// Empty before the handshake completes or when no ALPN was negotiated; the
+    /// view is owned by this Engine and is invalidated on destruction.
     [[nodiscard]] std::string_view negotiated_protocol() const noexcept;
 
     [[nodiscard]] std::size_t input_capacity() const noexcept;
     [[nodiscard]] Result<std::size_t> feed(std::span<const std::byte> ciphertext);
-    /// 失败后仍可取走已生成的密文（如 fatal alert），不会再次驱动 SSL I/O。
+    /// After a failure the already-generated ciphertext (such as a fatal alert)
+    /// can still be collected; the SSL I/O is never driven again.
     [[nodiscard]] Result<std::size_t> drain(std::span<std::byte> ciphertext);
-    /// 底层失败或驱动被取消后必须使状态机失效，不能重试应用数据。
+    /// After an underlying failure or a cancelled drive the state machine must be
+    /// invalidated; application data must not be retried.
     void invalidate() noexcept;
 
 private:

@@ -181,7 +181,8 @@ public:
         fail_waiters(fd, make_error_code(Errc::cancelled));
     }
 
-    // 占位覆盖整个重试循环，不随 readiness 通知提前释放。
+    // The slot covers the whole retry loop; it is not released early on a
+    // readiness notification.
     // Held under `mutex_`, same as `add_waiter`/`add_timer`: a coroutine that
     // migrated to another thread via `schedule_on` may call `receive_from`
     // off the loop thread, and the loop thread can be inside `detach` at the
@@ -626,7 +627,8 @@ private:
         if (unlinked.result) {
             *unlinked.result = outcome;
         }
-        // detach 也会同步恢复续体；不能只依赖 run_once 的批次保护。
+        // detach also resumes continuations synchronously; the batch guard
+        // in run_once alone is not enough.
         const detail::DispatchScope dispatching{dispatch_depth_};
         unlinked.handle.resume();
     }
@@ -989,8 +991,10 @@ Task<Result<EventLoop::DatagramResult>> EventLoop::receive_from(
     for (;;) {
         if (*token) co_return fail(Errc::cancelled);
         DatagramResult result;
-        // Darwin 的零长度 iovec 不保证执行数据报接收；用一字节 scratch
-        // 强制消费，非空包随后按用户容量报告截断。
+        // Darwin does not guarantee that a zero-length iovec performs the
+        // datagram receive; a one-byte scratch forces the consumption, and a
+        // non-empty packet is then reported as truncated against the user's
+        // capacity.
         std::byte scratch{};
         iovec buffer{destination.empty() ? &scratch : destination.data(),
                      destination.empty() ? 1U : destination.size()};

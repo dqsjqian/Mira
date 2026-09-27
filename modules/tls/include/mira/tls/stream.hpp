@@ -13,20 +13,28 @@
 
 namespace Mira::tls {
 
-/// 泛型异步 TLS 包装器，不拥有底层流，也不关闭底层连接。
-/// Context 可在 create 后销毁；底层流、Stream 和传入 span 的存储必须存活到
-/// 返回的惰性 Task 完成或被安全销毁。Task 未结束时不可移动/析构 Stream。
-/// 同一实例同时只允许一个操作（包括读写），重叠操作返回 operation_in_progress。
-/// 已开始的操作被取消/抛异常或发生致命错误后不可复用；析构不会发送 close_notify。
-/// 不能绕过本包装器直接操作底层流。跨线程驱动还须遵守底层流的线程约束。
+/// Generic asynchronous TLS wrapper; it neither owns nor closes the underlying stream.
+/// The Context may be destroyed after create; the underlying stream, the Stream, and
+/// the storage behind any passed-in span must survive until the returned lazy Task
+/// completes or is safely destroyed. The Stream must not be moved or destroyed while
+/// a Task is outstanding. Only one operation at a time (reads and writes included) is
+/// allowed per instance; overlapping operations return operation_in_progress. After a
+/// started operation is cancelled or throws, or after a fatal error, the instance
+/// cannot be reused; the destructor does not send close_notify. The underlying stream
+/// must not be touched directly, bypassing this wrapper. Driving across threads must
+/// also respect the underlying stream's threading constraints.
 ///
-/// 底层流必须是 `BoundedStream`。一次 TLS 操作会对底层做任意多次读写，而只有
-/// 真正在等待的那一层能停止等待；底层若无法承载 `OperationOptions`，本包装器
-/// 就兑现不了取消与截止时间，handshake 会变成一个随时可能挂死的等待。
+/// The underlying stream must be a `BoundedStream`. A single TLS operation performs
+/// an unbounded number of reads and writes on the underlying stream, and only the
+/// layer that is genuinely waiting can stop waiting; if the underlying stream cannot
+/// carry `OperationOptions`, this wrapper cannot honour cancellation and deadlines,
+/// and handshake degenerates into a wait that can hang at any moment.
 ///
-/// `options` 原样转发给**每一次**底层读写。这正是绝对截止时间的含义：没有任何
-/// 一层需要扣减已耗时间，一个 `{.deadline = T}` 自然表示「整个 handshake / 读 /
-/// 写必须在 T 之前结束」。换成时长的话每层都得自己做减法，而且都会算错。
+/// `options` is forwarded verbatim to **every** underlying read and write. That is
+/// exactly what an absolute deadline means: no layer needs to subtract elapsed time,
+/// and a single `{.deadline = T}` naturally says "the whole handshake / read / write
+/// must finish before T". With a duration instead, every layer would have to do its
+/// own subtraction, and every layer would get it wrong.
 template<BoundedStream Underlying>
 class Stream {
 public:
@@ -41,9 +49,11 @@ public:
     Stream& operator=(Stream&&) noexcept = default;
     Stream(const Stream&) = delete;
     Stream& operator=(const Stream&) = delete;
-    /// 断言即契约：析构时仍有未完成操作意味着协程帧里还挂着对 State 的
-    /// 借用，继续运行就是 use-after-free。与其无声 UB，不如当场诊断终止
-    /// ——与 Task 析构契约同款（std::thread 的 join 契约亦是如此）。
+    /// The assert is the contract: an operation still in flight at destruction time
+    /// means coroutine frames still hold borrows of the State, and letting them run
+    /// on is a use-after-free. Rather than silent UB, diagnose and terminate on the
+    /// spot — the same deal as the Task destruction contract (std::thread's join
+    /// contract is no different).
     ~Stream() {
         if (state_ && state_->active.test(std::memory_order_acquire)) {
             std::fprintf(stderr,
@@ -67,13 +77,16 @@ public:
         return run(state_.get(), Operation::write, {}, source, std::move(options));
     }
 
-    /// 发送并 flush 本方 close_notify；不等待对方通知，不代表双向关闭完成。
-    /// 成功后只能再次 shutdown，不能继续应用读写；底层流由调用方关闭。
+    /// Sends and flushes our close_notify; it does not wait for the peer's
+    /// notification and does not imply that bidirectional close is complete.
+    /// After success only another shutdown is allowed, not further application
+    /// reads or writes; the underlying stream is closed by the caller.
     [[nodiscard]] Task<Result<void>> shutdown(OperationOptions options = {}) {
         return run_void(state_.get(), Operation::shutdown, std::move(options));
     }
 
-    /// 仅在没有未完成操作时调用；返回视图在本 Stream 析构后失效。
+    /// Call only while no operation is in flight; the returned view is invalidated
+    /// once this Stream is destroyed.
     [[nodiscard]] std::string_view negotiated_protocol() const noexcept {
         return state_ ? state_->engine.negotiated_protocol() : std::string_view{};
     }
@@ -96,7 +109,8 @@ private:
             : state(value), acquired(!state.active.test_and_set(std::memory_order_acquire)) {}
         ~OperationGuard() {
             if (acquired) {
-                // 取消可能发生在密文仅部分写出之后，不能再驱动该 SSL 对象。
+                // Cancellation may arrive after only part of the ciphertext was
+                // written; the SSL object can no longer be driven.
                 if (!completed) state.engine.invalidate();
                 state.active.clear(std::memory_order_release);
             }
@@ -174,12 +188,14 @@ private:
             if (!step) {
                 const auto error = step.error();
                 if (error != make_error_code(Errc::invalid_state)) {
-                    // 致命错误后仅发送已生成的 alert，不能再调用 SSL I/O。
-                    // 告警是收尾动作，仍受同一截止时间约束，不另给预算。
+                    // After a fatal error only the already-generated alert is sent;
+                    // the SSL I/O must not be driven again. The alert is a closing
+                    // action, still bound by the same deadline, with no extra budget.
                     try {
                         (void)co_await flush(state, options);
                     } catch (...) {
-                        // 告警发送失败不能覆盖最初的 TLS 错误。
+                        // A failure to send the alert must not mask the original
+                        // TLS error.
                     }
                 }
                 co_return fail(error);

@@ -1,7 +1,8 @@
-# 已验证依赖：nghttp2 1.70.0，MIT（上游 COPYING）。不触发网络下载。
-# 官方发布 tar.xz SHA256: e05cb1388eaca3830aded4ccf20044b6e1ac1a61411dcca11b0437c4285c8bc2
+# Verified dependency: nghttp2 1.70.0, MIT (upstream COPYING). No network downloads.
+# Official release tar.xz SHA256: e05cb1388eaca3830aded4ccf20044b6e1ac1a61411dcca11b0437c4285c8bc2
 # v1.70.0 commit: 85e300c79fb6dbcfa9c1013215c8710c1c2cd3d2
-# 1.61 是所需 *2 / max_continuations API 下限，不等于其他版本已完成运行验证。
+# 1.61 is the floor for the *2 / max_continuations APIs this code uses; other
+# versions have not been run-verified.
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 find_package(NGHTTP2 1.61 REQUIRED)
 

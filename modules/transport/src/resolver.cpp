@@ -160,7 +160,8 @@ public:
         {
             const std::lock_guard lock{state->mutex};
             state->closing = true;
-            // completion 的回调只投递取消，不会同步恢复协程或获取 State 锁。
+            // The completion callbacks only post cancellation; they never
+            // synchronously resume coroutines or take the State lock.
             for (const auto& job : state->queue) close_job(job);
             for (const auto& job : state->active) close_job(job);
             state->queue.clear();
@@ -252,7 +253,7 @@ public:
         {
             const std::lock_guard lock{shared->mutex};
             if (shared->closing) co_return fail(Errc::cancelled);
-            // 已取消的排队作业不占用后续请求的配额。
+            // Cancelled queued jobs do not consume quota of later requests.
             std::erase_if(shared->queue, [](const auto& pending) {
                 const std::lock_guard pending_lock{pending->mutex};
                 return pending->abandoned || pending->user_cancelled;
@@ -301,7 +302,8 @@ Resolver::~Resolver() = default;
 
 Task<Result<Resolver::Endpoints>> Resolver::resolve(EventLoop& loop, ResolveQuery query,
                                                     OperationOptions options) {
-    // 非协程包装在调用时持有状态，避免延迟启动的 Task 解引用已销毁的 this。
+    // The non-coroutine wrapper holds the state at call time, so a lazily
+    // started Task never dereferences a destroyed this.
     return Impl::resolve(impl_ ? impl_->state : nullptr, loop, std::move(query), std::move(options));
 }
 

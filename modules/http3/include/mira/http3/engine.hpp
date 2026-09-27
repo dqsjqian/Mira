@@ -7,13 +7,14 @@
 
 namespace Mira::http3 {
 using Mira::Result;
-/// HTTP/2 与 HTTP/3 的头部区块语义相同（HPACK/QPACK 压缩同一份字段序列模型），
-/// 所以共用同一个头部列表类型：换传输层不需要重写头部处理代码。
+/// HTTP/2 and HTTP/3 share the same header-block semantics (HPACK/QPACK compress the same field
+/// sequence model), so they share one header list type: swapping transports requires no rewrite
+/// of header-handling code.
 using Mira::http2::Header;
 using Mira::http2::Headers;
 
-/// nghttp3 原生负码与引擎自有边界码共用的错误分类。
-/// -100000 段为引擎自有码，其余为 nghttp3 原生码。
+/// Error category shared by native nghttp3 negative codes and engine-owned boundary codes.
+/// The -100000 range holds engine-owned codes; the rest are native nghttp3 codes.
 [[nodiscard]] Error http3_error(int code) noexcept;
 struct Limits {
     std::size_t max_header_bytes = 64 * 1024;
@@ -29,8 +30,9 @@ struct Event {
     quic::Bytes data;
     std::uint64_t error_code = 0;
 };
-/// 拥有 QUIC 引擎的 HTTP/3 状态机；仅 h3 ALPN、无 0-RTT/server push/扩展 CONNECT。
-/// 输入 body 分片交付并通过 consume 恢复窗口；当前输出 body 复制有界整块，非异步 body source。
+/// HTTP/3 state machine owning a QUIC engine; h3 ALPN only, no 0-RTT/server push/extended CONNECT.
+/// Incoming body is delivered in chunks and the window is restored via consume; the current outgoing
+/// body copies a bounded whole block rather than acting as an async body source.
 class Engine {
 public:
     static Result<Engine> create(quic::Engine transport, bool server, Limits limits = {});
@@ -51,7 +53,7 @@ public:
     std::vector<Event> take_events();
     Result<void> consume(std::int64_t stream, std::size_t bytes);
     Result<void> cancel(std::int64_t stream);
-    /// 两阶段 GOAWAY：notice 后由调用方等待合适的 RTT 再调用 shutdown。
+    /// Two-phase GOAWAY: after the notice the caller waits a suitable RTT before calling shutdown.
     Result<void> shutdown_notice();
     Result<void> shutdown();
     Result<quic::Bytes> close(std::uint64_t code, std::uint64_t now);

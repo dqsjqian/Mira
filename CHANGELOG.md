@@ -5,18 +5,20 @@ version is 0, the minor version is where breaking changes land: a request for
 0.3 is not satisfied by 0.2, which the package-config version file encodes as
 `SameMinorVersion`.
 
-## [0.3.0]
-
-### Renamed
-
-- The project is now **Mira** (formerly `continuo`). Export sets, package
-  config, and CMake options all follow the new name (`MiraConfig.cmake`,
-  `MIRA_*` options).
-
 ## [Unreleased]
+
+## [0.4.0] — 2026-09-27
+
+The audit-hardening release: the negative space of the parsers is explored
+continuously (fuzzing), the loop's own costs are measured (benchmarks), the
+examples prove real interop (curl speaks to every server), and the seams the
+library is built on became named, executable contracts.
 
 ### Changed
 
+- The codebase speaks one language in its comments, diagnostics, and test
+  labels: English throughout — a comment a global contributor cannot read is
+  a contract nobody can check. The bilingual README stays; the code does not.
 - `post()` takes `mira::move_only_function<void()>`: posted work no longer
   has to be copyable, so a callable capturing a `Task` can be posted
   directly. The library owns one backing implementation on every platform:
@@ -32,7 +34,9 @@ version is 0, the minor version is where breaking changes land: a request for
   concepts and `writev_all` join the stream seam; `EventLoop::writev`
   (writev(2)/WSASend) and `tcp::Socket::writev_some` implement them. A
   response head and body now leave in one submission without being
-  concatenated, removing a full copy of every response body.
+  concatenated, removing a full copy of every response body. `writev_all`
+  rebuilds its tail view per short write but allocates it once per call, so
+  a scattered transfer costs no malloc per iteration.
 - A request body whose Content-Length is parsed reserves its size up front:
   one allocation plus linear appends instead of the vector's doubling growth.
 - `Errc::internal` added: an exception that crossed a library boundary (e.g. a
@@ -144,6 +148,19 @@ version is 0, the minor version is where breaking changes land: a request for
 - `dispatch_depth_` is `std::atomic<int>`; the shutdown diagnostic no longer
   commits a data race of its own.
 - HTTP handler exceptions can no longer escape `serve_connection`.
+- Release hygiene: every version now ships its tarball as a release asset.
+  The v0.1.6 and v0.3.0 releases were published without the archive the
+  consumption example pins, which made the documented URL a 404; both
+  archives are attached, and `Mira-0.4.0.tar.gz` ships with this release
+  so the pin resolves on day one.
+
+## [0.3.0]
+
+### Renamed
+
+- The project is now **Mira** (formerly `continuo`). Export sets, package
+  config, and CMake options all follow the new name (`MiraConfig.cmake`,
+  `MIRA_*` options).
 
 ## [0.2.0]
 

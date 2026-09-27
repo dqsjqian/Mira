@@ -799,7 +799,7 @@ void test_cancel_leaves_other_direction_armed() {
 }
 
 void test_detach_and_shutdown_resume_waiters() {
-    test::section("detach 与 shutdown 同步排空双向等待，允许重入 detach");
+    test::section("detach and shutdown synchronously drain both waiting directions, tolerating re-entrant detach");
 
     struct Waiter {
         static DetachedTask go(EventLoop& loop, NativeHandle handle, bool writable,
@@ -1461,7 +1461,8 @@ int run_contract_violation(std::string_view mode) {
 #if MIRA_HAS_READINESS_API
     } else if (mode == "destroy-during-detach" ||
                mode == "reentrant-run-once-during-detach") {
-        // 已释放 mutex 的 system_error 也会触发 terminate；不能误认作契约保护。
+        // A system_error from the already-released mutex also triggers
+        // terminate; it must not be mistaken for the contract guard.
         std::set_terminate([] { std::_Exit(std::current_exception() ? 78 : 77); });
         HandlePair pair;
         if (!pair.valid()) return 2;
@@ -1491,7 +1492,8 @@ int run_contract_violation(std::string_view mode) {
         Waiter::read(loop, pair.first(), destroy);
         Waiter::write(*loop, pair.first(), sibling_done);
         if (loop->outstanding() != 2 || sibling_done != 0) std::_Exit(3);
-        // 不调用 run_once：必须命中外部 detach，而不是现有批次保护。
+        // No run_once call: the external detach must be the path that is
+        // hit, not the existing batch guard.
         loop->detach(pair.first());
         if (!destroy) delete loop;
 #endif

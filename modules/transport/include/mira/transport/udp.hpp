@@ -17,11 +17,15 @@ struct Datagram {
     Endpoint peer;
 };
 
-/// 单线程、完成式数据报传输，不是 AsyncStream。
-/// 同方向只允许一个在途操作，收发可以同时进行；冲突返回 invalid_argument。
-/// 零长包有效，零长接收缓冲也会消费一个包；截断返回 message_size 且丢弃尾部。
-/// 调用者必须保持 Task 和借用缓冲到完成；close 取消但不同步排空 IOCP。
-/// EventLoop 必须活得比 Socket 久。移动及销毁 wrapper 不影响已开始操作的状态。
+/// Single-threaded, completion-based datagram transport; not an AsyncStream.
+/// Only one in-flight operation per direction; send and receive may proceed
+/// simultaneously; conflicts return invalid_argument. Zero-length datagrams
+/// are valid, and a zero-length receive buffer also consumes one datagram;
+/// truncation returns message_size and discards the tail. The caller must keep
+/// the Task and borrowed buffers alive until completion; close cancels but
+/// does not synchronously drain IOCP. The EventLoop must outlive the Socket.
+/// Moving or destroying the wrapper does not affect the state of started
+/// operations.
 class Socket {
 public:
     Socket() = default;
@@ -31,7 +35,8 @@ public:
     Socket& operator=(const Socket&) = delete;
     ~Socket();
 
-    /// 独占绑定；不启用 SO_REUSEADDR/SO_REUSEPORT。port 0 由系统分配。
+    /// Exclusive bind; SO_REUSEADDR/SO_REUSEPORT are not enabled. Port 0 is
+    /// assigned by the system.
     [[nodiscard]] static Result<Socket>
     bind(EventLoop& loop, const Endpoint& endpoint, BindOptions options = {});
     [[nodiscard]] Result<Endpoint> local_endpoint() const;
@@ -39,7 +44,8 @@ public:
     [[nodiscard]] bool is_open() const noexcept;
     void close() noexcept;
 
-    /// peer 按值捕获，Task 延迟启动或挂起时无需保留调用者的 Endpoint。
+    /// peer is captured by value, so a lazily started or suspended Task does
+    /// not require the caller's Endpoint to stay alive.
     [[nodiscard]] Task<Result<std::size_t>>
     send_to(std::span<const std::byte> source, Endpoint peer, OperationOptions options = {});
     [[nodiscard]] Task<Result<Datagram>> receive_from(std::span<std::byte> destination,

@@ -54,7 +54,7 @@ Parsed parse(std::string_view wire,
     }
 }
 void test_incremental() {
-    test::section("响应增量分帧及 span 生命周期");
+    test::section("response incremental framing and span lifetime");
     const std::vector<std::string> messages{
         "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabcdef",
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: "
@@ -90,13 +90,13 @@ void test_incremental() {
     parser.reset();
     CHECK_VALUE(parser.parse(exact) == ParseStep::head);
     CHECK_VALUE(parser.parse(exact) == ParseStep::body);
-    CHECK_VALUE(text(parser.body()) == "abcdef");  // ASan 检查不能提前 clear 底层 vector。
+    CHECK_VALUE(text(parser.body()) == "abcdef");  // ASan check: the underlying vector must not be cleared early.
     CHECK_VALUE(exact.size() == 6);
     CHECK_VALUE(parser.parse(exact) == ParseStep::complete);
     CHECK_VALUE(exact.empty());
 }
 void test_semantics() {
-    test::section("HEAD / 1xx / 204 / 304 / EOF / tunnel 边界");
+    test::section("HEAD / 1xx / 204 / 304 / EOF / tunnel boundaries");
     for (unsigned status : {100u, 103u, 199u, 204u, 304u}) {
         auto result = parse("HTTP/1.1 " + std::to_string(status) + " X\r\n\r\n", 1);
         CHECK_VALUE(result.done);
@@ -132,7 +132,7 @@ void test_semantics() {
         "no");
 }
 void test_negative() {
-    test::section("响应走私、截断、资源上限负测");
+    test::section("response smuggling, truncation, and resource limit negative tests");
     CHECK_VALUE(
         parse("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
               1)
@@ -196,7 +196,7 @@ void test_negative() {
     limits.max_header_count = 1;
     CHECK_VALUE(parse(complete[1], 1, Method::get, limits).error == ParseError::limit_exceeded);
     limits = {};
-    limits.max_headers_total = 29;  // TE 26 + trailer 4，累计超过预算。
+    limits.max_headers_total = 29;  // TE 26 + trailer 4; the running total exceeds the budget.
     CHECK_VALUE(parse(complete[1], 1, Method::get, limits).error == ParseError::limit_exceeded);
     limits = {};
     limits.max_chunk_extension = 2;
@@ -216,7 +216,7 @@ void test_negative() {
             .error == ParseError::limit_exceeded);
 }
 void test_request_serialization() {
-    test::section("请求序列化及 Host 校验");
+    test::section("request serialization and Host validation");
     Request request;
     request.target = "/a?b=c";
     request.headers.append("Host", "example.com:8080");

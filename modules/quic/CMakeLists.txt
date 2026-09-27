@@ -1,8 +1,8 @@
-# 已验证依赖：ngtcp2 1.22.1（MIT），OpenSSL 3.6.2（Apache-2.0）。
+# Verified dependencies: ngtcp2 1.22.1 (MIT), OpenSSL 3.6.2 (Apache-2.0).
 # ngtcp2-1.22.1.tar.xz SHA256:
 # dfd2c68bd64b89847c611425b9487105c46e8447b5c21e6aeb00642c8fbe2ca8
-# 官方源码：https://github.com/ngtcp2/ngtcp2/releases/download/v1.22.1/ngtcp2-1.22.1.tar.xz
-# ossl QUIC TLS adapter 仍为上游 experimental；不自动下载依赖。
+# Official source: https://github.com/ngtcp2/ngtcp2/releases/download/v1.22.1/ngtcp2-1.22.1.tar.xz
+# The ossl QUIC TLS adapter is still marked experimental upstream; dependencies are not downloaded automatically.
 find_package(OpenSSL 3.5 REQUIRED COMPONENTS SSL Crypto)
 find_path(MIRA_NGTCP2_INCLUDE_DIR ngtcp2/ngtcp2_crypto_ossl.h REQUIRED)
 find_library(MIRA_NGTCP2_LIBRARY NAMES ngtcp2 REQUIRED)

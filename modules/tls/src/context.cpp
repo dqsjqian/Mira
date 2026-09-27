@@ -59,7 +59,8 @@ int select_protocol(SSL* ssl,
     const auto* protocols = static_cast<const std::string*>(
         SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl), protocol_index()));
     if (!protocols) return SSL_TLSEXT_ERR_ALERT_FATAL;
-    // 先验证完整 offer，再按服务器优先顺序匹配，不能随客户端排序改变选择。
+    // Validate the whole offer first, then match in the server's preference order;
+    // the selection must not change with the client's ordering.
     for (std::size_t offset = 0; offset < offered_length;) {
         const auto length = offered[offset++];
         if (length == 0 || length > offered_length - offset) return SSL_TLSEXT_ERR_ALERT_FATAL;
@@ -84,7 +85,8 @@ int select_protocol(SSL* ssl,
     return SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
-/// 装载证书链与私钥并校验匹配。三个 OpenSSL 步骤共享同一错误域。
+/// Loads the certificate chain and the private key and verifies they match.
+/// The three OpenSSL steps share one error domain.
 Result<void> apply_identity(SSL_CTX* handle,
                             std::string_view cert_file,
                             std::string_view key_file) {
@@ -102,7 +104,8 @@ Result<void> apply_identity(SSL_CTX* handle,
     return Result<void>{};
 }
 
-/// 最低协议版本只接受 "1.2"/"1.3"；TLS 1.0/1.1 从未在可选范围内。
+/// The minimum protocol version accepts only "1.2"/"1.3"; TLS 1.0/1.1 have
+/// never been an option.
 Result<void> apply_min_version(SSL_CTX* handle, std::string_view min_version) {
     const int version = min_version == "1.2"   ? TLS1_2_VERSION
                         : min_version == "1.3" ? TLS1_3_VERSION
@@ -114,8 +117,10 @@ Result<void> apply_min_version(SSL_CTX* handle, std::string_view min_version) {
     return Result<void>{};
 }
 
-/// 服务端单协议 ALPN：把协议名挂到 SSL_CTX 的 ex_data 上并安装选择回调。
-/// SSL 保留 SSL_CTX 的引用；协议副本随 SSL_CTX 释放，不依赖 Context 的生命周期。
+/// Server-side single-protocol ALPN: attaches the protocol name to the SSL_CTX's
+/// ex_data and installs the selection callback. The SSL keeps a reference to the
+/// SSL_CTX; the protocol copy is released with the SSL_CTX and does not depend on
+/// the Context's lifetime.
 Result<void> install_server_alpn(SSL_CTX* handle, std::span<const std::string_view> protocols) {
     auto wire = encode_protocols(protocols);
     if (!wire) return fail(wire.error());
@@ -213,7 +218,8 @@ Result<Context> Context::server(ServerConfig config) {
         if (SSL_CTX_load_verify_locations(impl->handle, ca.c_str(), nullptr) != 1)
             return fail(make_error_code(Errc::configuration_error));
         ERR_clear_error();
-        // 强制模式：未出示可验证证书的客户端在握手期被拒绝。
+        // Mandatory mode: clients that present no verifiable certificate are
+        // rejected during the handshake.
         SSL_CTX_set_verify(impl->handle,
                            SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
     }

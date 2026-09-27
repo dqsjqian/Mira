@@ -18,7 +18,7 @@
 
 namespace Mira::quic {
 namespace {
-// 引擎自有错误码，取远离 ngtcp2 原生负码的区间。
+// Engine-owned error codes, placed far away from native ngtcp2 negative codes.
 constexpr int invalid = -100000;
 constexpr int budget = -100001;
 
@@ -34,8 +34,8 @@ public:
 }  // namespace
 
 Error quic_error(int code) noexcept {
-    // category 必须以存储期常量返回：std::error_code 只持有其引用，
-    // 临时对象会在返回后销毁并留下悬空指针。
+    // The category must be returned as a storage-duration constant: std::error_code only holds a
+    // reference to it, and a temporary would be destroyed after the return, leaving a dangling pointer.
     static const QuicCategory category{};
     return {code, category};
 }
@@ -152,15 +152,16 @@ struct Engine::Impl {
             if (auto it = s.streams.find(id); it != s.streams.end()) {
                 for (auto& c : it->second.chunks)
                     s.buffered -= c.bytes.size();
-                // 已交付但尚未消费的数据仍在总窗口内，允许应用稍后消费。
+                // Delivered-but-unconsumed data still counts against the total window, letting the application consume it later.
                 it->second.chunks.clear();
                 it->second.closed = true;
                 if (!it->second.unread) s.streams.erase(it);
                 else released = false;
             }
-            // 对端发起的流关闭后归还其开新流的额度。记录因未消费数据保留时
-            // 延迟归还，由 consume() 清空记录后补发，保证本地记录容量始终
-            // 覆盖已放行的对端流数量。
+            // After a peer-initiated stream closes, return its credit for opening new streams.
+            // When the record is retained because of unconsumed data, the return is deferred and
+            // re-issued by consume() once the record is drained, so local record capacity always
+            // covers the number of peer streams already admitted.
             if (released && !ngtcp2_conn_is_local_stream(conn, id)) {
                 if (ngtcp2_is_bidi_stream(id))
                     ngtcp2_conn_extend_max_streams_bidi(conn, 1);
@@ -182,7 +183,7 @@ struct Engine::Impl {
         });
     }
     static void random(std::uint8_t* dest, std::size_t len, const ngtcp2_rand_ctx*) {
-        // 此无返回值回调仅用于非安全协议随机；安全 CID 在下方单独检查 RNG 返回值。
+        // This no-return-value callback is only used for non-security-protocol randomness; security-relevant CIDs below check the RNG return value separately.
         if (RAND_bytes(dest, static_cast<int>(len)) != 1) std::terminate();
     }
     static int cid(ngtcp2_conn*,
@@ -295,7 +296,7 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
     int rv;
     if (s->options.server) {
         ngtcp2_pkt_hd hd{};
-        // ngtcp2 的 C API 只说 uint8_t；库级字节是 std::byte，cast 收口在此。
+        // ngtcp2's C API only speaks uint8_t; the library-wide byte is std::byte, and the cast is contained here.
         rv = ngtcp2_accept(&hd, reinterpret_cast<const std::uint8_t*>(initial.data()),
                            initial.size());
         if (rv != 0) return std::unexpected(quic_error(rv));
@@ -423,7 +424,7 @@ Result<Bytes> Engine::poll(std::uint64_t now) {
     ngtcp2_pkt_info info{};
     ngtcp2_path_storage path;
     ngtcp2_path_storage_zero(&path);
-    // 单向控制流先于双向业务流，防止业务窗口耗尽阻塞控制/QPACK 进展。
+    // Unidirectional control streams come before bidirectional application streams, so an exhausted application window cannot stall control/QPACK progress.
     for (bool unidirectional : {true, false}) {
     for (auto& [id, stream] : s.streams) {
         if (stream.cancelled || bool(id & 2) != unidirectional) continue;
@@ -567,7 +568,7 @@ Result<void> Engine::consume(std::int64_t id, std::size_t bytes) {
     it->second.unread -= bytes;
     s.received -= bytes;
     if (it->second.closed && !it->second.unread) {
-        // 关闭时因未消费数据而延迟归还的对端流额度，在这里补发。
+        // Peer stream credit whose return was deferred at close due to unconsumed data is re-issued here.
         if (!ngtcp2_conn_is_local_stream(s.conn, id)) {
             if (ngtcp2_is_bidi_stream(id)) ngtcp2_conn_extend_max_streams_bidi(s.conn, 1);
             else ngtcp2_conn_extend_max_streams_uni(s.conn, 1);

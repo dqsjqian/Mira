@@ -138,7 +138,8 @@ public:
         static constexpr std::size_t kMaxScatter = 16;
         std::array<WSABUF, kMaxScatter> scatter{};
         DWORD scatter_count{0};
-        // Winsock 在异步完成之前仍可写地址长度和 flags。
+        // Winsock may still write the address length and flags before the
+        // asynchronous completion.
         SOCKADDR_STORAGE datagram_address{};
         int datagram_address_size{sizeof(SOCKADDR_STORAGE)};
         DWORD datagram_flags{0};
@@ -1100,8 +1101,9 @@ EventLoop& EventLoop::operator=(EventLoop&& other) noexcept {
     return *this;
 }
 EventLoop::~EventLoop() {
-    // 恢复回调可能经由 socket.close() 再调用 loop.detach()；
-    // 必须在 unique_ptr 开始销毁并清空 impl_ 之前完成 shutdown。
+    // A resumed callback may reach loop.detach() again through
+    // socket.close(); shutdown must complete before the unique_ptr starts
+    // destroying itself and clearing impl_.
     if (impl_) {
         impl_->shutdown();
     }

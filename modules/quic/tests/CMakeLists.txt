@@ -22,19 +22,20 @@ find_program(MIRA_QUIC_OPENSSL_TOOL
 if(NOT MIRA_QUIC_OPENSSL_TOOL)
     find_program(MIRA_QUIC_OPENSSL_TOOL NAMES openssl REQUIRED)
 endif()
-set(MIRA_QUIC_TEST_CERT "${CMAKE_CURRENT_BINARY_DIR}/cert.pem" CACHE INTERNAL "QUIC 测试证书")
-set(MIRA_QUIC_TEST_KEY "${CMAKE_CURRENT_BINARY_DIR}/key.pem" CACHE INTERNAL "QUIC 测试私钥")
+set(MIRA_QUIC_TEST_CERT "${CMAKE_CURRENT_BINARY_DIR}/cert.pem" CACHE INTERNAL "QUIC test certificate")
+set(MIRA_QUIC_TEST_KEY "${CMAKE_CURRENT_BINARY_DIR}/key.pem" CACHE INTERNAL "QUIC test private key")
 execute_process(COMMAND "${MIRA_QUIC_OPENSSL_TOOL}" req -x509 -newkey rsa:2048 -nodes
     -keyout "${MIRA_QUIC_TEST_KEY}" -out "${MIRA_QUIC_TEST_CERT}" -days 2
     -subj /CN=localhost -addext subjectAltName=DNS:localhost
     RESULT_VARIABLE cert_result OUTPUT_QUIET ERROR_QUIET)
 if(NOT cert_result EQUAL 0)
-    message(FATAL_ERROR "无法生成 QUIC 本地测试证书")
+    message(FATAL_ERROR "Failed to generate the local QUIC test certificate")
 endif()
 add_executable(test_quic_engine test_engine.cpp)
 target_link_libraries(test_quic_engine PRIVATE Mira::quic)
-# 断言 ngtcp2 原生错误码需要其公开头；quic 引擎将依赖保持为 PRIVATE，
-# 测试自行携带 include 路径而不把它泄漏给库的消费者。
+# Asserting ngtcp2's native error codes requires its public headers; the quic
+# engine keeps the dependency PRIVATE, so the tests carry their own include
+# path rather than leaking it to the library's consumers.
 target_include_directories(test_quic_engine PRIVATE "${MIRA_NGTCP2_INCLUDE_DIR}")
 foreach(mode normal chaos bad-host untrusted bad-alpn stream-limit)
     add_test(NAME quic_${mode} COMMAND test_quic_engine "${MIRA_QUIC_TEST_CERT}" "${MIRA_QUIC_TEST_KEY}" ${mode})

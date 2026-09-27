@@ -24,7 +24,7 @@ using namespace Mira::http2;
 using namespace std::chrono_literals;
 
 namespace {
-void require(bool ok) { if (!ok) throw std::runtime_error("HTTP2 网络测试前置条件失败"); }
+void require(bool ok) { if (!ok) throw std::runtime_error("HTTP2 network test precondition failed"); }
 std::span<const std::byte> bytes(const std::string& text) { return std::as_bytes(std::span(text)); }
 Headers request_headers(std::string path, std::string method = "GET") {
     return {{":method", std::move(method)}, {":scheme", "https"}, {":authority", "localhost"}, {":path", std::move(path)}};
@@ -72,7 +72,7 @@ Task<void> serve(S& transport, Results& results, OperationOptions options) {
         const auto flushed = co_await connection.flush(options);
         CHECK(flushed.has_value());
     }
-    // 大响应仍可能等待流窗口；继续驱动直到两条流都关闭。
+    // Large responses may still be waiting on stream windows; keep driving until both streams close.
     for (;;) {
         bool closed = true;
         for (auto id : connection.session().streams()) if (!connection.session().stream(id)->closed) closed = false;
@@ -117,7 +117,7 @@ Task<void> query(S& transport, Results& results, OperationOptions options) {
     }
     CHECK(bodies[*post] == std::vector<std::byte>(bytes(payload).begin(), bytes(payload).end()));
     CHECK(bodies[*get] == std::vector<std::byte>({std::byte{'o'}, std::byte{'k'}}));
-    // 确认服务端 GOAWAY 已完整到达，再允许底层 socket 析构。
+    // Confirm the server GOAWAY has fully arrived before letting the underlying socket destruct.
     while (connection.session().state() == State::open) {
         auto result = co_await connection.read(options);
         CHECK(result.has_value());

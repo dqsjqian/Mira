@@ -92,13 +92,13 @@ int main(int argc, char** argv) {
             drive();
         check(client.handshake_complete() && server.handshake_complete(), "handshake incomplete");
         handshake_phase = false;
-        check(!negative, "错误证书/ALPN 居然握手成功");
+        check(!negative, "bad certificate/ALPN unexpectedly completed the handshake");
         check(client.negotiated_protocol() == "h3" && server.negotiated_protocol() == "h3",
               "wrong ALPN");
         if (mode == "stream-limit") {
-            // 服务端只放行 1 个 bidi 流。双向 FIN 后流关闭，但未消费的
-            // 接收数据保留记录期间对端额度不得归还；consume 清空记录后
-            // 才补发 MAX_STREAMS。
+            // The server admits only 1 bidi stream. After both FINs the stream closes, but while
+            // the record is retained for unconsumed received data the peer's credit must not be
+            // returned; only after consume drains the record is MAX_STREAMS re-issued.
             auto first = require(client.open_stream());
             quic::Bytes small(1024, std::byte{0xa5});
             require(client.write(first, wire(small), true));
@@ -109,30 +109,30 @@ int main(int argc, char** argv) {
                 for (auto& e : server.take_events())
                     if (e.kind == quic::Event::Kind::data) {
                         got += e.data.size();
-                        fin |= e.fin;  // 故意不 consume：记录保留，额度不归还。
+                        fin |= e.fin;  // Deliberately no consume: record retained, credit not returned.
                     }
                 client.take_events();
             }
-            check(fin && got == small.size(), "首流未完整抵达");
-            require(server.write(first, {}, true));  // 回 FIN，双向关闭流 0。
-            for (int i = 0; i < 2000; ++i) drive();  // 等 ACK 触发 stream_close。
+            check(fin && got == small.size(), "first stream did not fully arrive");
+            require(server.write(first, {}, true));  // Send FIN back, closing stream 0 in both directions.
+            for (int i = 0; i < 2000; ++i) drive();  // Wait for the ACK that triggers stream_close.
             auto blocked = client.open_stream();
             check(!blocked && blocked.error().value() == NGTCP2_ERR_STREAM_ID_BLOCKED,
-                  "未消费的关闭流已归还对端额度");
-            require(server.consume(first, got));  // 清空记录，触发补发额度。
+                  "unconsumed closed stream already returned the peer's credit");
+            require(server.consume(first, got));  // Drain the record, triggering the deferred credit.
             bool reopened = false;
             for (int i = 0; i < 2000 && !reopened; ++i) {
                 drive();
                 reopened = client.open_stream().has_value();
             }
-            check(reopened, "consume 后对端额度未恢复");
-            std::cout << "QUIC stream-limit 延迟归还额度通过\n";
+            check(reopened, "peer credit did not recover after consume");
+            std::cout << "QUIC stream-limit deferred credit return passed\n";
             return 0;
         }
         auto id = require(client.open_stream());
         quic::Bytes data(200000, std::byte{0x5a});
         require(client.write(id, wire(data), true));
-        check(!client.write(id, data, false), "FIN 后仍可写");
+        check(!client.write(id, data, false), "write after FIN succeeded");
         std::size_t total = 0;
         bool fin = false;
         for (int i = 0; i < 10000 && !fin; ++i) {
@@ -173,7 +173,7 @@ int main(int argc, char** argv) {
             if (e.kind == quic::Event::Kind::data)
                 require(server.consume(e.stream_id, e.data.size()));
         require(client.cancel(cancel_id, 0x10c));
-        check(!client.write(cancel_id, {}, true), "取消后仍可写");
+        check(!client.write(cancel_id, {}, true), "write after cancel succeeded");
         bool reset = false;
         for (int i = 0; i < 2000 && !reset; ++i) {
             drive();
@@ -186,23 +186,23 @@ int main(int argc, char** argv) {
                     reset = true;
             }
         }
-        check(reset, "RESET_STREAM 未抵达");
+        check(reset, "RESET_STREAM did not arrive");
         auto other = require(client.open_stream());
         require(client.write(other, {}, true));
         auto over = require(client.open_stream());
         quic::Bytes huge(co.max_buffered_bytes + 1);
-        check(!client.write(over, wire(huge), false), "发送预算未执行");
+        check(!client.write(over, wire(huge), false), "send budget not enforced");
         auto close = require(client.close(0, now));
-        check(!close.empty(), "close 未生成数据报");
+        check(!close.empty(), "close produced no datagram");
         require(server.receive(close, now));
-        check(server.closed(), "远端未进入 draining");
-        check(!client.poll(now), "关闭后仍可发送");
-        if (mode == "chaos") check(dropped > 0, "丢包注入未触发");
-        std::cout << "QUIC " << mode << " TLS1.3 双向200KB、取消、预算、关闭通过\n";
+        check(server.closed(), "remote did not enter draining");
+        check(!client.poll(now), "send after close succeeded");
+        if (mode == "chaos") check(dropped > 0, "packet-drop injection never triggered");
+        std::cout << "QUIC " << mode << " TLS1.3 200KB bidirectional, cancel, budget, close passed\n";
     } catch (const std::exception& ex) {
         if (negative && handshake_phase &&
             std::string(ex.what()).find("ERR_CRYPTO") != std::string::npos) {
-            std::cout << "QUIC " << mode << " 拒绝握手: " << ex.what() << '\n';
+            std::cout << "QUIC " << mode << " rejected handshake: " << ex.what() << '\n';
             return 0;
         }
         std::cerr << ex.what() << '\n';
