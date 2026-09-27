@@ -670,8 +670,15 @@ DetachedTask run_alpn_peer(EventLoop& loop,
                            std::size_t peer,
                            bool destroy_context) {
     Completion completion{exchange.done};
-    auto connected = peer == 0 ? co_await listener.accept()
-                               : co_await tcp::connect(loop, listener.local_endpoint());
+    // Split by role rather than `peer == 0 ? co_await ... : co_await ...`:
+    // co_await inside the branches of a conditional operator miscompiles
+    // under GCC 15 (MinGW); see run_mtls_peer for the same note.
+    Result<tcp::Socket> connected;
+    if (peer == 0) {
+        connected = co_await listener.accept();
+    } else {
+        connected = co_await tcp::connect(loop, listener.local_endpoint());
+    }
     if (!connected) {
         exchange.errors[peer] = connected.error();
         co_return;
@@ -874,8 +881,18 @@ DetachedTask run_mtls_peer(EventLoop& loop,
                            MtlsExchange& exchange,
                            std::size_t peer) {
     Completion completion{exchange.done};
-    auto connected = peer == 0 ? co_await listener.accept()
-                               : co_await tcp::connect(loop, listener.local_endpoint());
+    // The connection step is split by role instead of written as
+    // `peer == 0 ? co_await accept() : co_await connect()`: co_await inside
+    // the branches of a conditional operator miscompiles under GCC 15
+    // (MinGW) — the operation completes but its awaiter is never resumed,
+    // so the exchange stalls until the deadline. Plain if/else lowers
+    // correctly on every toolchain.
+    Result<tcp::Socket> connected;
+    if (peer == 0) {
+        connected = co_await listener.accept();
+    } else {
+        connected = co_await tcp::connect(loop, listener.local_endpoint());
+    }
     if (!connected) {
         exchange.errors[peer] = connected.error();
         co_return;

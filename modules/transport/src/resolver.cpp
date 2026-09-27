@@ -30,11 +30,29 @@ public:
     const char* name() const noexcept override { return "Mira.resolver"; }
     std::string message(int code) const override {
 #if MIRA_PLATFORM_WINDOWS
-        const char* text = ::gai_strerrorA(code);
+        // gai_strerrorA is uneven across Windows toolchains: the SDK copy
+        // prints the WSA codes, while MinGW's returns an empty string for
+        // several of them (WSATYPE_NOT_FOUND among them). A diagnostic must
+        // never be empty, so a static table covers the codes getaddrinfo
+        // documents before falling back to the raw value.
+        if (const char* text = ::gai_strerrorA(code); text != nullptr && *text != '\0')
+            return std::string{text};
+        switch (code) {
+        case WSAHOST_NOT_FOUND: return "host not found";
+        case WSATRY_AGAIN: return "host lookup try again";
+        case WSANO_RECOVERY: return "host lookup non-recoverable failure";
+        case WSANO_DATA: return "name valid but no record of the requested type";
+        case WSATYPE_NOT_FOUND: return "service not found for the socket type";
+        case WSAEINVAL: return "invalid argument to getaddrinfo";
+        case WSAESOCKTNOSUPPORT: return "socket type unsupported by getaddrinfo";
+        case WSAEAFNOSUPPORT: return "address family unsupported by getaddrinfo";
+        default: return "unknown getaddrinfo error " + std::to_string(code);
+        }
 #else
         const char* text = ::gai_strerror(code);
+        return text != nullptr && *text != '\0' ? std::string{text}
+                                                : "unknown getaddrinfo error";
 #endif
-        return text != nullptr ? std::string{text} : "unknown getaddrinfo error";
     }
 };
 

@@ -7,6 +7,19 @@ version is 0, the minor version is where breaking changes land: a request for
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows: the resolver's diagnostic is never empty. `gai_strerrorA` is
+  uneven across toolchains — MinGW's copy returns an empty string for
+  several WSA codes (`WSATYPE_NOT_FOUND` among them) — so the category now
+  falls back to a static table of the codes `getaddrinfo` documents, then
+  to the raw value.
+- Windows: the TLS tests no longer select the connection step with
+  `co_await` inside both branches of a conditional operator. Under GCC 15
+  (MinGW) the operation completes but its awaiter is never resumed, so
+  every loopback exchange stalled until the deadline; plain `if/else`
+  lowers correctly on every toolchain.
+
 ## [0.4.0] — 2026-09-27
 
 The audit-hardening release: the negative space of the parsers is explored
