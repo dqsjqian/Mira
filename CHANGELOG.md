@@ -104,6 +104,12 @@ version is 0, the minor version is where breaking changes land: a request for
   retires (`take_body`/`release`). Its test is real nghttp2 inside curl
   speaking prior-knowledge HTTP/2, single and `--parallel` concurrent
   streams, skipped with a message where no HTTP/2-capable curl exists.
+- `h3_server` follows for HTTP/3 (built when `MIRA_ENABLE_HTTP3=ON`): one
+  UDP socket, a startup-generated localhost certificate, `Connection::serve`
+  for the QUIC handshake, request streams answered in arrival order. Its
+  test is curl's native QUIC stack — ngtcp2 + nghttp3 — speaking real h3
+  with `--http3-only` and `--cacert`, verifying TLS 1.3, ALPN, QPACK and
+  the response framing end to end.
 
 ### Fixed
 

@@ -166,6 +166,10 @@ if(MIRA_BUILD_EXAMPLES)
         add_executable(mira_h2_prior_knowledge_server examples/h2_prior_knowledge_server.cpp)
         target_link_libraries(mira_h2_prior_knowledge_server PRIVATE Mira::http2 Mira::transport Mira::warnings)
     endif()
+    if(MIRA_ENABLE_HTTP3)
+        add_executable(mira_h3_server examples/h3_server.cpp)
+        target_link_libraries(mira_h3_server PRIVATE Mira::http3 Mira::transport Mira::warnings)
+    endif()
 
     if(MIRA_BUILD_TESTS)
         find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -195,6 +199,14 @@ if(MIRA_BUILD_EXAMPLES)
                         $<TARGET_FILE:mira_h2_prior_knowledge_server>
                 )
                 set_tests_properties(mira_h2_interop PROPERTIES TIMEOUT 90)
+            endif()
+            if(TARGET mira_h3_server)
+                add_test(NAME mira_h3_interop
+                    COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_h3_interop.py
+                        $<TARGET_FILE:mira_h3_server>
+                )
+                set_tests_properties(mira_h3_interop PROPERTIES TIMEOUT 120)
             endif()
         endif()
     endif()

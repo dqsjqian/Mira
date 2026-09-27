@@ -260,7 +260,7 @@ Android requires **NDK 29 or newer**: NDK 27/28's libc++ gates `std::stop_token`
 
 1. **End-to-end resource contracts**: slow-consumer backpressure, connection- and process-level memory caps
 2. **Deepen run coverage on every platform**: more real-machine run verification of cancellation semantics
-3. **Evidence-backed expansion**: cross-platform negative tests, interop; in-process benchmarks (`bench/`, 5 scenarios), parser fuzzing (`fuzz/`, request and response harnesses) and runnable examples (`examples/`: echo, hello world, a streaming file server, an HTTP/2 prior-knowledge server — each with an out-of-process smoke test, the file server's and the h2 server's including real curl interop, the latter exercised by genuine nghttp2 over concurrent streams) now ship with the library, with more scenarios to come
+3. **Evidence-backed expansion**: cross-platform negative tests, interop; in-process benchmarks (`bench/`, 5 scenarios), parser fuzzing (`fuzz/`, request and response harnesses) and runnable examples (`examples/`: echo, hello world, a streaming file server, an HTTP/2 prior-knowledge server, an HTTP/3 server — each with an out-of-process smoke test; the file server and h2 server include real curl interop — the latter exercised by genuine nghttp2 over concurrent streams — and the h3 server is verified by curl's native QUIC, ngtcp2 + nghttp3) now ship with the library, with more scenarios to come
 
 See the [architecture document](docs/ARCHITECTURE.md) for design rationale and acceptance criteria.
 

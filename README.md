@@ -260,7 +260,7 @@ Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` �
 
 1. **端到端资源契约**：慢消费者背压、连接级与进程级内存上限
 2. **深化全平台运行覆盖**：取消语义在更多真机环境下的运行验证
-3. **以证据支持扩展**：跨平台负测、互操作；进程内基准（`bench/`，5 场景）、解析器模糊测试（`fuzz/`，请求与响应双 harness）与可运行示例（`examples/`：echo、hello world、流式文件服务器、HTTP/2 prior-knowledge 服务器，均带进程外烟测，文件服务器与 h2 服务器含 curl 互操作——后者经真实 nghttp2 以并发流验证）已随库发布，持续扩充覆盖场景
+3. **以证据支持扩展**：跨平台负测、互操作；进程内基准（`bench/`，5 场景）、解析器模糊测试（`fuzz/`，请求与响应双 harness）与可运行示例（`examples/`：echo、hello world、流式文件服务器、HTTP/2 prior-knowledge 服务器、HTTP/3 服务器，均带进程外烟测；文件服务器与 h2 服务器含 curl 互操作——后者经真实 nghttp2 以并发流验证，h3 服务器经 curl 原生 QUIC/ngtcp2+nghttp3 验证）已随库发布，持续扩充覆盖场景
 
 设计依据与验收要求见[架构文档](docs/ARCHITECTURE.md)。
 
