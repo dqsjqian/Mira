@@ -162,6 +162,11 @@ if(MIRA_BUILD_EXAMPLES)
     add_executable(mira_tiny_file_server examples/tiny_file_server.cpp)
     target_link_libraries(mira_tiny_file_server PRIVATE Mira::http Mira::transport Mira::warnings)
 
+    if(MIRA_ENABLE_HTTP2)
+        add_executable(mira_h2_prior_knowledge_server examples/h2_prior_knowledge_server.cpp)
+        target_link_libraries(mira_h2_prior_knowledge_server PRIVATE Mira::http2 Mira::transport Mira::warnings)
+    endif()
+
     if(MIRA_BUILD_TESTS)
         find_package(Python3 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
@@ -183,6 +188,14 @@ if(MIRA_BUILD_EXAMPLES)
                     $<TARGET_FILE:mira_tiny_file_server>
             )
             set_tests_properties(mira_tiny_file_server_example PROPERTIES TIMEOUT 120)
+            if(TARGET mira_h2_prior_knowledge_server)
+                add_test(NAME mira_h2_interop
+                    COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_h2_interop.py
+                        $<TARGET_FILE:mira_h2_prior_knowledge_server>
+                )
+                set_tests_properties(mira_h2_interop PROPERTIES TIMEOUT 90)
+            endif()
         endif()
     endif()
 endif()

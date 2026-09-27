@@ -44,6 +44,13 @@ version is 0, the minor version is where breaking changes land: a request for
 - HTTP/2 and HTTP/3 share one header-list type (`http2/headers.hpp`): HPACK
   and QPACK compress the same field-section semantics, so `http3::Header` is
   `http2::Header` instead of a pair of strings. Limits stay per-protocol.
+- The datagram contract is a named core seam: `transport::DatagramTransport`
+  (`mira/transport/datagram.hpp`) replaces the QUIC-local concept of the
+  same shape. `udp::Socket` satisfies it, deliberately broken shapes do not,
+  and both directions are pinned by compile-time assertions
+  (`transport/tests/test_datagram_concept.cpp`) — a concept nobody asserts
+  is a comment pretending to be a contract. `quic::Connection` and
+  `http3::Connection` constrain against the transport-level name now.
 - Destroying a `tls::Stream` with an operation still in flight terminates
   with a diagnosis instead of leaving the borrowed state dangling silently —
   the same contract `Task` already carries.
@@ -90,6 +97,13 @@ version is 0, the minor version is where breaking changes land: a request for
   Both ship with out-of-process smoke tests, and the file server's test
   includes real curl interop — an external client against Mira's stack,
   byte-compared, since that is the claim "HTTP server" makes.
+- `h2_prior_knowledge_server` joins the examples (built when
+  `MIRA_ENABLE_HTTP2=ON`): the thinnest honest demonstration of the http2
+  layer — a TCP listener, a server-role `Session`, per-connection `pump`,
+  requests answered as their headers arrive and reclaimed once the stream
+  retires (`take_body`/`release`). Its test is real nghttp2 inside curl
+  speaking prior-knowledge HTTP/2, single and `--parallel` concurrent
+  streams, skipped with a message where no HTTP/2-capable curl exists.
 
 ### Fixed
 

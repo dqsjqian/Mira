@@ -11,7 +11,7 @@
 #include "mira/core/event_loop.hpp"
 #include "mira/core/task.hpp"
 #include "mira/http3/engine.hpp"
-#include "mira/quic/connection.hpp"  // DatagramTransport concept
+#include "mira/quic/connection.hpp"  // the datagram-constrained QUIC layer
 #include "mira/quic/engine.hpp"
 
 #include <array>
@@ -52,7 +52,7 @@ struct BodyChunk {
 /// Constrained by the same `DatagramTransport` concept as `quic::Connection`,
 /// so an unsuitable transport fails at the declaration rather than deep
 /// inside a pump.
-template<quic::DatagramTransport Transport>
+template<transport::DatagramTransport Transport>
 class Connection {
 public:
     Connection(Connection&&) noexcept = default;

@@ -13,6 +13,7 @@
 #include "mira/core/event_loop.hpp"
 #include "mira/core/task.hpp"
 #include "mira/quic/engine.hpp"
+#include "mira/transport/datagram.hpp"
 #include "mira/transport/endpoint.hpp"
 #include "mira/transport/udp.hpp"
 
@@ -28,16 +29,6 @@
 #include <utility>
 
 namespace Mira::quic {
-
-/// A transport carrying whole datagrams with peer addressing.
-/// udp::Socket satisfies this; a deterministic in-memory transport can too.
-template<typename T>
-concept DatagramTransport = requires(
-    T transport, std::span<const std::byte> out, std::span<std::byte> in,
-    transport::Endpoint peer, OperationOptions options) {
-    { transport.send_to(out, peer, options) } -> std::same_as<Task<Result<std::size_t>>>;
-    { transport.receive_from(in, options) } -> std::same_as<Task<Result<transport::udp::Datagram>>>;
-};
 
 /// One chunk of received stream data, with the remote's FIN when it arrives.
 struct StreamChunk {
@@ -60,7 +51,7 @@ struct StreamChunk {
 /// flush pending output, then wait for the next inbound datagram or timer
 /// expiry, whichever comes first. `read` pumps until the stream produces.
 /// Operations must not overlap; nothing here runs in the background.
-template<DatagramTransport Transport>
+template<transport::DatagramTransport Transport>
 class Connection {
 public:
     Connection(Connection&&) noexcept = default;

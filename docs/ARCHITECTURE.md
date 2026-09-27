@@ -34,8 +34,8 @@ and remaining acceptance work must be described separately.
 |---|---|---|
 | Execution and ownership | Lazy, move-only `Task` that terminates rather than destroy a started, unfinished frame; single-threaded `TaskScope` with immediate spawn and one-shot join; executor seam; single-threaded `EventLoop` whose operations carry never-reused identities | Explicit operation/buffer ownership across layers and continued join/drain validation; loop destruction during dispatch is refused rather than supported |
 | Cancellation and deadlines | `OperationOptions` on every core operation, forwarded through TCP, TLS and the HTTP connection loop; `BoundedStream` distinguishes streams that can honour it; HTTP converts `idle_timeout` / `request_timeout` into a fresh deadline per request | Runtime evidence on Windows, where the IOCP semantics rest on CI alone; a cancelled IOCP read may lose bytes, so that connection must be closed; `stop()` is still a stop-pumping request, not I/O cancellation |
-| Transport and composition | TCP and completion-shaped kqueue/epoll/IOCP implementations; stream concepts; message-preserving UDP datagrams with cancellation/deadline support | Equivalent observable semantics across backends, verified teardown, bounded queues; datagram contract formalized as a core concept before further UDP-based modules build on it |
-| Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered and streaming request bodies (`RequestBodyReader`), chunked trailers, connection-loop drain guarantees; request- and response-parser fuzzing in CI; curl interop exercised out-of-process against the example servers | Protocol conformance evidence, slow-consumer backpressure bounds and bounded aggregate memory measurements |
+| Transport and composition | TCP and completion-shaped kqueue/epoll/IOCP implementations; stream concepts; message-preserving UDP datagrams with cancellation/deadline support; `transport::DatagramTransport` pins the datagram contract (`mira/transport/datagram.hpp`), positive and negative conformance asserted at compile time | Equivalent observable semantics across backends, verified teardown, bounded queues |
+| Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered and streaming request bodies (`RequestBodyReader`), chunked trailers, connection-loop drain guarantees; request- and response-parser fuzzing in CI; curl interop exercised out-of-process against the example servers — HTTP/1.1 against the file server, real-nghttp2 HTTP/2 (prior knowledge, including concurrent streams) against `examples/h2_prior_knowledge_server` | Protocol conformance evidence, slow-consumer backpressure bounds and bounded aggregate memory measurements |
 | Security and robustness | Optional OpenSSL TLS stream, parser limits, negative-input tests and fuzzing of both HTTP parsers (request and response) | Lifecycle-safe TLS cancellation, fuzzing beyond the HTTP parsers, failure injection and resource-exhaustion tests |
 | Engineering evidence | C++23-only build, desktop runtime CI and mobile cross-compilation jobs exist; last confirmed passing desktop baseline is `f796db9` | Fresh validation of current streaming/fuzz changes, mobile runtime evidence, reproducible interop/performance/resource measurements; no current stable ABI promise |
 
@@ -146,10 +146,13 @@ time, and by the time it hurts, the fix is a rewrite.
 TCP and UDP belong to the transport layer, not a checklist of HTTP features.
 TCP supplies stream connections. UDP supplies message-preserving datagrams
 (`transport::udp::Socket`: completion-shaped send/receive with cancellation
-and deadlines, truncation reported rather than silently clipped); it is a
-datagram contract, not a stream-shaped wrapper. DNS and QUIC are examples of
-protocols that may use datagrams; their requirements must not be imposed on
-the TCP API or treated as existing functionality.
+and deadlines, truncation reported rather than silently clipped); the wire
+contract those sockets model is named — `transport::DatagramTransport`
+(`mira/transport/datagram.hpp`) — so UDP-based protocols such as QUIC
+constrain against the concept, never against the concrete socket, and a
+deterministic in-memory transport can satisfy the same seam. DNS is another
+example of a protocol that may use datagrams; its requirements must not be
+imposed on the TCP API or treated as existing functionality.
 
 ## Core seams
 
@@ -650,7 +653,7 @@ cancellation-safety claim.
 **Remaining work, not a phase-one scope exemption.** UDP, asynchronous system
 resolution, HTTP/1 client, HTTP/2 engines and request-body streaming now
 exist; QUIC/HTTP3 are experimental. The current implementation still lacks a
-QUIC UDP scheduling entry point, independent H2/H3 interoperability and full
+QUIC UDP scheduling entry point, independent H3 interoperability and full
 platform
 acceptance. Routing, native OS trust-store integration, end-to-end resource
 bounds and multi-threaded loops also remain incomplete; mTLS policy is now
