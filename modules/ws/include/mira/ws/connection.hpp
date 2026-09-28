@@ -101,7 +101,7 @@ public:
             if (frame->opcode == Opcode::ping || frame->opcode == Opcode::pong) continue;
             if (!started) { message.opcode = frame->opcode; started = true; }
             if (frame->payload.size() > limits_.max_message - message.payload.size()) {
-                terminate(make_error_code(Mira::Errc::limit_exceeded));
+                static_cast<void>(terminate(make_error_code(Mira::Errc::limit_exceeded)));
                 co_return fail(Mira::Errc::limit_exceeded);
             }
             message.payload.insert(message.payload.end(), frame->payload.begin(), frame->payload.end());
@@ -195,7 +195,7 @@ private:
         if (!result || *result == 0 || *result > bytes.size()) {
             auto error = !result ? result.error() : make_error_code(Errc::abnormal_close);
             if (error == make_error_code(Mira::Errc::eof)) error = make_error_code(Errc::abnormal_close);
-            terminate(error);
+            static_cast<void>(terminate(error));
             co_return fail(error);
         }
         co_return result;
@@ -261,7 +261,7 @@ private:
                         (void)sent;
                     }
                 }
-                terminate(error);
+                static_cast<void>(terminate(error));
                 co_return fail(error);
             }
             begin_ += parsed->consumed;
