@@ -210,9 +210,12 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - name: Install OpenSSL on Linux
+      - name: Install protocol toolchain on Linux
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+        run: |
+          sudo apt-get update && sudo apt-get install -y libssl-dev g++-14
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
       - name: Build OpenSSL 3.5 for QUIC (Linux)
         if: runner.os == 'Linux'
         # The distro OpenSSL (3.0) predates SSL_set_quic_tls_cbs, which the

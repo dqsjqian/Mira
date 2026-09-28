@@ -32,7 +32,9 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="mira-h3-") as runtime:
         cert, key = str(Path(runtime) / "cert.pem"), str(Path(runtime) / "key.pem")
-        subprocess.run([args.openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        config = Path(runtime) / "openssl.cnf"
+        config.write_text("[req]\ndistinguished_name=dn\n[dn]\n", encoding="utf-8")
+        subprocess.run([args.openssl, "req", "-config", str(config), "-x509", "-newkey", "rsa:2048", "-nodes",
                         "-keyout", key, "-out", cert, "-days", "2", "-subj", "/CN=localhost",
                         "-addext", "subjectAltName=DNS:localhost"],
                        capture_output=True, check=True, timeout=TIMEOUT)
