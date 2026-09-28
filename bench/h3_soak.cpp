@@ -674,7 +674,7 @@ private:
     }
 };
 
-std::string quoted(std::string_view text) {
+std::string json_quote(std::string_view text) {
     std::string output = "\"";
     constexpr char hex[] = "0123456789abcdef";
     for (const char ch : text) {
@@ -724,7 +724,7 @@ void summary(const Options& config, const Stats& stats, double runtime, const st
               << ",\"final\":{\"connections\":" << stats.final_connections << ",\"tombstones\":" << stats.final_tombstones
               << ",\"routes\":" << stats.final_routes << ",\"reserved_payload_bytes\":" << stats.final_reserved_bytes
               << ",\"queued_bytes\":" << stats.final_queued_bytes << "}"
-              << ",\"rss_cap_claimed\":false,\"error\":" << quoted(error) << "}\n";
+              << ",\"rss_cap_claimed\":false,\"error\":" << json_quote(error) << "}\n";
 }
 }  // namespace
 
