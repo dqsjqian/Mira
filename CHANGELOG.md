@@ -9,6 +9,11 @@ version is 0, the minor version is where breaking changes land: a request for
 
 ### Added
 
+- Opt-in stateless QUIC Retry admission with ngtcp2 AEAD tokens, source-address
+  binding, strict expiry, service-scoped key rotation and bounded reply limiting.
+- Required-Retry HTTP/3 multi-client example, independent curl interoperability
+  observing Retry on real UDP, and a seeded bounded fault/churn harness with JSON
+  content, fairness, resource-drain and sampled-RSS evidence.
 - Windows MSVC QUIC/HTTP3 runtime coverage, pinned multi-config dependency
   builds and installed-package static-library dependency propagation.
 - Same-event-loop TLS and WSS duplex I/O, with independent request deadline

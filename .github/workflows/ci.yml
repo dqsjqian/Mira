@@ -22,6 +22,8 @@ jobs:
         run: |
           python3 tools/ci/test_protocol_deps.py
           python3 tools/ci/test_autobahn_runner.py
+          python3 tools/ci/test_h3_interop.py
+          python3 tools/ci/test_h3_soak_runner.py
 
   # Every backend gets a real build and a real test run, because a platform
   # that merely compiles is not a supported platform:
@@ -299,7 +301,7 @@ jobs:
           cmake -S . -B build/protocols -DCMAKE_BUILD_TYPE=Debug
           -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON
           -DMIRA_ENABLE_HTTP2=ON
-          -DMIRA_ENABLE_HTTP3=ON
+          -DMIRA_ENABLE_HTTP3=ON -DMIRA_BUILD_BENCH=ON
           -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix"
       - name: Build
         run: cmake --build build/protocols --parallel
@@ -319,6 +321,26 @@ jobs:
           python3 tools/ci/check_h3_interop.py build/protocols/mira_h3_server
           --strict --curl "$PWD/build/interop-curl/prefix/bin/curl"
           --openssl "$OPENSSL_ROOT_DIR/bin/openssl"
+      - name: Require independent Retry interoperability (Linux)
+        if: runner.os == 'Linux'
+        run: >
+          python3 tools/ci/check_h3_interop.py build/protocols/mira_h3_multi_server
+          --strict --multi-retry --curl "$PWD/build/interop-curl/prefix/bin/curl"
+          --openssl "$OPENSSL_ROOT_DIR/bin/openssl"
+      - name: Real UDP Retry and network-fault smoke
+        run: >
+          python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak
+          --certificate build/protocols/modules/quic/tests/cert.pem
+          --key build/protocols/modules/quic/tests/key.pem
+          --duration-seconds 20 --seed 20260928 --clients 3 --requests 4
+          --output build/h3-fault-smoke.json
+      - name: Preserve fault-smoke measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: h3-fault-smoke-${{ matrix.os }}
+          path: build/h3-fault-smoke.json
+          if-no-files-found: warn
       - name: Installed protocol package and component isolation
         run: python3 tools/ci/check_install_consumer.py --build-dir build/protocols
       - name: Configure HTTP3 without HTTP2 or NGHTTP2 (Linux)

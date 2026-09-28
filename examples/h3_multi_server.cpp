@@ -5,6 +5,7 @@
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
+#include <string_view>
 
 using namespace Mira;
 using namespace std::chrono_literals;
@@ -18,7 +19,7 @@ void require(Result<void> result) {
     if (!result) throw std::runtime_error(result.error().message());
 }
 
-Task<void> serve(EventLoop& loop, const char* cert, const char* key, std::uint16_t port) {
+Task<void> serve(EventLoop& loop, const char* cert, const char* key, std::uint16_t port, bool retry) {
     auto socket = require(transport::udp::Socket::bind(loop, transport::Endpoint::loopback(port)));
     quic::Options options;
     options.local = require(socket.local_endpoint());
@@ -29,8 +30,11 @@ Task<void> serve(EventLoop& loop, const char* cert, const char* key, std::uint16
     limits.max_buffered_body = 64 * 1024;
     limits.max_header_bytes = 16 * 1024;
     limits.max_streams = 16;
-    auto server = require(http3::make_server(options, {}, limits));
-    std::cout << "HTTP/3 multi-client server on " << options.local.to_string() << '\n';
+    quic::RetryOptions retry_options;
+    retry_options.policy = retry ? quic::RetryPolicy::required : quic::RetryPolicy::disabled;
+    auto server = require(http3::make_server(options, {}, limits, std::nullopt, retry_options));
+    std::cout << "HTTP/3 multi-client server on " << options.local.to_string()
+              << " retry=" << (retry ? "required" : "disabled") << '\n' << std::flush;
     std::array<std::byte, 65536> buffer{};
     for (;;) {
         auto now = quic::detail::now_ns();
@@ -73,21 +77,32 @@ Task<void> serve(EventLoop& loop, const char* cert, const char* key, std::uint16
         }
         auto received = server.ingest(packet->peer, std::span(buffer).first(packet->size),
                                        quic::detail::now_ns());
-        if (!received) std::cerr << "packet rejected: " << received.error().message() << '\n';
+        if (!received) {
+            std::cerr << "packet rejected: " << received.error().message() << '\n';
+        } else if (received->reply) {
+            // Retry is stateless: send its bounded response before ingesting more input.
+            auto sent = co_await socket.send_to(received->reply->data, received->reply->peer,
+                                                {.deadline = Clock::now() + 1s});
+            if (!sent) std::cerr << "Retry send: " << sent.error().message() << '\n';
+        }
     }
 }
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3 || argc > 4) {
-        std::cerr << "usage: mira_h3_multi_server certificate.pem key.pem [port]\n";
+    if (argc < 3 || argc > 5) {
+        std::cerr << "usage: mira_h3_multi_server certificate.pem key.pem [port] [--retry]\n";
         return 2;
     }
     try {
-        auto port = argc == 4 ? std::stoul(argv[3]) : 4433;
-        if (!port || port > 65535) throw std::runtime_error("invalid port");
+        const bool retry = argc == 5 && std::string_view(argv[4]) == "--retry";
+        if (argc == 5 && !retry) throw std::runtime_error("unknown option");
+        std::size_t end = 0;
+        auto port = argc >= 4 ? std::stoul(argv[3], &end) : 4433;
+        if (port > 65535 || (argc >= 4 && end != std::string_view(argv[3]).size()))
+            throw std::runtime_error("invalid port");
         auto loop = require(EventLoop::create());
-        require(loop.run_until_complete(serve(loop, argv[1], argv[2], static_cast<std::uint16_t>(port))));
+        require(loop.run_until_complete(serve(loop, argv[1], argv[2], static_cast<std::uint16_t>(port), retry)));
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

@@ -3,8 +3,10 @@
 #include "mira/core/error.hpp"
 #include "mira/transport/endpoint.hpp"
 
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -53,6 +55,44 @@ struct PacketRoute {
 /// the engine's fixed 16-byte local CID length; only QUIC v1 Initials admit peers.
 [[nodiscard]] Result<PacketRoute> packet_route(std::span<const std::byte> packet);
 
+enum class RetryPolicy { disabled, required };
+using RetryKey = std::array<std::uint8_t, 32>;
+
+/// Disabled preserves legacy admission, allocating an engine before address validation.
+/// Required validates a short-lived ngtcp2 Retry token before any connection reservation.
+/// This is address validation, not replay prevention or a complete denial-of-service defense.
+struct RetryOptions {
+    RetryPolicy policy = RetryPolicy::disabled;
+    // Omitted keys use a fresh cryptographically random per-listener secret.
+    // Injected keys must be secret, random, and accompanied by a nonempty service scope.
+    std::optional<RetryKey> current_key;
+    std::optional<RetryKey> previous_key;
+    // Empty auto-key scopes are instance-random and remain isolated after rotation.
+    // Shared listeners need identical scope, local endpoint, ALPN and monotonic clock epoch.
+    std::string scope;
+    // Positive and at most 60 seconds; expiry is exclusive, future tokens fail.
+    std::uint64_t token_lifetime_ns = 10'000'000'000;
+    // Whole-listener fixed window, not a per-address map; no queued Retry packets.
+    // At most twice the configured ceiling may straddle a window boundary.
+    std::uint64_t window_ns = 1'000'000'000;
+    std::size_t max_replies_per_window = 128;
+};
+
+namespace detail { class RetryGate; }
+
+/// Opaque proof issued only by the listener's Retry verifier. Custom factories must
+/// preserve it and call Engine::accept with the same Initial, endpoints and timestamp.
+class RetryValidation {
+    friend class detail::RetryGate;
+    friend class Engine;
+    RetryValidation() = default;
+    transport::Endpoint local_, remote_;
+    std::string alpn_;
+    Bytes original_dcid_, retry_scid_, token_;
+    std::uint32_t version_ = 0;
+    std::uint64_t verified_at_ = 0;
+};
+
 struct Options {
     bool server = false;
     transport::Endpoint local;
@@ -65,9 +105,34 @@ struct Options {
     std::size_t max_buffered_bytes = 4 * 1024 * 1024;
     std::uint64_t max_streams = 64;
     std::uint64_t idle_timeout_ns = 30'000'000'000;
-    // Lifetime CID limit including the original DCID; reject issuance before exceeding it.
+    // Lifetime CID limit including original DCID and Retry SCID; never evict retired IDs.
     std::size_t max_connection_ids = 64;
+    std::shared_ptr<const RetryValidation> retry_validation;
 };
+
+namespace detail {
+class RetryGate {
+public:
+    struct Decision {
+        bool admitted = false;
+        Bytes reply;
+        std::shared_ptr<const RetryValidation> validation;
+    };
+    static Result<RetryGate> create(const Options& options, RetryOptions retry);
+    RetryGate(RetryGate&&) noexcept;
+    RetryGate& operator=(RetryGate&&) noexcept;
+    ~RetryGate();
+    Result<Decision> inspect(const transport::Endpoint& peer,
+                             std::span<const std::byte> initial, std::uint64_t now);
+    Result<void> rotate(const RetryKey& key);
+    void discard_previous() noexcept;
+private:
+    struct Impl;
+    explicit RetryGate(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+};
+}  // namespace detail
+
 struct Event {
     enum class Kind { data, acknowledged, reset, closed } kind;
     std::int64_t stream_id;
@@ -76,14 +141,15 @@ struct Event {
     bool fin = false;
 };
 /// Single-threaded, socket-free QUIC v1 state machine. Time is monotonic nanoseconds; the caller
-/// owns sending packets and waking on expiry. The path is currently fixed: migration, 0-RTT, and
-/// Retry policies are not supported. The OpenSSL ossl backend is experimental upstream support.
+/// owns sending packets and waking on expiry. The path is fixed: migration and 0-RTT are not
+/// supported. Retry address validation is provided by Listener; clients process Retry automatically.
+/// The OpenSSL ossl backend is experimental upstream support.
 class Engine {
 public:
     static Result<Engine> client(Options options, std::uint64_t now);
-    /// The initial is the peer's first datagram; the factory parses the connection ID and consumes that packet.
-    /// May return ERR_RETRY when the first visible CRYPTO is not at offset 0; listener address
-    /// validation / Retry policies are not provided yet.
+    /// Consumes the Initial exactly once. A token-bearing Initial requires the listener's opaque
+    /// retry_validation; client-provided original CIDs are never trusted. May return ERR_RETRY
+    /// when the first visible CRYPTO is not at offset 0; callers must not retry such failures in a loop.
     static Result<Engine>
     accept(Options options, std::span<const std::byte> initial, std::uint64_t now);
     Engine(Engine&&) noexcept;

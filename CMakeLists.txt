@@ -274,6 +274,12 @@ if(MIRA_BUILD_EXAMPLES)
                         --openssl ${MIRA_QUIC_OPENSSL_TOOL}
                 )
                 set_tests_properties(mira_h3_interop PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+                add_test(NAME mira_h3_retry_interop
+                    COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_h3_interop.py
+                        $<TARGET_FILE:mira_h3_multi_server> --multi-retry
+                        --openssl ${MIRA_QUIC_OPENSSL_TOOL})
+                set_tests_properties(mira_h3_retry_interop PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
             endif()
         endif()
     endif()

@@ -286,6 +286,7 @@ Android requires **NDK 29 or newer**: NDK 27/28's libc++ gates `std::stop_token`
 ## Production composition now available
 
 - **Single-port multi-client QUIC/H3**: `quic::Dispatcher` routes actual DCIDs, including newly issued IDs; `http3::make_server` composes H3. Admission, payload and queue reservations are bounded, and dispatchers can share `ResourceBudget`. Termination releases application budgets while retaining all issued CIDs for at least three PTOs. Local closes retransmit on matching input with bounded pacing; peer draining is silent. Closing slots are reserved at admission, never evicted early; explicit `remove()` purges protection. These are accounting limits, not a hard RSS cap or complete replay/flood protection; peers remain fixed.
+- **QUIC Retry / source-address validation**: pass `RetryOptions{.policy = RetryPolicy::required}` to `http3::make_server` / `quic::Listener::create`. No connection or admission budget is allocated before token verification. Tokens use ngtcp2's AEAD, binding peer address/port, version, Retry CID, service scope and local endpoint. Expired, future, tampered or changed-source tokens are dropped silently. Keys default to instance-random and can be rotated with one previous key retained. Send or discard `ingest().reply` immediately; there is no internal Retry queue. The default limit is 128 replies per listener per fixed one-second window; adjacent windows can permit a burst of 256. This is not a sliding-second bound, full DDoS protection or one-time/replay protection. The policy defaults to disabled; public endpoints must explicitly select required. Shared keys require matching scope, local endpoint, ALPN and monotonic clock epoch.
 - **Streaming H2/H3 output**: `request_stream` / `respond_stream` → `write_body` → `finish_body`. Exhaustion returns `would_block` without failing the connection. H3 chunks survive until ACK; QUIC bidirectional streams rotate to prevent starvation.
 - **Connection lifecycle**: `ConnectionPool<T>` provides bounded per-origin leases and idle eviction; leases discard by default and recycle only drained connections. `tcp::connect_with_retry` retries connection establishment, never application requests. `tcp::serve` bounds admission and cooperatively stops, cancels and joins handlers.
 - **WebSocket/WSS**: `MIRA_ENABLE_WEBSOCKET=ON` builds `Mira::ws` and OpenSSL Crypto-backed nonce/masking/RFC6455 handshake support. Fragmentation, incremental UTF-8, ping/pong/close, limits and independent peers are tested. TCP and TLS/WSS support one concurrent read and write on the same event loop; handshake/shutdown remain exclusive. Each TLS request owns its deadline timer. Cancellation/timeouts permanently invalidate the session and wake its companion, never replay ciphertext after cancellation. `Stream::create` takes the event loop explicitly; `close()` stops the wrapper without owning the transport. No compression, subprotocol negotiation or H2/H3 Extended CONNECT.
@@ -297,16 +298,27 @@ cmake --build build/ws -j
 ctest --test-dir build/ws --output-on-failure
 # Two terminals: mira_ws_server 8080 / mira_ws_client 8080
 # SSE: mira_sse_server 8081; client GET /events
-# Multi-client H3: mira_h3_multi_server cert.pem key.pem 8443
+# Multi-client H3 + Retry: mira_h3_multi_server cert.pem key.pem 8443 --retry
 ```
 
 Real network benchmark: `python3 tools/bench/network_bench.py --server build/release/mira_managed_echo_server --clients 8 --requests 1000 --slow-clients 4` emits throughput, p50/p99, sampled peak RSS and environment JSON. The independent Python socket load generator uses loopback; these are neither cross-library rankings nor WAN measurements.
+
+### Real UDP Retry fault validation
+
+Enable `MIRA_ENABLE_HTTP3=ON` and `MIRA_BUILD_BENCH=ON` to reproduce bounded loss, duplication, delay, reordering and connection churn:
+
+```bash
+python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak \
+  --duration-seconds 300 --seed 20260928 --output build/h3-soak.json
+```
+
+Each round verifies binary contents, newly submitted short streams progressing during slow responses, closing-slot admission and final budget drain; timeouts or mismatches fail with a nonzero exit. Defaults are 3 clients with 4 streams each, streaming 128 KiB large bodies through 16 KiB protocol buffers. A fixed seed selects fault decisions, not bit-identical timing or random CIDs. This is single-machine loopback sustained validation, not multi-host or long-term stability certification. Initial normal-close packets bypass fault injection; RSS is sampled, not capped. Keep the machine awake; sleep-induced timeouts still fail.
 
 ## Next: remaining verification boundaries
 
 1. iOS/Android TLS/protocol device runs still require connected devices; mobile currently cross-compiles only. Windows MSVC H3, WSS duplex and concurrent TLS 1.3 KeyUpdate regressions have run. Independent third-party HTTP/3 interoperability on Windows and MinGW H3 remain uncovered.
 2. Longer fault injection, multi-machine load and process-memory governance. Official Autobahn 25.10.1 non-compression RFC6455 coverage is complete for both roles: 301 cases each, 298 OK + 3 INFORMATIONAL, zero failures, NON-STRICT results or missing cases. The 216 RFC7692 compression cases per role are explicitly excluded; this is not compression support. Reproduce on Linux with `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker`; CI preserves the complete reports.
-3. QUIC migration/NAT rebinding, 0-RTT, Retry/address validation and HTTP/3 Extended CONNECT remain unsupported. Closing/draining protects admitted connections; the listener is not an Internet flood-protection system.
+3. QUIC migration/NAT rebinding, 0-RTT and HTTP/3 Extended CONNECT remain unsupported. Retry source-address validation and closing/draining are implemented, but tokens are not single-use or fully replay-proof; the listener is not an Internet flood-protection system.
 4. MQTT, SOCKS5 and DNS/DoH are demand-driven independent extensions. Keep gRPC/Redis/WebRTC in the ecosystem layer, not bundled into the network core.
 
 See the [architecture document](docs/ARCHITECTURE.md) for design rationale and acceptance criteria.

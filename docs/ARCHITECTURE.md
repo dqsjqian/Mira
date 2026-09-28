@@ -658,11 +658,12 @@ it. This foundation is neither production-readiness nor a complete
 cancellation-safety claim.
 
 **Remaining work, not a phase-one scope exemption.** UDP, asynchronous system
-resolution, HTTP/1 client, HTTP/2 engines and request-body streaming now
-exist; QUIC/HTTP3 are experimental. The current implementation still lacks a
-QUIC UDP scheduling entry point and full platform
-acceptance. Routing, native OS trust-store integration, end-to-end resource
-bounds and multi-threaded loops also remain incomplete; mTLS policy is now
-available on `tls::Context` but native OS trust-store integration is still open.
+resolution, HTTP/1 client, HTTP/2 engines and request-body streaming exist.
+QUIC/HTTP3 have real UDP scheduling, CID-routed multi-client dispatchers,
+closing/draining protection and optional Retry source-address validation.
+Mobile protocol runtime acceptance, native OS trust-store integration,
+process-wide memory bounds and multi-threaded loops remain incomplete.
+mTLS policy is available on `tls::Context`; protocol queue and payload
+budgets are not hard process-RSS bounds.
 Judge the current tested snapshot by the repository's own CI and tests rather
 than the historical counts above.

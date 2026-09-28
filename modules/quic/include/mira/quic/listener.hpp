@@ -46,7 +46,10 @@ struct ListenerLimits {
 /// Closing slots are separate from application event queues; reserved_payload_bytes()
 /// includes the closing ciphertext reservation.
 /// The caller must bound its own output queue and stop polling when it is full.
-/// Retry, stateless reset, migration, and address validation are not implemented.
+/// Required Retry returns at most one small reply directly from ingest; send it
+/// immediately or discard it. Replies never enter poll or reserve a connection.
+/// Disabled Retry admits unvalidated peers; select required for public endpoints.
+/// Stateless reset, migration, 0-RTT and replay prevention are not implemented.
 template<class Protocol = Engine>
 class Dispatcher {
 public:
@@ -58,8 +61,10 @@ public:
         Bytes data;
     };
     struct Ingest {
-        enum class Kind { dropped, admitted, delivered, removed } kind;
+        enum class Kind { dropped, admitted, delivered, removed, retry } kind;
         Id connection_id = 0;
+        // Retry has no connection: reply.connection_id is zero. No retained output queue.
+        std::optional<Datagram> reply = std::nullopt;
     };
 
     /// Custom factories must preserve the supplied QUIC limits and declare their
@@ -68,12 +73,14 @@ public:
     static Result<Dispatcher> create(Options options, ListenerLimits limits = {},
                                       Factory factory = {}, std::size_t extra_payload = 0,
                                       std::size_t extra_queue_entries = 0,
-                                      std::optional<ResourceBudget> shared_payload = std::nullopt) {
+                                      std::optional<ResourceBudget> shared_payload = std::nullopt,
+                                      RetryOptions retry = {}) {
         if (options.local.address_bytes().empty() || !options.max_streams ||
             options.max_streams > 4096 || options.alpn.empty() || options.alpn.size() > 255 ||
             options.alpn.find('\0') != std::string::npos || !limits.max_connections ||
             limits.max_connections > 65536 || limits.max_connection_ids < 2 ||
-            limits.max_connection_ids > 64 || !limits.max_closing_connections ||
+            (retry.policy == RetryPolicy::required && limits.max_connection_ids < 3) ||
+            options.retry_validation || limits.max_connection_ids > 64 || !limits.max_closing_connections ||
             limits.max_closing_connections > 65536 || options.max_buffered_bytes < 4096 ||
             options.max_buffered_bytes > 64 * 1024 * 1024 ||
             extra_payload > std::numeric_limits<std::size_t>::max() -
@@ -90,8 +97,11 @@ public:
         }
         options.server = true;
         options.max_connection_ids = limits.max_connection_ids;
+        auto gate = detail::RetryGate::create(options, std::move(retry));
+        if (!gate) return std::unexpected(gate.error());
         return Dispatcher(std::move(options), limits, std::move(factory), payload, events,
-                          shared_payload.value_or(ResourceBudget{limits.max_payload_bytes}));
+                          shared_payload.value_or(ResourceBudget{limits.max_payload_bytes}),
+                          std::move(*gate));
     }
 
     Result<Ingest> ingest(const transport::Endpoint& peer, std::span<const std::byte> packet,
@@ -131,12 +141,18 @@ public:
             queue_entries_per_connection_ > limits_.max_queue_entries - reserved_queue_entries() ||
             next_id_ == std::numeric_limits<Id>::max())
             return Ingest{Ingest::Kind::dropped};
+        auto decision = retry_.inspect(peer, packet, now);
+        if (!decision) return std::unexpected(decision.error());
+        if (!decision->reply.empty())
+            return Ingest{Ingest::Kind::retry, 0, Datagram{0, peer, std::move(decision->reply)}};
+        if (!decision->admitted) return Ingest{Ingest::Kind::dropped};
         auto reservation = shared_payload_.try_acquire(payload_per_connection_);
         if (!reservation) return Ingest{Ingest::Kind::dropped};
         auto close_reservation = shared_payload_.try_acquire(detail::kClosePacket);
         if (!close_reservation) return Ingest{Ingest::Kind::dropped};
         auto options = options_;
         options.remote = peer;
+        options.retry_validation = std::move(decision->validation);
         auto engine = factory_(std::move(options), packet, now);
         if (!engine) return std::unexpected(engine.error());
         auto id = next_id_++;
@@ -264,6 +280,11 @@ public:
     }
     std::size_t reserved_queue_entries() const noexcept { return size() * queue_entries_per_connection_; }
     std::size_t route_count() const noexcept { return routes_.size(); }
+    /// Keep exactly the formerly-current key as previous. Does not refill the reply limiter.
+    /// Rotate on this single-threaded dispatcher; shared-key listeners need coordinated keys,
+    /// scope, local endpoint, ALPN and a common monotonic clock epoch.
+    Result<void> rotate_retry_key(const RetryKey& key) { return retry_.rotate(key); }
+    void discard_previous_retry_key() noexcept { retry_.discard_previous(); }
 
 private:
     struct Closed {
@@ -279,10 +300,11 @@ private:
         Closed closed;
     };
     Dispatcher(Options options, ListenerLimits limits, Factory factory,
-               std::size_t payload, std::size_t events, ResourceBudget shared_payload)
+               std::size_t payload, std::size_t events, ResourceBudget shared_payload,
+               detail::RetryGate retry)
         : options_(std::move(options)), limits_(limits), factory_(std::move(factory)),
           payload_per_connection_(payload), queue_entries_per_connection_(events),
-          shared_payload_(std::move(shared_payload)) {}
+          shared_payload_(std::move(shared_payload)), retry_(std::move(retry)) {}
     static const Engine& transport_engine(const Protocol& engine) {
         if constexpr (std::is_same_v<Protocol, Engine>) return engine;
         else return engine.transport();
@@ -349,6 +371,7 @@ private:
     std::size_t payload_per_connection_, queue_entries_per_connection_;
     std::size_t active_ = 0, close_reserved_bytes_ = 0;
     ResourceBudget shared_payload_;
+    detail::RetryGate retry_;
     std::uint64_t clock_ = 0;
     Id next_id_ = 1, last_polled_ = 0;
     std::map<Id, Entry> entries_;

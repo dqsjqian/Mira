@@ -9,7 +9,8 @@ using Server = quic::Dispatcher<Engine>;
 
 /// A single-port, socket-free HTTP/3 server. The caller pumps one UDP socket,
 /// feeds (peer, datagram) to ingest, services application events per connection,
-/// sends poll results to their peer, and wakes at expiry().
+/// sends poll results to their peer, and wakes at expiry(). With required Retry,
+/// immediately send ingest().reply (or discard it); Retry never enters poll().
 /// Reservations cover QUIC send/receive payload, HTTP/3 send/receive body and
 /// retained decoded header accounting, plus both engines' event queue limits.
 /// Each nonempty HTTP/3 output chunk costs at least one body byte, so reserving
@@ -21,7 +22,8 @@ using Server = quic::Dispatcher<Engine>;
 /// Protocol-library allocations and application-owned events are not RSS-bounded.
 inline Result<Server> make_server(quic::Options options,
                                   quic::ListenerLimits admission = {}, Limits limits = {},
-                                  std::optional<ResourceBudget> shared_payload = std::nullopt) {
+                                  std::optional<ResourceBudget> shared_payload = std::nullopt,
+                                  quic::RetryOptions retry = {}) {
     if (options.alpn != "h3" || !limits.max_streams || limits.max_streams > 4096 || !limits.max_headers ||
         limits.max_headers > 4096 || !limits.max_header_bytes ||
         limits.max_header_bytes > 1024 * 1024 || !limits.max_buffered_body ||
@@ -40,7 +42,7 @@ inline Result<Server> make_server(quic::Options options,
         return std::unexpected(http3_error(-110000));
     return Server::create(std::move(options), admission, std::move(factory),
                           static_cast<std::size_t>(payload),
-                          2 * limits.max_events, std::move(shared_payload));
+                          2 * limits.max_events, std::move(shared_payload), std::move(retry));
 }
 
 }  // namespace Mira::http3

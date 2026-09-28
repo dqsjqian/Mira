@@ -286,6 +286,7 @@ Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` �
 ## 已落地的生产组合能力
 
 - **单端口多客户端 QUIC/H3**：`quic::Dispatcher` 按实际 DCID 路由（含新 CID），`http3::make_server` 组合 H3；准入、payload 与队列预留有界，陌生 peer 不得迁移连接。多个 dispatcher 可共享 `ResourceBudget`。连接终止释放应用预算，保留全部已签发 CID 至少三个 PTO；本地主动关闭按匹配入包限频重发，对端 draining 静默丢弃。关闭槽在准入时预留，不驱逐尚受保护的 CID；显式 `remove()` 才强制清除。这是可核算资源上限，不冒充进程 RSS 的硬限制，也不是完整重放/洪泛防护。
+- **QUIC Retry / 来源地址验证**：向 `http3::make_server` / `quic::Listener::create` 传入 `RetryOptions{.policy = RetryPolicy::required}`，在 token 验证前不创建连接、不占连接预算。token 使用 ngtcp2 官方 AEAD，绑定地址、端口、版本、Retry CID、服务作用域与本地端点；过期、未来时间、篡改或来源变化静默拒绝。默认独立随机密钥，可显式轮转并保留一代旧密钥。`ingest().reply` 由调用方即时发送或丢弃，没有内部 Retry 队列。默认每 listener 每个固定 1 秒窗口最多 128 个 Retry，跨窗口边界可突发 256 个；这不是任意滑动秒限额或完整 DDoS 防护，也不提供一次性 token / 防重放保证。默认策略仍为 disabled，公网入口需显式 required。共享密钥要求相同作用域、本地端点、ALPN 与单调时钟基准。
 - **H2/H3 出站流式 body**：`request_stream` / `respond_stream` → `write_body` → `finish_body`；预算满返回 `would_block` 且不污染连接。H3 chunk 保留到 ACK，QUIC 双向流轮转避免长流饿死短流。
 - **连接生命周期**：`ConnectionPool<T>` 提供每源有界租约池与 idle 淘汰，默认丢弃、显式归还已排空连接；`tcp::connect_with_retry` 只重试建连，绝不暗中重放业务请求；`tcp::serve` 提供准入和停止接入、取消、join 的协作关闭。
 - **WebSocket/WSS**：`MIRA_ENABLE_WEBSOCKET=ON`，独立 `Mira::ws` + OpenSSL Crypto（安全 nonce/mask、RFC6455 SHA-1 握手）；分片、增量 UTF-8、ping/pong/close、消息限额、双向独立互操作。TCP 和 TLS/WSS 均支持同一事件循环上一读一写并行，握手与关闭独占；每个 TLS 请求有独立期限，取消或超时令整个 TLS 会话永久失效并唤醒同伴，不取消后重放密文。`Stream::create` 显式接收事件循环，`close()` 终止包装器但不拥有底层流。无压缩/子协议/H2/H3 Extended CONNECT。
@@ -297,16 +298,27 @@ cmake --build build/ws -j
 ctest --test-dir build/ws --output-on-failure
 # 两个终端分别运行：mira_ws_server 8080 / mira_ws_client 8080
 # SSE：mira_sse_server 8081；客户端 GET /events
-# 多客户端 H3：mira_h3_multi_server cert.pem key.pem 8443
+# 多客户端 H3 + Retry：mira_h3_multi_server cert.pem key.pem 8443 --retry
 ```
 
 真实网络基准：`python3 tools/bench/network_bench.py --server build/release/mira_managed_echo_server --clients 8 --requests 1000 --slow-clients 4`，输出吞吐、p50/p99、峰值 RSS 采样和环境 JSON。负载发生器使用独立进程 Python sockets；loopback 数字不是跨库性能排名，也不是公网性能。
+
+### Retry 真实 UDP 故障验收
+
+启用 `MIRA_ENABLE_HTTP3=ON` 与 `MIRA_BUILD_BENCH=ON` 后，可复现有界丢包、重复、延迟、重排与连接 churn：
+
+```bash
+python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak \
+  --duration-seconds 300 --seed 20260928 --output build/h3-soak.json
+```
+
+每轮验证二进制内容、慢响应期间新短流的进展、关闭保护槽与最终预算归零；超时或内容错误非零退出。默认是 3 客户端、每轮各 4 条流，128 KiB 大 body 经 16 KiB 协议缓冲流式传输。固定 seed 固定故障选择策略，不保证实际调度或随机 CID 逐包一致；这是单机 loopback 持续验收，不是多机或长时稳定性认证。初始正常关闭包不注入故障，RSS 仅采样不设硬上限。运行期间需保持机器唤醒，合盖休眠导致的超时仍判失败。
 
 ## 接下来：仍需验证的边界
 
 1. iOS/Android TLS 与协议真机运行仍待设备，当前移动仅交叉编译。Windows MSVC H3、WSS 全双工及 TLS 1.3 KeyUpdate 并行回归已实跑；Windows 独立第三方 HTTP/3 互操作和 MinGW H3 尚未覆盖。
 2. 更长时故障注入、真实多机负载与进程内存治理。官方 Autobahn 25.10.1 已完成双端 RFC6455 非压缩用例：每端 301 项，298 OK + 3 INFORMATIONAL，零失败、零 NON-STRICT、零缺项；每端 216 项 RFC7692 压缩用例明确排除，不代表支持压缩。可用 `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker` 在 Linux 复现，完整报告由 CI 保存。
-3. QUIC migration/NAT rebinding、0-RTT、Retry/地址验证与 HTTP/3 Extended CONNECT 尚未实现；closing/draining 已保护已准入连接，但 listener 不是互联网抗洪泛防护系统。
+3. QUIC migration/NAT rebinding、0-RTT 与 HTTP/3 Extended CONNECT 尚未实现。Retry 来源地址验证与 closing/draining 已落地，但不保证 token 一次性使用或完整防重放，listener 不是互联网抗洪泛防护系统。
 4. MQTT、SOCKS5、DNS/DoH 依具体需求独立扩展；gRPC/Redis/WebRTC 保持生态层边界，不将专业子系统全部塞进网络内核。
 
 设计依据与验收要求见[架构文档](docs/ARCHITECTURE.md)。

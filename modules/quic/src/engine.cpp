@@ -6,6 +6,7 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <limits>
@@ -21,6 +22,21 @@ namespace {
 // Engine-owned error codes, placed far away from native ngtcp2 negative codes.
 constexpr int invalid = -100000;
 constexpr int budget = -100001;
+
+bool decode_initial(ngtcp2_pkt_hd& hd, std::span<const std::byte> packet) {
+    if (packet.size() < 1200 || packet.size() > detail::kMaxDatagram) return false;
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(packet.data());
+    if (!(bytes[0] & 0x40) || ngtcp2_accept(&hd, bytes, packet.size()) != 0 ||
+        hd.version != NGTCP2_PROTO_VER_V1 || hd.dcid.datalen < NGTCP2_MIN_INITIAL_DCIDLEN)
+        return false;
+    const auto header = ngtcp2_pkt_decode_hd_long(&hd, bytes, packet.size());
+    return header >= 0 && static_cast<std::size_t>(header) <= packet.size() &&
+           hd.len >= 17 && hd.len <= packet.size() - static_cast<std::size_t>(header);
+}
+Bytes cid_bytes(const ngtcp2_cid& cid) {
+    const auto* begin = reinterpret_cast<const std::byte*>(cid.data);
+    return Bytes(begin, begin + cid.datalen);
+}
 
 class QuicCategory final : public std::error_category {
 public:
@@ -57,10 +73,184 @@ Result<PacketRoute> packet_route(std::span<const std::byte> packet) {
         if (ids.version != NGTCP2_PROTO_VER_V1)
             return std::unexpected(quic_error(invalid));
         ngtcp2_pkt_hd hd{};
-        initial = packet.size() >= 1200 && ngtcp2_accept(&hd, data, packet.size()) == 0;
+        initial = decode_initial(hd, packet);
     }
     auto* cid = reinterpret_cast<const std::byte*>(ids.dcid);
     return PacketRoute{Bytes(cid, cid + ids.dcidlen), initial};
+}
+
+struct detail::RetryGate::Impl {
+    transport::Endpoint local;
+    std::string alpn, domain;
+    RetryKey current{};
+    std::optional<RetryKey> previous;
+    std::uint64_t lifetime = 0, window = 0, clock = 0, window_start = 0;
+    std::size_t reply_limit = 0, replies = 0;
+    bool window_started = false;
+    ~Impl() {
+        OPENSSL_cleanse(current.data(), current.size());
+        if (previous) OPENSSL_cleanse(previous->data(), previous->size());
+    }
+    Result<RetryKey> derive(const RetryKey& key) const {
+        if (std::all_of(key.begin(), key.end(), [](auto byte) { return byte == 0; }))
+            return std::unexpected(quic_error(invalid));
+        RetryKey result{};
+        ngtcp2_crypto_md md;
+        ngtcp2_crypto_md_init(&md, const_cast<EVP_MD*>(EVP_sha256()));
+        constexpr std::string_view salt = "Mira QUIC Retry key v1";
+        if (ngtcp2_crypto_hkdf(result.data(), result.size(), &md, key.data(), key.size(),
+                               reinterpret_cast<const std::uint8_t*>(salt.data()), salt.size(),
+                               reinterpret_cast<const std::uint8_t*>(domain.data()), domain.size()))
+            return std::unexpected(quic_error(invalid));
+        return result;
+    }
+    bool verify(ngtcp2_cid& original, const ngtcp2_pkt_hd& hd,
+                const transport::Endpoint& peer, const RetryKey& key, std::uint64_t now) const {
+        const auto address = peer.address_bytes();
+        const auto* sa = reinterpret_cast<const ngtcp2_sockaddr*>(address.data());
+        const auto length = static_cast<ngtcp2_socklen>(address.size());
+        if (ngtcp2_crypto_verify_retry_token2(&original, hd.token, hd.tokenlen,
+                key.data(), key.size(), hd.version, sa, length, &hd.dcid, lifetime, now))
+            return false;
+        // ngtcp2 1.22.1 checks only gen_ts + timeout <= now, not future timestamps.
+        // With all other authenticated inputs identical, timeout=0 must fail the
+        // expiry check. Success would prove gen_ts > now. Both checks fail closed
+        // on upstream timestamp addition overflow; issuance below avoids it entirely.
+        ngtcp2_cid ignored{};
+        return ngtcp2_crypto_verify_retry_token2(&ignored, hd.token, hd.tokenlen,
+                   key.data(), key.size(), hd.version, sa, length, &hd.dcid, 0, now) ==
+                   NGTCP2_CRYPTO_ERR_VERIFY_TOKEN &&
+               original.datalen >= NGTCP2_MIN_INITIAL_DCIDLEN;
+    }
+};
+
+detail::RetryGate::RetryGate(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+detail::RetryGate::RetryGate(RetryGate&&) noexcept = default;
+detail::RetryGate& detail::RetryGate::operator=(RetryGate&&) noexcept = default;
+detail::RetryGate::~RetryGate() = default;
+Result<detail::RetryGate> detail::RetryGate::create(const Options& options, RetryOptions retry) {
+    struct Wipe {
+        RetryOptions& options;
+        ~Wipe() {
+            if (options.current_key) OPENSSL_cleanse(options.current_key->data(), options.current_key->size());
+            if (options.previous_key) OPENSSL_cleanse(options.previous_key->data(), options.previous_key->size());
+        }
+    } wipe{retry};
+    if (retry.policy == RetryPolicy::disabled) return RetryGate(nullptr);
+    if (retry.policy != RetryPolicy::required || options.local.address_bytes().empty() ||
+        !retry.token_lifetime_ns || retry.token_lifetime_ns > 60'000'000'000 ||
+        !retry.window_ns || retry.window_ns > 60'000'000'000 ||
+        !retry.max_replies_per_window || retry.max_replies_per_window > 65536 ||
+        retry.scope.size() > 128 || retry.scope.find('\0') != std::string::npos ||
+        (retry.current_key && retry.scope.empty()) || (retry.previous_key && !retry.current_key))
+        return std::unexpected(quic_error(invalid));
+    auto impl = std::make_unique<Impl>();
+    impl->local = options.local;
+    impl->alpn = options.alpn;
+    if (retry.scope.empty()) {
+        std::array<std::uint8_t, 16> instance_scope{};
+        if (!fill_random(instance_scope.data(), instance_scope.size()))
+            return std::unexpected(quic_error(invalid));
+        retry.scope.assign(reinterpret_cast<const char*>(instance_scope.data()), instance_scope.size());
+    }
+    // Length-delimited components separate services using shared injected keys.
+    // A wildcard local endpoint identifies that bound socket, not a destination IP.
+    for (const auto& part : {options.local.to_string(), options.alpn, retry.scope}) {
+        impl->domain += std::to_string(part.size());
+        impl->domain += ':';
+        impl->domain += part;
+    }
+    impl->lifetime = retry.token_lifetime_ns;
+    impl->window = retry.window_ns;
+    impl->reply_limit = retry.max_replies_per_window;
+    if (!retry.current_key) {
+        retry.current_key.emplace();
+        if (!fill_random(retry.current_key->data(), retry.current_key->size()))
+            return std::unexpected(quic_error(invalid));
+    }
+    auto current = impl->derive(*retry.current_key);
+    if (!current) return std::unexpected(current.error());
+    impl->current = *current;
+    OPENSSL_cleanse(current->data(), current->size());
+    if (retry.previous_key) {
+        auto previous = impl->derive(*retry.previous_key);
+        if (!previous) return std::unexpected(previous.error());
+        impl->previous = *previous;
+        OPENSSL_cleanse(previous->data(), previous->size());
+    }
+    return RetryGate(std::move(impl));
+}
+Result<detail::RetryGate::Decision> detail::RetryGate::inspect(
+    const transport::Endpoint& peer, std::span<const std::byte> initial, std::uint64_t now) {
+    if (!impl_) return Decision{true, {}, {}};
+    auto& state = *impl_;
+    if (now < state.clock) return std::unexpected(quic_error(invalid));
+    state.clock = now;
+    ngtcp2_pkt_hd hd{};
+    if (peer.address_bytes().empty() || !decode_initial(hd, initial)) return Decision{};
+    // token2 authenticates raw sockaddr bytes: remove OS padding, BSD lengths and
+    // IPv6 flow labels, but preserve family, address, port and IPv6 scope identity.
+    auto canonical = transport::Endpoint::parse(peer.address(), peer.port());
+    if (!canonical) return Decision{};
+    if (hd.tokenlen) {
+        if (hd.tokenlen != NGTCP2_CRYPTO_MAX_RETRY_TOKENLEN2 || hd.dcid.datalen != 16)
+            return Decision{};
+        ngtcp2_cid original{};
+        if (!state.verify(original, hd, *canonical, state.current, now) &&
+            (!state.previous || !state.verify(original, hd, *canonical, *state.previous, now)))
+            return Decision{};
+        auto proof = std::shared_ptr<RetryValidation>(new RetryValidation);
+        proof->local_ = state.local;
+        proof->remote_ = peer;
+        proof->alpn_ = state.alpn;
+        proof->original_dcid_ = cid_bytes(original);
+        proof->retry_scid_ = cid_bytes(hd.dcid);
+        const auto* token = reinterpret_cast<const std::byte*>(hd.token);
+        proof->token_.assign(token, token + hd.tokenlen);
+        proof->version_ = hd.version;
+        proof->verified_at_ = now;
+        return Decision{true, {}, std::move(proof)};
+    }
+    if (!state.window_started || now - state.window_start >= state.window) {
+        state.window_start = now;
+        state.window_started = true;
+        state.replies = 0;
+    }
+    if (state.replies >= state.reply_limit ||
+        now > std::numeric_limits<std::uint64_t>::max() - state.lifetime)
+        return Decision{};
+    ++state.replies;
+    ngtcp2_cid scid{};
+    scid.datalen = 16;
+    if (!fill_random(scid.data, scid.datalen)) return std::unexpected(quic_error(invalid));
+    std::array<std::uint8_t, NGTCP2_CRYPTO_MAX_RETRY_TOKENLEN2> token{};
+    const auto address = canonical->address_bytes();
+    auto length = ngtcp2_crypto_generate_retry_token2(token.data(), state.current.data(),
+        state.current.size(), hd.version, reinterpret_cast<const ngtcp2_sockaddr*>(address.data()),
+        static_cast<ngtcp2_socklen>(address.size()), &scid, &hd.dcid, now);
+    if (length < 0) return std::unexpected(quic_error(invalid));
+    Bytes reply(256);
+    length = ngtcp2_crypto_write_retry(reinterpret_cast<std::uint8_t*>(reply.data()), reply.size(),
+        hd.version, &hd.scid, &scid, &hd.dcid, token.data(), static_cast<std::size_t>(length));
+    if (length < 0 || static_cast<std::size_t>(length) > initial.size())
+        return std::unexpected(quic_error(invalid));
+    reply.resize(static_cast<std::size_t>(length));
+    return Decision{false, std::move(reply), {}};
+}
+Result<void> detail::RetryGate::rotate(const RetryKey& key) {
+    if (!impl_) return std::unexpected(quic_error(invalid));
+    auto next = impl_->derive(key);
+    if (!next) return std::unexpected(next.error());
+    discard_previous();
+    impl_->previous = impl_->current;
+    impl_->current = *next;
+    OPENSSL_cleanse(next->data(), next->size());
+    return {};
+}
+void detail::RetryGate::discard_previous() noexcept {
+    if (!impl_ || !impl_->previous) return;
+    OPENSSL_cleanse(impl_->previous->data(), impl_->previous->size());
+    impl_->previous.reset();
 }
 
 struct Engine::Impl {
@@ -71,6 +261,7 @@ struct Engine::Impl {
     ngtcp2_crypto_ossl_ctx* crypto = nullptr;
     ngtcp2_crypto_conn_ref ref{};
     ngtcp2_path path{};
+    ngtcp2_cid original_dcid{};
     bool failed = false;
     bool ended = false;
     int failure_code = 0;
@@ -276,8 +467,24 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
         options.max_buffered_bytes > 64 * 1024 * 1024 ||
         options.max_connection_ids < 2 || options.max_connection_ids > 64 ||
         (!options.server &&
-         (options.peer_name.empty() || options.peer_name.find('\0') != std::string::npos)))
+         (options.peer_name.empty() || options.peer_name.find('\0') != std::string::npos ||
+          options.retry_validation)))
         return std::unexpected(quic_error(invalid));
+    ngtcp2_pkt_hd initial_header{};
+    if (options.server) {
+        if (!decode_initial(initial_header, initial)) return std::unexpected(quic_error(invalid));
+        const auto& proof = options.retry_validation;
+        if (proof) {
+            if (options.max_connection_ids < 3 || proof->local_ != options.local ||
+                proof->remote_ != options.remote || proof->verified_at_ != now ||
+                proof->alpn_ != options.alpn || proof->version_ != initial_header.version ||
+                proof->retry_scid_ != cid_bytes(initial_header.dcid) ||
+                proof->token_.size() != initial_header.tokenlen ||
+                !std::equal(proof->token_.begin(), proof->token_.end(),
+                    reinterpret_cast<const std::byte*>(initial_header.token)))
+                return std::unexpected(quic_error(invalid));
+        } else if (initial_header.tokenlen) return std::unexpected(quic_error(invalid));
+    }
     auto s = std::make_unique<Impl>();
     s->options = std::move(options);
     s->remote_bidi_limit = s->options.max_streams;
@@ -334,14 +541,20 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
         return std::unexpected(quic_error(invalid));
     int rv;
     if (s->options.server) {
-        ngtcp2_pkt_hd hd{};
-        // ngtcp2's C API only speaks uint8_t; the library-wide byte is std::byte, and the cast is contained here.
-        rv = ngtcp2_accept(&hd, reinterpret_cast<const std::uint8_t*>(initial.data()),
-                           initial.size());
-        if (rv != 0) return std::unexpected(quic_error(rv));
+        const auto& hd = initial_header;
         dcid = hd.scid;
         params.original_dcid = hd.dcid;
         params.original_dcid_present = 1;
+        if (const auto& proof = s->options.retry_validation) {
+            ngtcp2_cid_init(&params.original_dcid,
+                reinterpret_cast<const std::uint8_t*>(proof->original_dcid_.data()),
+                proof->original_dcid_.size());
+            params.retry_scid = hd.dcid;
+            params.retry_scid_present = 1;
+            settings.token = hd.token;
+            settings.tokenlen = hd.tokenlen;
+            settings.token_type = NGTCP2_TOKEN_TYPE_RETRY;
+        }
         rv = ngtcp2_conn_server_new(&s->conn,
                                     &dcid,
                                     &scid,
@@ -365,8 +578,11 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
                                     s.get());
     }
     if (rv) return std::unexpected(quic_error(rv));
+    s->original_dcid = s->options.server ? params.original_dcid : dcid;
     s->retain(scid);
-    s->retain(s->options.server ? params.original_dcid : dcid);
+    s->retain(s->original_dcid);
+    if (params.retry_scid_present) s->retain(params.retry_scid);
+    s->options.retry_validation.reset();
     s->ctx = SSL_CTX_new(TLS_method());
     if (!s->ctx || SSL_CTX_set_min_proto_version(s->ctx, TLS1_3_VERSION) != 1 ||
         SSL_CTX_set_max_proto_version(s->ctx, TLS1_3_VERSION) != 1)
@@ -582,9 +798,7 @@ bool Engine::draining() const noexcept {
     return ngtcp2_conn_in_draining_period(impl_->conn) != 0;
 }
 Bytes Engine::initial_destination_cid() const {
-    const auto* id = ngtcp2_conn_get_client_initial_dcid(impl_->conn);
-    auto* first = reinterpret_cast<const std::byte*>(id->data);
-    return Bytes(first, first + id->datalen);
+    return cid_bytes(impl_->original_dcid);
 }
 std::string Engine::negotiated_protocol() const {
     const unsigned char* data = nullptr;
