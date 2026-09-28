@@ -145,8 +145,8 @@ Result<ParseResult> FrameParser::feed(std::span<const std::byte> bytes) {
         header_[header_size_++] = bytes[result.consumed++];
         if (header_size_ == 2) {
             auto length = value(header_[1]) & 127;
-            header_needed_ = 2 + (length == 126 ? 2 : length == 127 ? 8 : 0) +
-                             ((value(header_[1]) & 0x80) ? 4 : 0);
+            header_needed_ = 2U + (length == 126 ? 2U : length == 127 ? 8U : 0U) +
+                             ((value(header_[1]) & 0x80) ? 4U : 0U);
         }
         if (header_size_ == header_needed_) {
             auto parsed = parse_header();
