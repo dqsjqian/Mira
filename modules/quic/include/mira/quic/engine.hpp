@@ -65,6 +65,8 @@ struct Options {
     std::size_t max_buffered_bytes = 4 * 1024 * 1024;
     std::uint64_t max_streams = 64;
     std::uint64_t idle_timeout_ns = 30'000'000'000;
+    // Lifetime CID limit including the original DCID; reject issuance before exceeding it.
+    std::size_t max_connection_ids = 64;
 };
 struct Event {
     enum class Kind { data, acknowledged, reset, closed } kind;
@@ -99,6 +101,11 @@ public:
     bool closed() const noexcept;
     /// Active locally-issued CIDs, including replacements; retired CIDs are omitted.
     std::vector<Bytes> local_connection_ids() const;
+    /// Original DCID and every issued local CID, including retired IDs, bounded by Options.
+    std::vector<Bytes> retained_connection_ids() const;
+    /// Current ngtcp2 PTO in nanoseconds, for external closing/draining lifetimes.
+    std::uint64_t pto() const noexcept;
+    bool draining() const noexcept;
     /// The client's original Initial DCID (also available on server engines).
     Bytes initial_destination_cid() const;
     std::string negotiated_protocol() const;
@@ -110,6 +117,8 @@ public:
     /// Restores the receive window after the application actually consumes (take_events does not count as consumption).
     Result<void> consume(std::int64_t stream, std::size_t bytes);
     Result<void> cancel(std::int64_t stream, std::uint64_t application_error);
+    /// Normal close sends an application error; existing failures retain their transport/TLS code.
+    /// Idle/drop/retry emit no packet. Standalone Engine users schedule the closing period.
     Result<Bytes> close(std::uint64_t application_error, std::uint64_t now);
 
 private:

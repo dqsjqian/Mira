@@ -17,9 +17,13 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message(FATAL_ERROR "MIRA_BUILD_FUZZERS requires clang (libFuzzer ships with it)")
 endif()
 
-# 解析器必须插桩，不能只统计 harness 的覆盖率。普通测试链接无 main
-# 的运行库，仍使用自身入口；这些选项不进入安装后的消费接口。
-foreach(parser_target IN ITEMS mira_core mira_http)
+# Instrument the actual parsers, not only the harness. Ordinary test binaries
+# retain their own entry points; installed consumers do not inherit these flags.
+set(mira_fuzz_libraries mira_core mira_http)
+if(MIRA_ENABLE_WEBSOCKET)
+    list(APPEND mira_fuzz_libraries mira_ws)
+endif()
+foreach(parser_target IN LISTS mira_fuzz_libraries)
     target_compile_options(${parser_target} PRIVATE -fsanitize=fuzzer-no-link)
     target_link_options(${parser_target} PUBLIC
         $<BUILD_INTERFACE:-fsanitize=fuzzer-no-link>)
@@ -38,3 +42,13 @@ target_link_libraries(fuzz_response_parser
 target_compile_features(fuzz_response_parser PRIVATE cxx_std_23)
 target_compile_options(fuzz_response_parser PRIVATE -fsanitize=fuzzer)
 target_link_options(fuzz_response_parser PRIVATE -fsanitize=fuzzer)
+
+if(MIRA_ENABLE_WEBSOCKET)
+    foreach(harness IN ITEMS ws_parser ws_handshake)
+        add_executable(fuzz_${harness} ${harness}.cpp)
+        target_link_libraries(fuzz_${harness} PRIVATE Mira::ws Mira::warnings)
+        target_compile_features(fuzz_${harness} PRIVATE cxx_std_23)
+        target_compile_options(fuzz_${harness} PRIVATE -fsanitize=fuzzer)
+        target_link_options(fuzz_${harness} PRIVATE -fsanitize=fuzzer)
+    endforeach()
+endif()

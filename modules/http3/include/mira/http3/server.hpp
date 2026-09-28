@@ -14,6 +14,10 @@ using Server = quic::Dispatcher<Engine>;
 /// retained decoded header accounting, plus both engines' event queue limits.
 /// Each nonempty HTTP/3 output chunk costs at least one body byte, so reserving
 /// max_buffered_body queue entries covers the worst-case one-byte chunks.
+/// Each live connection reserves 1200 closing bytes and one closing slot. Once
+/// closed it leaves size()/connection(), but its CIDs remain protected for at least
+/// three PTOs. Peer closes drain silently; local closes retransmit only on matching
+/// input within a bounded budget. remove() explicitly purges this protection.
 /// Protocol-library allocations and application-owned events are not RSS-bounded.
 inline Result<Server> make_server(quic::Options options,
                                   quic::ListenerLimits admission = {}, Limits limits = {},

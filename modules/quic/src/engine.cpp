@@ -73,6 +73,8 @@ struct Engine::Impl {
     ngtcp2_path path{};
     bool failed = false;
     bool ended = false;
+    int failure_code = 0;
+    std::vector<Bytes> retained_ids;
     std::uint64_t clock = 0;
     std::size_t buffered = 0;
     std::size_t queued_chunks = 0;
@@ -209,16 +211,29 @@ struct Engine::Impl {
         // This no-return-value callback is only used for non-security-protocol randomness; security-relevant CIDs below check the RNG return value separately.
         if (RAND_bytes(dest, static_cast<int>(len)) != 1) std::terminate();
     }
+    void retain(const ngtcp2_cid& id) {
+        auto* first = reinterpret_cast<const std::byte*>(id.data);
+        Bytes bytes(first, first + id.datalen);
+        if (std::find(retained_ids.begin(), retained_ids.end(), bytes) == retained_ids.end())
+            retained_ids.push_back(std::move(bytes));
+    }
     static int cid(ngtcp2_conn*,
                    ngtcp2_cid* id,
                    ngtcp2_stateless_reset_token* token,
                    std::size_t length,
-                   void*) {
-        id->datalen = length;
-        return RAND_bytes(id->data, static_cast<int>(length)) == 1 &&
-                       RAND_bytes(token->data, sizeof(token->data)) == 1
-                   ? 0
-                   : NGTCP2_ERR_CALLBACK_FAILURE;
+                   void* p) {
+        return guarded([&] {
+            auto& s = self(p);
+            // Never evict retired CIDs: terminate rather than issue an unprotectable CID.
+            if (s.retained_ids.size() >= s.options.max_connection_ids)
+                return NGTCP2_ERR_CALLBACK_FAILURE;
+            id->datalen = length;
+            if (RAND_bytes(id->data, static_cast<int>(length)) != 1 ||
+                RAND_bytes(token->data, sizeof(token->data)) != 1)
+                return NGTCP2_ERR_CALLBACK_FAILURE;
+            s.retain(*id);
+            return 0;
+        });
     }
     static int select_alpn(SSL*,
                            const unsigned char** out,
@@ -259,6 +274,7 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
         options.alpn.find('\0') != std::string::npos || options.max_streams == 0 ||
         options.max_streams > 4096 || options.max_buffered_bytes < 4096 ||
         options.max_buffered_bytes > 64 * 1024 * 1024 ||
+        options.max_connection_ids < 2 || options.max_connection_ids > 64 ||
         (!options.server &&
          (options.peer_name.empty() || options.peer_name.find('\0') != std::string::npos)))
         return std::unexpected(quic_error(invalid));
@@ -349,6 +365,8 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
                                     s.get());
     }
     if (rv) return std::unexpected(quic_error(rv));
+    s->retain(scid);
+    s->retain(s->options.server ? params.original_dcid : dcid);
     s->ctx = SSL_CTX_new(TLS_method());
     if (!s->ctx || SSL_CTX_set_min_proto_version(s->ctx, TLS1_3_VERSION) != 1 ||
         SSL_CTX_set_max_proto_version(s->ctx, TLS1_3_VERSION) != 1)
@@ -435,6 +453,7 @@ Result<void> Engine::receive(std::span<const std::byte> packet, std::uint64_t no
     }
     if (rv) {
         s.failed = true;
+        s.failure_code = rv;
         return std::unexpected(quic_error(rv));
     }
     return {};
@@ -484,6 +503,7 @@ Result<Bytes> Engine::poll(std::uint64_t now) {
                 break;
             if (n < 0) {
                 s.failed = true;
+                s.failure_code = static_cast<int>(n);
                 return std::unexpected(quic_error(static_cast<int>(n)));
             }
             if (used >= 0) {
@@ -504,6 +524,7 @@ Result<Bytes> Engine::poll(std::uint64_t now) {
     auto n = ngtcp2_conn_write_pkt(s.conn, &path.path, &info, out.data(), out.size(), now);
     if (n < 0) {
         s.failed = true;
+        s.failure_code = static_cast<int>(n);
         return std::unexpected(quic_error(static_cast<int>(n)));
     }
     if (n) ngtcp2_conn_update_pkt_tx_time(s.conn, now);
@@ -517,6 +538,7 @@ Result<void> Engine::handle_expiry(std::uint64_t now) {
     int rv = ngtcp2_conn_handle_expiry(s.conn, now);
     if (rv) {
         s.failed = true;
+        s.failure_code = rv;
         return std::unexpected(quic_error(rv));
     }
     return {};
@@ -549,6 +571,15 @@ std::vector<Bytes> Engine::local_connection_ids() const {
         result.emplace_back(first, first + id.datalen);
     }
     return result;
+}
+std::vector<Bytes> Engine::retained_connection_ids() const {
+    return impl_->retained_ids;
+}
+std::uint64_t Engine::pto() const noexcept {
+    return ngtcp2_conn_get_pto(impl_->conn);
+}
+bool Engine::draining() const noexcept {
+    return ngtcp2_conn_in_draining_period(impl_->conn) != 0;
 }
 Bytes Engine::initial_destination_cid() const {
     const auto* id = ngtcp2_conn_get_client_initial_dcid(impl_->conn);
@@ -636,9 +667,19 @@ Result<Bytes> Engine::close(std::uint64_t code, std::uint64_t now) {
         return std::unexpected(quic_error(invalid));
     auto& s = *impl_;
     if (s.ended || !s.time(now)) return std::unexpected(quic_error(invalid));
+    if (s.failure_code == NGTCP2_ERR_IDLE_CLOSE || s.failure_code == NGTCP2_ERR_DROP_CONN ||
+        s.failure_code == NGTCP2_ERR_RETRY || draining()) {
+        s.ended = true;
+        return Bytes{};
+    }
     ngtcp2_ccerr err;
     ngtcp2_ccerr_default(&err);
-    ngtcp2_ccerr_set_application_error(&err, code, nullptr, 0);
+    if (s.failure_code == NGTCP2_ERR_CRYPTO)
+        ngtcp2_ccerr_set_tls_alert(&err, ngtcp2_conn_get_tls_alert(s.conn), nullptr, 0);
+    else if (s.failure_code)
+        ngtcp2_ccerr_set_liberr(&err, s.failure_code, nullptr, 0);
+    else
+        ngtcp2_ccerr_set_application_error(&err, code, nullptr, 0);
     Bytes packet(1200);
     ngtcp2_pkt_info info{};
     auto n = ngtcp2_conn_write_connection_close(

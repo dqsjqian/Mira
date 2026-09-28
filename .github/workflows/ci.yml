@@ -18,6 +18,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Layering, framework-independence, platform-fencing
         run: python3 tools/ci/check_layering.py
+      - name: Verification runner invariants
+        run: |
+          python3 tools/ci/test_protocol_deps.py
+          python3 tools/ci/test_autobahn_runner.py
 
   # Every backend gets a real build and a real test run, because a platform
   # that merely compiles is not a supported platform:
@@ -88,10 +92,17 @@ jobs:
           & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install openssl:x64-windows nghttp2:x64-windows
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "CMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Enable Windows HTTP2
+      - name: Build pinned Windows QUIC and HTTP3 dependencies
         if: runner.os == 'Windows'
         shell: pwsh
-        run: '"MIRA_PLATFORM_PROTOCOL_FLAGS=-DMIRA_ENABLE_HTTP2=ON" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8'
+        run: |
+          $openssl = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows"
+          "OPENSSL_ROOT_DIR=$openssl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          @("$openssl/debug/bin", "$openssl/bin", "$openssl/tools/openssl") | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          python tools/ci/build_protocol_deps.py --generator "Visual Studio 17 2022" --openssl-root "$openssl" --config Debug --architecture x64 --toolchain "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "CMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/build/protocol-deps/prefix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MIRA_PLATFORM_PROTOCOL_FLAGS=-DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Configure TLS
         run: cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=${{ matrix.std }} -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON ${{ env.MIRA_PLATFORM_PROTOCOL_FLAGS }}
       - name: Build TLS
@@ -182,13 +193,13 @@ jobs:
         # _LIBCPP_HAS_NO_EXPERIMENTAL_STOP_TOKEN (CI-proven with both 18 and
         # 19; the android job describes the same gate), while libstdc++ ships
         # the complete library — exactly what epoll-clang already validates.
-        run: sudo apt-get update && sudo apt-get install -y clang-19
+        run: sudo apt-get update && sudo apt-get install -y clang-19 libssl-dev
       - name: Configure with libFuzzer
         run: >
           cmake -S . -B build/fuzz -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_CXX_COMPILER=clang++-19
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"
-          -DMIRA_BUILD_FUZZERS=ON
+          -DMIRA_BUILD_FUZZERS=ON -DMIRA_ENABLE_WEBSOCKET=ON
       - name: Build
         run: cmake --build build/fuzz --parallel
       - name: Ordinary tests with instrumented parser libraries
@@ -200,7 +211,39 @@ jobs:
           fuzz/corpus/http_parser &&
           ./build/fuzz/fuzz/fuzz_response_parser
           -max_total_time=60 -max_len=1024 -rss_limit_mb=2560
-          fuzz/corpus/response_parser
+          fuzz/corpus/response_parser &&
+          ./build/fuzz/fuzz/fuzz_ws_parser
+          -max_total_time=60 -max_len=8192 -rss_limit_mb=2560 &&
+          ./build/fuzz/fuzz/fuzz_ws_handshake
+          -max_total_time=60 -max_len=16384 -rss_limit_mb=2560
+
+  # Run the official RFC6455 corpus against both roles. RFC7692 compression
+  # cases are explicitly excluded until extension negotiation is implemented.
+  websocket-conformance:
+    needs: discipline
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install WebSocket build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Configure and build both conformance harnesses
+        run: |
+          cmake -S . -B build/autobahn -DCMAKE_BUILD_TYPE=Release -DMIRA_ENABLE_WEBSOCKET=ON
+          cmake --build build/autobahn --parallel --target mira_ws_autobahn_server mira_ws_autobahn_client
+      - name: Run official Autobahn client and server cases
+        run: >
+          python3 tools/ci/run_autobahn.py
+          --server build/autobahn/mira_ws_autobahn_server
+          --client build/autobahn/mira_ws_autobahn_client
+          --runtime docker --output build/autobahn-results --timeout 2400
+      - name: Preserve complete conformance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: websocket-autobahn-results
+          path: build/autobahn-results
+          if-no-files-found: error
 
   # Optional protocol engines (nghttp2 / ngtcp2 / nghttp3) with their
   # dependencies built from pinned, hash-verified sources by the same

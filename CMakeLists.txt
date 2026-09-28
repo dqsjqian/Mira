@@ -181,7 +181,7 @@ if(MIRA_BUILD_EXAMPLES)
     target_link_libraries(mira_sse_server PRIVATE Mira::http Mira::transport Mira::warnings)
 
     if(MIRA_ENABLE_WEBSOCKET)
-        foreach(example IN ITEMS ws_server ws_client)
+        foreach(example IN ITEMS ws_server ws_client ws_autobahn_server ws_autobahn_client)
             add_executable(mira_${example} examples/${example}.cpp)
             target_link_libraries(mira_${example} PRIVATE Mira::ws Mira::transport Mira::warnings)
         endforeach()

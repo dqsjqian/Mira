@@ -39,6 +39,12 @@ bool utf8(std::span<const std::byte> bytes, unsigned& remaining,
             else return false;
         } else {
             if ((c & 0xc0) != 0x80) return false;
+            // Reject impossible Unicode scalar prefixes before waiting for the remaining bytes.
+            if ((remaining == 2 && minimum == 0x800 &&
+                 ((cp == 0 && c < 0xa0) || (cp == 13 && c >= 0xa0))) ||
+                (remaining == 3 && minimum == 0x10000 &&
+                 ((cp == 0 && c < 0x90) || (cp == 4 && c >= 0x90))))
+                return false;
             cp = (cp << 6) | (c & 63);
             if (--remaining == 0 && (cp < minimum || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)))
                 return false;
@@ -120,16 +126,11 @@ Result<void> FrameParser::validate_frame() {
     if (frame_.opcode == Opcode::close) {
         auto result = validate_close(frame_.payload);
         if (!result) return result;
-        if (role_ == Role::client && frame_.payload.size() >= 2 &&
-            value(frame_.payload[0]) == 3 && value(frame_.payload[1]) == 242)
-            return fail(make_error_code(Errc::protocol));
         closed_ = true;
     } else if (!control(frame_.opcode)) {
         auto type = fragmented_.value_or(frame_.opcode);
         message_size_ += frame_.payload.size();
-        if (type == Opcode::text &&
-            (!utf8(frame_.payload, utf8_remaining_, utf8_value_, utf8_min_) ||
-             (frame_.final && utf8_remaining_ != 0)))
+        if (type == Opcode::text && frame_.final && utf8_remaining_ != 0)
             return fail(make_error_code(Errc::invalid_utf8));
         if (frame_.final) { fragmented_.reset(); message_size_ = 0; }
         else fragmented_ = type;
@@ -154,10 +155,18 @@ Result<ParseResult> FrameParser::feed(std::span<const std::byte> bytes) {
         }
     }
     auto count = std::min(payload_size_ - frame_.payload.size(), bytes.size() - result.consumed);
+    const auto previous_size = frame_.payload.size();
     for (std::size_t i = 0; i < count; ++i) {
         auto byte = bytes[result.consumed++];
         if (masked_) byte ^= mask_[frame_.payload.size() % 4];
         frame_.payload.push_back(byte);
+    }
+    // RFC6455 UTF-8 state spans a message; control frames must not interrupt text validation.
+    if (!control(frame_.opcode) && fragmented_.value_or(frame_.opcode) == Opcode::text &&
+        !utf8(std::span<const std::byte>(frame_.payload).subspan(previous_size),
+              utf8_remaining_, utf8_value_, utf8_min_)) {
+        error_ = make_error_code(Errc::invalid_utf8);
+        return fail(error_);
     }
     if (frame_.payload.size() == payload_size_) {
         auto checked = validate_frame();

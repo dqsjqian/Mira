@@ -6,6 +6,7 @@
 #include <iostream>
 #include <map>
 #include <stdexcept>
+#include <source_location>
 
 using namespace Mira;
 using namespace std::chrono_literals;
@@ -13,12 +14,12 @@ using transport::Endpoint;
 using quic::Bytes;
 
 namespace {
-template<class T> T require(Result<T> value) {
-    if (!value) throw std::runtime_error(value.error().message());
+template<class T> T require(Result<T> value, std::source_location location = std::source_location::current()) {
+    if (!value) throw std::runtime_error(value.error().message() + " at " + std::to_string(location.line()));
     return std::move(*value);
 }
-void require(Result<void> value) {
-    if (!value) throw std::runtime_error(value.error().message());
+void require(Result<void> value, std::source_location location = std::source_location::current()) {
+    if (!value) throw std::runtime_error(value.error().message() + " at " + std::to_string(location.line()));
 }
 void check(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
@@ -198,8 +199,20 @@ Task<void> run(EventLoop& loop, const char* certificate, const char* key) {
                 input = require(co_await socket.receive_from(buffer, {.deadline = Clock::now() + 1s}));
                 require(server.ingest(input.peer, std::span(buffer).first(input.size), now()));
             }
-            check(server.size() == 2 && server.reserved_payload_bytes() == reserved / 3 * 2,
-                  "peer close did not release admission");
+            check(server.size() == 2 && server.tombstone_count() == 1 &&
+                      server.reserved_payload_bytes() == reserved / 3 * 2,
+                  "peer drain did not release engine admission");
+            auto replay = require(server.ingest(peers[0], initials[0], now()));
+            check(replay.kind == http3::Server::Ingest::Kind::dropped && replay.connection_id == ids[0],
+                  "HTTP/3 draining Initial was re-admitted");
+            check(require(server.ingest(peers[1], initials[0], now())).kind ==
+                      http3::Server::Ingest::Kind::dropped, "draining changed fixed peer");
+            for (int burst = 0; burst < 64; ++burst) {
+                auto output = require(server.poll(now()));
+                if (!output) break;
+                check(output->connection_id != ids[0], "peer draining emitted a close response");
+                require(co_await socket.send_to(output->data, output->peer));
+            }
             require(co_await sockets[3].send_to(initials[3], local));
             for (;;) {
                 input = require(co_await socket.receive_from(buffer, {.deadline = Clock::now() + 1s}));
@@ -219,8 +232,13 @@ Task<void> run(EventLoop& loop, const char* certificate, const char* key) {
     check(server.route_count() >= server.size() * 3, "new CID routing was not refreshed");
     auto future = now() + 60'000'000'000;
     require(server.handle_expiry(future));
-    check(server.size() == 0 && server.route_count() == 0 && server.reserved_payload_bytes() == 0,
-          "idle expiry leaked state");
+    check(server.size() == 0 && server.tombstone_count() == 3 &&
+              server.route_count() >= 9 && server.reserved_payload_bytes() == 0,
+          "idle timeout lost CID protection or retained payload");
+    check(!require(server.poll(future)), "idle timeout sent a close packet");
+    require(server.handle_expiry(future + 60'000'000'000));
+    check(server.tombstone_count() == 0 && server.route_count() == 0,
+          "idle tombstones did not expire");
     check(!server.handle_expiry(future - 1), "backwards time accepted");
 }
 }  // namespace
