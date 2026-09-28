@@ -156,6 +156,24 @@ Result<Endpoint> Endpoint::from_bytes(std::span<const std::byte> address) {
     return endpoint;
 }
 
+bool operator==(const Endpoint& left, const Endpoint& right) noexcept {
+    if (left.length_ == 0 || right.length_ == 0) {
+        return left.length_ == right.length_;
+    }
+    if (left.family_ != right.family_) return false;
+    if (left.family_ == Family::ipv6) {
+        sockaddr_in6 a{}, b{};
+        std::memcpy(&a, left.storage_.data(), sizeof(a));
+        std::memcpy(&b, right.storage_.data(), sizeof(b));
+        return a.sin6_port == b.sin6_port && a.sin6_scope_id == b.sin6_scope_id &&
+               std::memcmp(&a.sin6_addr, &b.sin6_addr, sizeof(a.sin6_addr)) == 0;
+    }
+    sockaddr_in a{}, b{};
+    std::memcpy(&a, left.storage_.data(), sizeof(a));
+    std::memcpy(&b, right.storage_.data(), sizeof(b));
+    return a.sin_port == b.sin_port && a.sin_addr.s_addr == b.sin_addr.s_addr;
+}
+
 std::uint16_t Endpoint::port() const noexcept {
     if (family_ == Family::ipv6) {
         sockaddr_in6 v6{};

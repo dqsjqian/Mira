@@ -1,6 +1,6 @@
 #pragma once
 #include "mira/core/error.hpp"
-#include "mira/http2/headers.hpp"
+#include "mira/http/fields.hpp"
 #include "mira/quic/engine.hpp"
 
 #include <utility>
@@ -10,8 +10,8 @@ using Mira::Result;
 /// HTTP/2 and HTTP/3 share the same header-block semantics (HPACK/QPACK compress the same field
 /// sequence model), so they share one header list type: swapping transports requires no rewrite
 /// of header-handling code.
-using Mira::http2::Header;
-using Mira::http2::Headers;
+using Mira::http::Header;
+using Mira::http::Headers;
 
 /// Error category shared by native nghttp3 negative codes and engine-owned boundary codes.
 /// The -100000 range holds engine-owned codes; the rest are native nghttp3 codes.

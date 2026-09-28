@@ -16,7 +16,7 @@
 // In-process by design; the small window is configured, not simulated, so
 // the code path under test is the production path.
 //
-// Usage: bench_h1_overload [exchanges=50000]
+// Usage: bench_h1_overload [exchanges=50000] [response_read_chunk=4096]
 
 #include <mira/core/event_loop.hpp>
 #include <mira/core/task.hpp>
@@ -24,6 +24,7 @@
 #include <mira/http/connection.hpp>
 #include <mira/transport/tcp.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -74,7 +75,7 @@ Task<void> server_task(tcp::Listener& listener, std::uint64_t requests) {
 }
 
 Task<void> client_task(EventLoop& loop, const Endpoint& address, std::uint64_t requests,
-                       Counters& counters) {
+                       std::size_t response_read_chunk, Counters& counters) {
     auto connected = co_await tcp::connect(loop, address);
     if (!connected) {
         std::fprintf(stderr, "bench: connect failed: %s\n",
@@ -102,8 +103,8 @@ Task<void> client_task(EventLoop& loop, const Endpoint& address, std::uint64_t r
         std::size_t pending = 0;
         bool whole = false;
         while (!whole) {
-            const auto read =
-                co_await socket.read_some(std::span<std::byte>{buffer.data(), buffer.size()});
+            const auto read = co_await socket.read_some(std::span<std::byte>{
+                buffer.data() + pending, std::min(response_read_chunk, buffer.size() - pending)});
             if (!read || *read == 0) co_return;
             pending += *read;
             std::string_view text{reinterpret_cast<const char*>(buffer.data()), pending};
@@ -122,6 +123,11 @@ Task<void> client_task(EventLoop& loop, const Endpoint& address, std::uint64_t r
 
 int main(int argc, char** argv) {
     const std::uint64_t requests = argc > 1 ? std::stoull(argv[1]) : 50000;
+    const std::size_t response_read_chunk = argc > 2 ? std::stoull(argv[2]) : 4096;
+    if (response_read_chunk == 0 || response_read_chunk > 4096) {
+        std::fprintf(stderr, "bench: response_read_chunk must be between 1 and 4096\n");
+        return 1;
+    }
 
     Result<EventLoop> created = EventLoop::create();
     if (!created) {
@@ -140,7 +146,7 @@ int main(int argc, char** argv) {
     Counters counters{};
     TaskScope tasks;
     tasks.spawn(server_task(*bound, requests));
-    tasks.spawn(client_task(loop, address, requests, counters));
+    tasks.spawn(client_task(loop, address, requests, response_read_chunk, counters));
 
     const auto started = LoopClock::now();
     const Result<void> joined = loop.run_until_complete(tasks.join());
@@ -159,8 +165,9 @@ int main(int argc, char** argv) {
     }
     const double seconds = std::chrono::duration<double>(elapsed).count();
     const double rps = seconds > 0 ? static_cast<double>(counters.completed) / seconds : 0.0;
-    std::printf("h1_overload: %llu exchanges (4KiB bodies, 512B read window) in %.3fs"
-                " -> %.0f req/s\n",
-                static_cast<unsigned long long>(counters.completed), seconds, rps);
+    std::printf("h1_overload: %llu exchanges (4KiB bodies, 512B read window, %zuB response reads)"
+                " in %.3fs -> %.0f req/s\n",
+                static_cast<unsigned long long>(counters.completed), response_read_chunk,
+                seconds, rps);
     return 0;
 }

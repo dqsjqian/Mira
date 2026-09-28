@@ -7,6 +7,46 @@ version is 0, the minor version is where breaking changes land: a request for
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-28
+
+### Added
+
+- Runnable client/server pairs for TCP, UDP, HTTP/1.1, HTTP/2 and HTTP/3.
+  Smoke tests cover keep-alive, concurrent streams, zero-byte datagrams,
+  connection refusal and deadlines. H3 examples require explicit certificates.
+- HTTP/3 `receive_events()` exposes real request IDs in arrival order with
+  bounded connection-level queues. Resets are errors, not successful EOF;
+  recent consumed terminal states remain terminal on repeated reads.
+- Isolated installed-SDK consumer tests, including required/optional components,
+  lower-case version headers, H3 without H2, and QUIC without H3 dependencies.
+- Hash-pinned independent HTTP/3 curl builder and strict Linux interoperability
+  gate. A missing external client is explicitly skipped elsewhere, never passed.
+
+### Fixed
+
+- HTTP/1 chunk terminators reject invalid prefixes immediately rather than
+  accumulating unbounded data while waiting for a newline.
+- POSIX readiness batches keep pending operations cancellable until dispatch;
+  closing/reusing another ready descriptor cannot redirect old I/O. Socket
+  writes suppress SIGPIPE locally without changing process-wide disposition.
+- Scattered writes skip trailing empty fragments instead of reporting EOF.
+- Endpoint equality compares family, IP, port and IPv6 scope, not OS padding,
+  BSD length bytes or flow labels.
+- QUIC/H3 process already-expired timers before awaiting another datagram,
+  distinguish caller deadlines from protocol timers, and keep the peer fixed.
+- The overload benchmark appends short reads correctly; a configurable read
+  chunk makes the fragmented-response path independently reproducible.
+- Parser implementation objects now carry libFuzzer coverage instrumentation,
+  rather than instrumenting only the harness translation units.
+
+### Changed
+
+- Shared HTTP field types live in dependency-free `Mira::http_common`; HTTP/3
+  no longer requires nghttp2. H2/H3 field aliases remain source-compatible,
+  but their canonical namespace changed: rebuild consumers for this minor release.
+- Package components use the correct `Mira_*` variables, and QUIC/H3 have
+  separate exports. `mira_h3_server` now takes port, certificate and key paths.
+
 ### Added
 
 - CI: a UCRT64 MinGW job (GCC + OpenSSL from the ucrt64 packages, full suite

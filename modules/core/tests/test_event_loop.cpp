@@ -38,7 +38,11 @@
 #include <vector>
 
 #if !MIRA_PLATFORM_WINDOWS
+    #include <csignal>
+    #include <netinet/in.h>
+    #include <poll.h>
     #include <sys/socket.h>
+    #include <sys/wait.h>
     #include <unistd.h>
 #endif
 
@@ -81,22 +85,6 @@ struct DetachedTask {
         void unhandled_exception() noexcept { std::terminate(); }
     };
 };
-
-/// Run `body` to completion, pumping the loop until it finishes.
-///
-/// `budget` bounds the number of iterations so a hung expectation fails the
-/// test instead of hanging CI.
-template<typename Body>
-bool drive(EventLoop& loop, std::atomic<bool>& finished, Body body, int budget = 1000) {
-    body();  // starts eagerly, suspends on its first await
-    for (int i = 0; i < budget && !finished.load(std::memory_order_acquire); ++i) {
-        const Result<void> stepped = loop.run_once(50ms);
-        if (!stepped) {
-            return false;
-        }
-    }
-    return finished.load(std::memory_order_acquire);
-}
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 
@@ -847,6 +835,301 @@ void test_detach_and_shutdown_resume_waiters() {
         CHECK(write_outcome.error() == Errc::cancelled);
     }
 }
+
+void test_ready_batch_detach_and_reuse() {
+    test::section("ready-batch detach and dup2 must not access replacement descriptors");
+    for (const int mode : {0, 1, 2}) {
+        auto created = EventLoop::create();
+        CHECK(created.has_value());
+        if (!created) return;
+        auto& loop = *created;
+        std::array<HandlePair, 2> pairs;
+        HandlePair replacement;
+        CHECK(pairs[0].valid() && pairs[1].valid() && replacement.valid());
+        if (!pairs[0].valid() || !pairs[1].valid() || !replacement.valid()) return;
+        std::array<int, 2> handles{pairs[0].first(), pairs[1].first()};
+        for (const int fd : handles) CHECK(loop.attach(fd).has_value());
+        CHECK(loop.attach(replacement.first()).has_value());
+        std::array<std::size_t, 2> buffered{};
+        if (mode != 0) {
+            for (std::size_t i = 0; i < pairs.size(); ++i) {
+                buffered[i] = pairs[i].fill_send_buffer();
+                CHECK(buffered[i] > 0);
+            }
+        }
+        std::array<Result<std::size_t>, 2> outcomes;
+        int done = 0;
+        int winner = -1;
+        int replacement_done = 0;
+        struct Runner {
+            static DetachedTask replacement_wait(EventLoop& target, int fd, int& count) {
+                const auto result = co_await target.wait_readable(fd);
+                CHECK(result.has_value());
+                ++count;
+            }
+            static DetachedTask go(EventLoop& target, std::array<int, 2>& fds,
+                                   std::size_t index, int kind, int substitute,
+                                   std::array<Result<std::size_t>, 2>& results,
+                                   int& count, int& first, int& new_count) {
+                std::array<std::byte, 1> buffer{};
+                const auto payload = bytes_of("x");
+                const std::array pieces{payload, payload};
+                if (kind == 0) results[index] = co_await target.read(fds[index], buffer);
+                else if (kind == 1) results[index] = co_await target.write(fds[index], payload);
+                else results[index] = co_await target.writev(fds[index], pieces);
+                ++count;
+                if (!results[index]) {
+                    // Cancellation reenters detach; outer frames must not retain invalid iterators.
+                    target.detach(fds[index]);
+                } else if (first == -1) {
+                    first = static_cast<int>(index);
+                    const int victim = fds[1 - index];
+                    target.detach(victim);
+                    CHECK(::close(victim) == 0);
+                    CHECK(::dup2(substitute, victim) == victim);
+                    CHECK(target.attach(victim).has_value());
+                    replacement_wait(target, victim, new_count);
+                }
+            }
+        };
+        for (std::size_t i = 0; i < pairs.size(); ++i) {
+            Runner::go(loop, handles, i, mode, replacement.first(), outcomes,
+                       done, winner, replacement_done);
+        }
+        CHECK(done == 0);
+        CHECK(loop.outstanding() == 2);
+        for (std::size_t i = 0; i < pairs.size(); ++i) {
+            if (mode == 0) pairs[i].peer_send("a");
+            else pairs[i].peer_drain(buffered[i]);
+        }
+        // Replacement descriptors are ready; an incorrect retry cannot hide behind EAGAIN.
+        replacement.peer_send("replacement");
+        CHECK(loop.run_once(0ms).has_value());
+        CHECK(done == 2);
+        CHECK(winner >= 0);
+        if (winner >= 0) {
+            const auto& cancelled = outcomes[static_cast<std::size_t>(1 - winner)];
+            CHECK(!cancelled.has_value());
+            if (!cancelled) CHECK(cancelled.error() == Errc::cancelled);
+        }
+        CHECK(replacement_done == 0);
+        CHECK(loop.run_once(0ms).has_value());
+        CHECK(replacement_done == 1);
+        CHECK(done == 2);
+        CHECK(loop.outstanding() == 0);
+        // The old operation must not consume replacement socket data.
+        std::array<char, 16> untouched{};
+        CHECK(::read(replacement.first(), untouched.data(), untouched.size()) == 11);
+        CHECK(std::string_view(untouched.data(), 11) == "replacement");
+    }
+}
+
+void test_ready_batch_both_directions_detach() {
+    test::section("first callback cancels the other ready direction on the same fd");
+    auto created = EventLoop::create();
+    HandlePair pair;
+    HandlePair replacement;
+    CHECK(created && pair.valid() && replacement.valid());
+    if (!created || !pair.valid() || !replacement.valid()) return;
+    auto& loop = *created;
+    CHECK(loop.attach(pair.first()).has_value());
+    const auto buffered = pair.fill_send_buffer();
+    CHECK(buffered > 0);
+    std::array<Result<std::size_t>, 2> outcomes;
+    int done = 0;
+    struct Runner {
+        static DetachedTask go(EventLoop& target, int fd, int substitute, bool writing,
+                               std::array<Result<std::size_t>, 2>& results, int& count) {
+            const std::size_t index = writing ? 1U : 0U;
+            std::array<std::byte, 1> scratch{};
+            results[index] = writing ? co_await target.write(fd, bytes_of("x"))
+                                     : co_await target.read(fd, scratch);
+            ++count;
+            if (results[index]) {
+                target.detach(fd);
+                CHECK(::close(fd) == 0);
+                CHECK(::dup2(substitute, fd) == fd);
+                CHECK(target.attach(fd).has_value());
+            } else {
+                target.detach(fd);
+            }
+        }
+    };
+    Runner::go(loop, pair.first(), replacement.first(), false, outcomes, done);
+    Runner::go(loop, pair.first(), replacement.first(), true, outcomes, done);
+    CHECK(done == 0);
+    pair.peer_send("a");
+    pair.peer_drain(buffered);
+    replacement.peer_send("new");
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(done == 2);
+    CHECK(outcomes[0].has_value() != outcomes[1].has_value());
+    for (const auto& outcome : outcomes) {
+        if (!outcome) CHECK(outcome.error() == Errc::cancelled);
+    }
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(done == 2);
+    CHECK(loop.outstanding() == 0);
+}
+
+void test_ready_accept_batch_detach_and_reuse() {
+    test::section("ready-batch accept must cancel after listener descriptor reuse");
+    auto created = EventLoop::create();
+    CHECK(created.has_value());
+    if (!created) return;
+    auto& loop = *created;
+    std::array<int, 3> listeners{-1, -1, -1};
+    std::array<sockaddr_in, 3> addresses{};
+    std::array<int, 3> clients{-1, -1, -1};
+    for (std::size_t i = 0; i < listeners.size(); ++i) {
+        listeners[i] = ::socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(listeners[i] >= 0);
+        addresses[i].sin_family = AF_INET;
+        addresses[i].sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        CHECK(::bind(listeners[i], reinterpret_cast<sockaddr*>(&addresses[i]),
+                     sizeof(sockaddr_in)) == 0);
+        socklen_t length = sizeof(sockaddr_in);
+        CHECK(::getsockname(listeners[i], reinterpret_cast<sockaddr*>(&addresses[i]), &length) == 0);
+        CHECK(::listen(listeners[i], 4) == 0);
+        CHECK(loop.attach(listeners[i]).has_value());
+    }
+    std::array<Result<NativeHandle>, 2> outcomes;
+    int done = 0;
+    int winner = -1;
+    struct Acceptor {
+        static DetachedTask go(EventLoop& target, std::array<int, 3>& fds, std::size_t index,
+                               std::array<Result<NativeHandle>, 2>& results,
+                               int& count, int& first) {
+            results[index] = co_await target.accept(fds[index], AF_INET);
+            ++count;
+            if (!results[index]) {
+                target.detach(fds[index]);
+            } else {
+                ::close(*results[index]);
+                if (first == -1) {
+                    first = static_cast<int>(index);
+                    const int victim = fds[1 - index];
+                    target.detach(victim);
+                    CHECK(::close(victim) == 0);
+                    CHECK(::dup2(fds[2], victim) == victim);
+                    CHECK(target.attach(victim).has_value());
+                }
+            }
+        }
+    };
+    Acceptor::go(loop, listeners, 0, outcomes, done, winner);
+    Acceptor::go(loop, listeners, 1, outcomes, done, winner);
+    CHECK(done == 0);
+    for (std::size_t i = 0; i < clients.size(); ++i) {
+        clients[i] = ::socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(clients[i] >= 0);
+        CHECK(::connect(clients[i], reinterpret_cast<sockaddr*>(&addresses[i]),
+                        sizeof(sockaddr_in)) == 0);
+    }
+    // A completed connect may precede accept readiness. Wait for every
+    // listener to become readable before polling the complete batch.
+    for (const int fd : listeners) {
+        pollfd ready{fd, POLLIN, 0};
+        CHECK(::poll(&ready, 1, 1000) == 1);
+        CHECK((ready.revents & POLLIN) != 0);
+    }
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(done == 2);
+    CHECK(winner >= 0);
+    if (winner >= 0) {
+        const auto& cancelled = outcomes[static_cast<std::size_t>(1 - winner)];
+        CHECK(!cancelled.has_value());
+        if (!cancelled) CHECK(cancelled.error() == Errc::cancelled);
+    }
+    const int untouched = ::accept(listeners[2], nullptr, nullptr);
+    CHECK(untouched >= 0);
+    if (untouched >= 0) ::close(untouched);
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(done == 2);
+    CHECK(loop.outstanding() == 0);
+    for (const int fd : listeners) { loop.detach(fd); ::close(fd); }
+    for (const int fd : clients) ::close(fd);
+}
+
+void test_socket_writes_do_not_raise_sigpipe() {
+    test::section("socket writes report errors with default SIGPIPE without changing host disposition");
+    for (const int mode : {0, 1, 2, 3}) {
+        const bool scatter = (mode % 2) != 0;
+        std::fflush(nullptr);
+        const pid_t child = ::fork();
+        CHECK(child >= 0);
+        if (child < 0) return;
+        if (child == 0) {
+            ::signal(SIGPIPE, SIG_DFL);
+            sigset_t signals;
+            (void)sigemptyset(&signals);
+            (void)sigaddset(&signals, SIGPIPE);
+            ::sigprocmask(SIG_UNBLOCK, &signals, nullptr);
+            auto created = EventLoop::create();
+            HandlePair pair;
+            if (!created || !pair.valid() || !created->attach(pair.first())) std::_Exit(2);
+            int writer = pair.first();
+            if (mode >= 2) {
+                const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+                sockaddr_in address{};
+                address.sin_family = AF_INET;
+                address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                if (listener < 0 ||
+                    ::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+                    ::listen(listener, 1) != 0 || !created->attach(listener)) std::_Exit(7);
+                socklen_t length = sizeof(address);
+                if (::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length) != 0)
+                    std::_Exit(7);
+                const int client = ::socket(AF_INET, SOCK_STREAM, 0);
+                if (client < 0 ||
+                    ::connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0)
+                    std::_Exit(7);
+                Result<NativeHandle> accepted = fail(Errc::cancelled);
+                struct Accept {
+                    static Task<void> go(EventLoop& target, int fd, Result<NativeHandle>& result) {
+                        result = co_await target.accept(fd, AF_INET);
+                    }
+                };
+                if (!created->run_until_complete(Accept::go(*created, listener, accepted)) ||
+                    !accepted) std::_Exit(7);
+                writer = *accepted;
+                // A first write after FIN may succeed. Local write shutdown
+                // gives deterministic EPIPE and covers sockets attached by accept.
+                if (::shutdown(writer, SHUT_WR) != 0) std::_Exit(7);
+                ::close(client);
+                ::close(listener);
+            } else {
+                pair.peer_close();
+            }
+            const auto payload = bytes_of("x");
+            const std::array pieces{payload, payload};
+            const auto outcome = scatter ? created->writev(writer, pieces).sync_get()
+                                         : created->write(writer, payload).sync_get();
+            if (outcome || outcome.error() != std::error_code{EPIPE, std::system_category()})
+                std::_Exit(3);
+            struct sigaction action{};
+            if (::sigaction(SIGPIPE, nullptr, &action) != 0 || action.sa_handler != SIG_DFL)
+                std::_Exit(4);
+            // Non-socket write/writev remain usable.
+            std::array<int, 2> pipe_fds{};
+            if (::pipe(pipe_fds.data()) != 0 || !created->attach(pipe_fds[1])) std::_Exit(5);
+            const auto pipe_result = scatter ? created->writev(pipe_fds[1], pieces).sync_get()
+                                             : created->write(pipe_fds[1], payload).sync_get();
+            std::array<char, 2> received{};
+            const auto expected = scatter ? 2 : 1;
+            if (!pipe_result || *pipe_result != static_cast<std::size_t>(expected) ||
+                ::read(pipe_fds[0], received.data(), received.size()) != expected)
+                std::_Exit(6);
+            ::close(pipe_fds[0]);
+            ::close(pipe_fds[1]);
+            std::_Exit(0);
+        }
+        int status = 0;
+        CHECK(::waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status));
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+}
 #endif  // MIRA_HAS_READINESS_API
 
 void test_deadline_on_a_suspended_read() {
@@ -1533,6 +1816,10 @@ int main(int argc, char** argv) {
 #if MIRA_HAS_READINESS_API
     test_cancel_leaves_other_direction_armed();
     test_detach_and_shutdown_resume_waiters();
+    test_ready_batch_detach_and_reuse();
+    test_ready_batch_both_directions_detach();
+    test_ready_accept_batch_detach_and_reuse();
+    test_socket_writes_do_not_raise_sigpipe();
 #endif
     test_deadline_on_a_suspended_read();
     test_deadline_is_absolute_across_retries();

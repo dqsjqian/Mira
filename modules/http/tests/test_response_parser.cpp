@@ -95,6 +95,66 @@ void test_incremental() {
     CHECK_VALUE(parser.parse(exact) == ParseStep::complete);
     CHECK_VALUE(exact.empty());
 }
+void test_chunk_data_terminator() {
+    test::section("response chunk terminator rejects invalid prefixes without waiting for LF");
+    for (const bool bare_lf : {false, true}) {
+        Limits limits;
+        limits.allow_bare_lf = bare_lf;
+        const std::vector<std::string> invalid{
+            "X", "\rX", "\r\r", "X\r", std::string(65536, 'X')};
+        for (const auto& suffix : invalid) {
+            for (const bool split_cr : {false, true}) {
+                ResponseParser parser{Method::get, limits};
+                Buffer input;
+                input.append(bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na"));
+                CHECK_VALUE(parser.parse(input) == ParseStep::head);
+                CHECK_VALUE(parser.parse(input) == ParseStep::body);
+                CHECK_VALUE(text(parser.body()) == "a");
+                CHECK_VALUE(parser.body().data() == input.readable().data());
+                CHECK_VALUE(input.size() == 1);
+                CHECK_VALUE(parser.parse(input) == ParseStep::need_more);
+                CHECK_VALUE(input.empty());
+                if (split_cr) {
+                    input.append(bytes("\r"));
+                    CHECK_VALUE(parser.parse(input) == ParseStep::need_more);
+                    CHECK_VALUE(input.size() == 1);
+                }
+                input.append(bytes(suffix));
+                CHECK_VALUE(!parser.parse(input));
+            }
+        }
+
+        ResponseParser parser{Method::get, limits};
+        Buffer input;
+        input.append(bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na"));
+        CHECK_VALUE(parser.parse(input) == ParseStep::head);
+        CHECK_VALUE(parser.parse(input) == ParseStep::body);
+        CHECK_VALUE(text(parser.body()) == "a");
+        CHECK_VALUE(input.size() == 1);
+        CHECK_VALUE(parser.parse(input) == ParseStep::need_more);
+        input.append(bytes("\r"));
+        CHECK_VALUE(parser.parse(input) == ParseStep::need_more);
+        CHECK_VALUE(parser.parse(input) == ParseStep::need_more);
+        CHECK_VALUE(input.size() == 1);
+        input.append(bytes("\n1\r\nb\r\n0\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n"));
+        CHECK_VALUE(parser.parse(input) == ParseStep::body);
+        CHECK_VALUE(text(parser.body()) == "b");
+        CHECK_VALUE(parser.parse(input) == ParseStep::complete);
+        parser.reset();
+        CHECK_VALUE(parser.parse(input) == ParseStep::head);
+        CHECK_VALUE(parser.response().status == 204);
+        CHECK_VALUE(parser.parse(input) == ParseStep::complete);
+        CHECK_VALUE(input.empty());
+
+        const auto lf = parse(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\n0\r\n\r\n",
+            1, Method::get, limits);
+        CHECK_VALUE(lf.done == bare_lf);
+        CHECK_VALUE(lf.body == "a");
+        if (!bare_lf) CHECK_VALUE(lf.error == ParseError::bad_line_ending);
+    }
+}
+
 void test_semantics() {
     test::section("HEAD / 1xx / 204 / 304 / EOF / tunnel boundaries");
     for (unsigned status : {100u, 103u, 199u, 204u, 304u}) {
@@ -290,6 +350,7 @@ void test_request_serialization() {
 }  // namespace
 int main() {
     test_incremental();
+    test_chunk_data_terminator();
     test_semantics();
     test_negative();
     test_request_serialization();

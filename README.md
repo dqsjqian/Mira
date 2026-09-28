@@ -186,9 +186,9 @@ auto client = Mira::tls::Context::client({
 | macOS | kqueue | 桌面运行测试，含 TLS / HTTPS |
 | Linux | epoll | 桌面运行 CI，独立 TLS 矩阵 |
 | Windows | IOCP | 桌面 loopback 运行 CI，独立 TLS 矩阵 |
-| iOS / Android | kqueue / epoll | 全部非 TLS 模块交叉编译覆盖；Android 需 **NDK 29+** |
+| iOS / Android | kqueue / epoll | core / transport / HTTP1 交叉编译；Android 需 **NDK 29+** |
 
-最近一次全平台 CI 通过：**16/16 job**（三桌面运行 + MinGW + sanitizers + fuzz 烟测 + protocols + 移动交叉编译），覆盖全部协议代码。设计依据见 [架构文档](docs/ARCHITECTURE.md)。
+CI 覆盖三桌面基础/TLS、MinGW、sanitizers、parser fuzz，以及 Linux/macOS H2/H3 运行测试。Windows H2/H3 和移动端协议运行尚未验证；移动端是基础模块交叉编译。Linux 协议任务使用固定源码构建的 HTTP/3 curl 做强制独立互操作，缺工具不得算通过。当前结果以顶部 CI 链接为准。
 
 ## ✨ 能力全景
 
@@ -233,6 +233,32 @@ cmake --build build/tls -j && ctest --test-dir build/tls --output-on-failure
 
 可选高版本协议：`MIRA_ENABLE_HTTP2=ON` / `MIRA_ENABLE_HTTP3=ON`（默认关闭，不自动联网下载；依赖版本由 `tools/ci/build_protocol_deps.py` SHA256 固定）。
 
+### 最小 client / server 示例
+
+每行先在终端 A 启动 server，再在终端 B 运行 client。全部绑定 loopback，客户端带总 deadline、错误退出码和响应校验；不是只打印成功的伪示例。
+
+| 协议 | 终端 A：server | 终端 B：client |
+|---|---|---|
+| TCP echo | `build/debug/mira_echo_server 8080` | `build/debug/mira_tcp_client 8080 hello` |
+| UDP echo | `build/debug/mira_udp_server 8081` | `build/debug/mira_udp_client 8081 hello` |
+| HTTP/1.1 | `build/debug/mira_hello_world_server 8082` | `build/debug/mira_http1_client 8082` |
+| HTTP/2 prior knowledge | `build/protocols/mira_h2_prior_knowledge_server 8083` | `build/protocols/mira_h2_client 8083` |
+| HTTP/3 | `build/protocols/mira_h3_server 8443 cert.pem key.pem` | `build/protocols/mira_h3_client 8443 cert.pem` |
+
+UDP 客户端传 `""` 可测零字节报文。HTTP1 在同一连接执行两次 keep-alive 请求；H2/H3 提交两个不同流。H2 示例为明文 prior knowledge，不是 TLS/ALPN 示例。H3 示例是单连接多请求，不冒充按 CID 分发的多客户端 listener；生产证书和私钥由调用方管理。
+
+构建 H2/H3（先准备 OpenSSL 3.5+，将 `OPENSSL_ROOT_DIR` 设为其安装路径）：
+
+```bash
+python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
+cmake -S . -B build/protocols -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix" -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"
+cmake --build build/protocols -j
+ctest --test-dir build/protocols --output-on-failure
+"$OPENSSL_ROOT_DIR/bin/openssl" req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 2 -subj /CN=localhost -addext subjectAltName=DNS:localhost
+```
+
+最后一条命令仅生成本地演示用证书；客户端验证该 CA 与 `localhost`，没有关闭验证。H3 可独立开启而无需 H2/nghttp2。所有成对示例都有进程外自动测试；独立 curl 互操作与同库双端测试分开计量。
+
 ### 📦 在自己的项目中使用
 
 推荐与 Aria、AriaAgent 相同的**哈希钉定发布档**方式：每个版本的源码包随 GitHub Release 发布，取回、校验 SHA256、再 `add_subdirectory`，配置期不引入任何子模块或 vendored 目录：
@@ -258,9 +284,11 @@ Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` �
 
 ## 🗺 接下来
 
-1. **端到端资源契约**：慢消费者背压、连接级与进程级内存上限
-2. **深化全平台运行覆盖**：取消语义在更多真机环境下的运行验证
-3. **以证据支持扩展**：跨平台负测、互操作；进程内基准（`bench/`，5 场景）、解析器模糊测试（`fuzz/`，请求与响应双 harness）与可运行示例（`examples/`：echo、hello world、流式文件服务器、HTTP/2 prior-knowledge 服务器、HTTP/3 服务器，均带进程外烟测；文件服务器与 h2 服务器含 curl 互操作——后者经真实 nghttp2 以并发流验证，h3 服务器经 curl 原生 QUIC/ngtcp2+nghttp3 验证）已随库发布，持续扩充覆盖场景
+1. **先把生产闭环补齐**：QUIC/H3 多客户端 CID listener、连接准入与进程级预算、H2/H3 出站流式 body、连接池/重连/优雅关闭组合层。
+2. **证据先于排名**：可复现真实网络吞吐、p50/p99 延迟、峰值内存、慢消费者过载，以及 Windows H2/H3 和移动真机运行。现有进程内基准不能支撑“性能第一”的结论。
+3. **扩协议有取舍**：下一独立协议优先 WebSocket（RFC 6455，后续评估 H2/H3 extended CONNECT）；SSE 先作为现有 HTTP 流式响应示例，Unix-domain socket 作为 transport 扩展。MQTT、SOCKS5、DNS/DoH 按具体使用需求增加；gRPC/Redis/WebRTC 不进入通用网络核心。
+
+当前不支持 QUIC migration/NAT rebinding、0-RTT、Retry 策略与 HTTP/3 extended CONNECT。高层协议完善前不以堆协议数量替代正确性与端到端验证。
 
 设计依据与验收要求见[架构文档](docs/ARCHITECTURE.md)。
 

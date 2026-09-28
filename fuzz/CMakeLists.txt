@@ -17,6 +17,14 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message(FATAL_ERROR "MIRA_BUILD_FUZZERS requires clang (libFuzzer ships with it)")
 endif()
 
+# 解析器必须插桩，不能只统计 harness 的覆盖率。普通测试链接无 main
+# 的运行库，仍使用自身入口；这些选项不进入安装后的消费接口。
+foreach(parser_target IN ITEMS mira_core mira_http)
+    target_compile_options(${parser_target} PRIVATE -fsanitize=fuzzer-no-link)
+    target_link_options(${parser_target} PUBLIC
+        $<BUILD_INTERFACE:-fsanitize=fuzzer-no-link>)
+endforeach()
+
 add_executable(fuzz_http_parser http_parser.cpp)
 target_link_libraries(fuzz_http_parser
     PRIVATE Mira::http Mira::warnings)

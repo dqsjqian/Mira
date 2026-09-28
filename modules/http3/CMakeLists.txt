@@ -13,10 +13,9 @@ add_library(Mira::http3 ALIAS mira_http3)
 target_include_directories(mira_http3 PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 target_compile_features(mira_http3 PUBLIC cxx_std_23)
 # The cryptographic random source comes from Mira::quic; this module does not
-# depend on the TLS backend directly. The shared header types (Header/Headers
-# from http2/headers.hpp): HPACK and QPACK compress the same field-section
-# semantics, so http3 reuses one type — hence the PUBLIC dependency.
-target_link_libraries(mira_http3 PUBLIC Mira::quic Mira::http2
+# depend on the TLS backend directly. Field-section types are shared through
+# a dependency-free vocabulary target, never through the HTTP/2 engine.
+target_link_libraries(mira_http3 PUBLIC Mira::quic Mira::http_common
     PRIVATE mira_nghttp3 $<BUILD_INTERFACE:Mira::warnings>)
 set_target_properties(mira_http3 PROPERTIES OUTPUT_NAME Mira-http3 EXPORT_NAME http3)
 if(COMMAND mira_install_module)

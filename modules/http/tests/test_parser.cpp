@@ -217,6 +217,73 @@ void test_chunked_body() {
     CHECK(hex.body == "0123456789");
 }
 
+void test_chunk_data_terminator() {
+    test::section("chunk data terminator rejects invalid prefixes without waiting for LF");
+
+    for (const bool bare_lf : {false, true}) {
+        Limits limits;
+        limits.allow_bare_lf = bare_lf;
+        const std::vector<std::string> invalid{
+            "X", "\rX", "\r\r", "X\r", std::string(65536, 'X')};
+        for (const auto& suffix : invalid) {
+            for (const bool split_cr : {false, true}) {
+                RequestParser parser{limits};
+                Buffer buffer;
+                feed(buffer, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na");
+                CHECK(parser.parse(buffer) == ParseStep::head);
+                CHECK(parser.parse(buffer) == ParseStep::body);
+                CHECK(parser.body().size() == 1);
+                CHECK(parser.body().data() == buffer.readable().data());
+                CHECK(buffer.size() == 1);
+                CHECK(parser.body().front() == std::byte{'a'});
+                CHECK(parser.parse(buffer) == ParseStep::need_more);
+                CHECK(buffer.empty());
+                if (split_cr) {
+                    feed(buffer, "\r");
+                    CHECK(parser.parse(buffer) == ParseStep::need_more);
+                    CHECK(buffer.size() == 1);
+                }
+                feed(buffer, suffix);
+                const auto step = parser.parse(buffer);
+                CHECK(!step.has_value());
+                if (!step) {
+                    CHECK(step.error() == (split_cr || suffix.front() == '\r'
+                                               ? ParseError::bad_line_ending
+                                               : ParseError::malformed_chunk));
+                }
+            }
+        }
+
+        RequestParser parser{limits};
+        Buffer buffer;
+        feed(buffer, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na");
+        CHECK(parser.parse(buffer) == ParseStep::head);
+        CHECK(parser.parse(buffer) == ParseStep::body);
+        CHECK(parser.body().front() == std::byte{'a'});
+        CHECK(buffer.size() == 1);
+        CHECK(parser.parse(buffer) == ParseStep::need_more);
+        feed(buffer, "\r");
+        CHECK(parser.parse(buffer) == ParseStep::need_more);
+        CHECK(parser.parse(buffer) == ParseStep::need_more);
+        CHECK(buffer.size() == 1);
+        feed(buffer, "\n1\r\nb\r\n0\r\n\r\nGET /next HTTP/1.1\r\n\r\n");
+        CHECK(parser.parse(buffer) == ParseStep::body);
+        CHECK(parser.body().front() == std::byte{'b'});
+        CHECK(parser.parse(buffer) == ParseStep::complete);
+        parser.reset();
+        CHECK(parser.parse(buffer) == ParseStep::head);
+        CHECK(parser.request().target == "/next");
+        CHECK(parser.parse(buffer) == ParseStep::complete);
+        CHECK(buffer.empty());
+
+        const auto lf = parse_byte_by_byte(
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\n0\r\n\r\n", limits);
+        CHECK(lf.complete == bare_lf);
+        CHECK(lf.body == "a");
+        if (!bare_lf) CHECK(lf.error == ParseError::bad_line_ending);
+    }
+}
+
 void test_chunked_trailers() {
     test::section("chunked trailers");
 
@@ -522,6 +589,7 @@ int main() {
     test_simple_request();
     test_content_length_body();
     test_chunked_body();
+    test_chunk_data_terminator();
     test_chunked_trailers();
     test_pipelining_and_reset();
     test_methods_and_versions();

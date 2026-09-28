@@ -58,6 +58,8 @@ jobs:
         run: cmake --build build --parallel --config Debug
       - name: Test
         run: ctest --test-dir build --output-on-failure --build-config Debug
+      - name: Installed package consumer
+        run: python tools/ci/check_install_consumer.py --build-dir build --config Debug
 
   # TLS is an opt-in module. Keep the dependency-free matrix above as well.
   tls:
@@ -92,6 +94,8 @@ jobs:
         run: cmake --build build/tls --parallel --config Debug
       - name: Test TLS and HTTPS
         run: ctest --test-dir build/tls --output-on-failure --build-config Debug
+      - name: Installed TLS package and dependency isolation
+        run: python tools/ci/check_install_consumer.py --build-dir build/tls --config Debug
 
   # Windows is not one toolchain. MSVC covers the IOCP backend above, and the
   # tls job builds it there too — but MinGW GCC is a supported local
@@ -182,6 +186,8 @@ jobs:
           -DMIRA_BUILD_FUZZERS=ON
       - name: Build
         run: cmake --build build/fuzz --parallel
+      - name: Ordinary tests with instrumented parser libraries
+        run: ctest --test-dir build/fuzz --output-on-failure
       - name: Smoke fuzz (60s cap per harness)
         run: >
           ./build/fuzz/fuzz/fuzz_http_parser
@@ -231,6 +237,11 @@ jobs:
           echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
       - name: Build pinned protocol dependencies
         run: python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
+      - name: Build independent HTTP3 curl (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          python3 tools/ci/build_interop_curl.py --openssl-root "$OPENSSL_ROOT_DIR"
+          echo "$PWD/build/interop-curl/prefix/bin" >> "$GITHUB_PATH"
       - name: Configure with TLS, HTTP/2 and HTTP/3
         shell: bash
         run: >
@@ -241,8 +252,38 @@ jobs:
           -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix"
       - name: Build
         run: cmake --build build/protocols --parallel
-      - name: Test
+      - name: Report external HTTP/3 interoperability capability
+        shell: bash
+        run: |
+          curl --version
+          if ! curl --version | grep -q 'HTTP3'; then
+            echo '::warning::curl lacks HTTP3; external H3 interoperability is skipped (CTest code 77), not passed.'
+            echo 'External HTTP/3 interoperability: SKIPPED (curl lacks HTTP3). Native Mira client/server tests still run.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Test POSIX protocols (Windows H2/H3 are not runtime-validated here)
         run: ctest --test-dir build/protocols --output-on-failure
+      - name: Require independent HTTP3 interoperability (Linux)
+        if: runner.os == 'Linux'
+        run: >
+          python3 tools/ci/check_h3_interop.py build/protocols/mira_h3_server
+          --strict --curl "$PWD/build/interop-curl/prefix/bin/curl"
+          --openssl "$OPENSSL_ROOT_DIR/bin/openssl"
+      - name: Installed protocol package and component isolation
+        run: python3 tools/ci/check_install_consumer.py --build-dir build/protocols
+      - name: Configure HTTP3 without HTTP2 or NGHTTP2 (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: >
+          cmake -S . -B build/http3-only -DCMAKE_BUILD_TYPE=Debug
+          -DMIRA_ENABLE_HTTP3=ON -DMIRA_ENABLE_HTTP2=OFF -DMIRA_ENABLE_TLS=OFF
+          -DCMAKE_DISABLE_FIND_PACKAGE_NGHTTP2=TRUE
+          -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix"
+      - name: Build and test HTTP3-only (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake --build build/http3-only --parallel
+          ctest --test-dir build/http3-only --output-on-failure
+          python3 tools/ci/check_install_consumer.py --build-dir build/http3-only --expect-http3-only
 
   # Mobile targets cross-compile only; no runner executes them. Keeping them in
   # CI catches the usual breakage — a POSIX assumption that does not hold on a

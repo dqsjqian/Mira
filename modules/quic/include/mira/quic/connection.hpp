@@ -244,10 +244,15 @@ private:
     /// One round: flush output, then wait for the next datagram or the
     /// engine's next timer deadline, and feed whichever arrives.
     Task<Result<void>> do_pump(OperationOptions io) {
+        if (engine_->closed()) co_return fail(Errc::eof);
         auto flushed = co_await flush(io);
         if (!flushed) co_return fail(flushed.error());
 
         collect_events();
+        if (io.stop.stop_requested()) co_return fail(Errc::cancelled);
+        if (io.deadline && *io.deadline <= EventLoop::Clock::now()) {
+            co_return fail(Errc::timed_out);
+        }
 
         const std::uint64_t now = detail::now_ns();
         OperationOptions wait = io;
@@ -256,40 +261,36 @@ private:
         // receive into an immediate-timeout spin. Only clamp to real timers.
         bool engine_timer_armed = false;
         if (const std::uint64_t expiry = engine_->expiry();
-            expiry > now && expiry != std::numeric_limits<std::uint64_t>::max()) {
+            expiry != std::numeric_limits<std::uint64_t>::max()) {
+            if (expiry <= now) {
+                auto handled = engine_->handle_expiry(now);
+                if (!handled) co_return fail(handled.error());
+                if (engine_->closed()) co_return fail(Errc::eof);
+                collect_events();
+                co_return co_await flush(io);
+            }
             const auto deadline =
                 EventLoop::Clock::time_point{std::chrono::nanoseconds{expiry}};
-            if (!wait.deadline || deadline < *wait.deadline) wait.deadline = deadline;
-            engine_timer_armed = true;
-        }
-
-        // Two sources can expire a wait, and they mean different things:
-        // the engine's retransmit/ACK timer wants `handle_expiry` and another
-        // round; the caller's budget wants the *operation* to fail. A silent
-        // peer plus an expired caller deadline would otherwise turn this into
-        // a synchronous spin (the loop rejects the submit immediately, the
-        // timeout is misread as the engine's, the round "succeeds", repeat)
-        // that starves every other task on the loop thread.
-        if (io.deadline && *io.deadline <= EventLoop::Clock::now()) {
-            co_return fail(Errc::timed_out);
+            if (!wait.deadline || deadline < *wait.deadline) {
+                wait.deadline = deadline;
+                engine_timer_armed = true;
+            }
         }
 
         std::array<std::byte, detail::kMaxDatagram> buffer{};
         auto received = co_await transport_->receive_from(buffer, wait);
         if (!received) {
             if (received.error() == Errc::timed_out) {
-                // The engine's own timer fired (a caller deadline would have
-                // been caught above; a deadline that expires mid-wait resolves
-                // the operation as timed_out only when it is the *earlier*
-                // one, which is exactly the case `engine_timer_armed`
-                // disambiguates below).
-                if (engine_timer_armed && wait.deadline == io.deadline) {
-                    // The caller's own deadline won the race mid-wait.
+                if (!engine_timer_armed ||
+                    (io.deadline && *io.deadline <= EventLoop::Clock::now())) {
                     co_return fail(Errc::timed_out);
                 }
+                if (io.stop.stop_requested()) co_return fail(Errc::cancelled);
                 if (auto handled = engine_->handle_expiry(detail::now_ns()); !handled) {
                     co_return fail(handled.error());
                 }
+                if (engine_->closed()) co_return fail(Errc::eof);
+                collect_events();
                 auto after = co_await flush(io);
                 if (!after) co_return fail(after.error());
                 co_return Result<void>{};
@@ -297,13 +298,7 @@ private:
             co_return fail(received.error());
         }
 
-        if (engine_->is_server()) {
-            // The remote the Initial came from is who we answer; it cannot
-            // change on this connection (no migration).
-            remote_ = received->peer;
-        } else if (!(received->peer == remote_)) {
-            // A datagram from a different source is not for this connection;
-            // drop it and let the next round decide.
+        if (!(received->peer == remote_)) {
             co_return Result<void>{};
         }
         if (auto fed = engine_->receive(

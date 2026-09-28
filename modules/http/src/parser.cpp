@@ -596,17 +596,27 @@ Result<RequestParser::Progress> RequestParser::read_chunk_data(Buffer& input) {
     }
 
     // Chunk data is followed by its own CRLF, which must be present.
-    Result<std::optional<Line>> located = next_line(input.readable(), limits_.allow_bare_lf);
-    if (!located) {
-        return fail(located.error());
-    }
-    if (!located->has_value()) {
+    const std::string_view terminator = as_text(input.readable());
+    if (terminator.empty()) {
         return Progress::need_data;
     }
-    if (!(*located)->text.empty()) {
-        return fail(ParseError::malformed_chunk);
+    if (terminator.front() == '\n') {
+        if (!limits_.allow_bare_lf) {
+            return fail(ParseError::bad_line_ending);
+        }
+        input.consume(1);
+    } else {
+        if (terminator.front() != '\r') {
+            return fail(ParseError::malformed_chunk);
+        }
+        if (terminator.size() == 1) {
+            return Progress::need_data;
+        }
+        if (terminator[1] != '\n') {
+            return fail(ParseError::bad_line_ending);
+        }
+        input.consume(2);
     }
-    input.consume((*located)->consumed);
     state_ = State::body_chunk_header;
     return Progress::advanced;
 }

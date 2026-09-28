@@ -87,18 +87,18 @@ public:
         [[nodiscard]] bool empty() const noexcept {
             return read == detail::kNoOperation && write == detail::kNoOperation;
         }
-
-        [[nodiscard]] detail::Interest interest() const noexcept {
-            auto set = detail::Interest::none;
-            if (read != detail::kNoOperation) {
-                set = set | detail::Interest::read;
-            }
-            if (write != detail::kNoOperation) {
-                set = set | detail::Interest::write;
-            }
-            return set;
-        }
     };
+
+    [[nodiscard]] detail::Interest interest(const FdWaiters& waiters) const noexcept {
+        auto set = detail::Interest::none;
+        const auto armed = [this](detail::OperationId id) {
+            const auto operation = operations_.find(id);
+            return operation != operations_.end() && operation->second.armed;
+        };
+        if (armed(waiters.read)) set = set | detail::Interest::read;
+        if (armed(waiters.write)) set = set | detail::Interest::write;
+        return set;
+    }
 
     Impl(detail::Poller poller, int wake_read, int wake_write) noexcept
         : poller_(std::move(poller)), wake_read_(wake_read), wake_write_(wake_write) {}
@@ -146,9 +146,8 @@ public:
 
     // ── handle registration ─────────────────────────────────────────────────
 
-    /// On POSIX the only per-handle setup is non-blocking mode, which the
-    /// EAGAIN-retry loop depends on. A blocking descriptor would stall the
-    /// whole loop inside a single `read()`.
+    // Nonblocking mode keeps EAGAIN retries from blocking the loop. Where
+    // supported, suppress broken-pipe signals on the socket itself.
     [[nodiscard]] Result<void> attach(int fd) noexcept {
         if (shutting_down()) return fail(Errc::cancelled);
         if (fd < 0) {
@@ -161,6 +160,14 @@ public:
         if ((flags & O_NONBLOCK) == 0 && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
             return fail(last_os_error());
         }
+#if defined(SO_NOSIGPIPE)
+        // Configure this socket without changing the host's SIGPIPE disposition.
+        const int enabled = 1;
+        if (::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) < 0 &&
+            errno != ENOTSOCK) {
+            return fail(last_os_error());
+        }
+#endif
         return Result<void>{};
     }
 
@@ -251,7 +258,7 @@ public:
                     detail::TimerTarget{.operation = id, .is_deadline = true});
             }
             slot = id;
-            combined = waiters.interest();
+            combined = interest(waiters);
         }
 
         // The syscall runs outside the lock; a failure must undo the record.
@@ -402,20 +409,13 @@ public:
         {
             const std::lock_guard lock{mutex_};
 
-            /// Take whoever waits on one direction, if anyone does.
-            ///
-            /// Clearing the slot here — under the lock, before anything is
-            /// resumed — is what lets `interest()` below describe the
-            /// *remaining* waiters, and what stops a second event in the same
-            /// batch from resolving the same operation twice.
-            const auto claim = [&](detail::OperationId& slot) {
-                if (slot == detail::kNoOperation) {
-                    return;
-                }
-                const detail::OperationId id = std::exchange(slot, detail::kNoOperation);
-                if (auto operation = operations_.find(id); operation != operations_.end()) {
-                    operation->second.armed = false;  // the one-shot has fired
-                }
+            // Readiness consumes the kernel registration, not the fd index.
+            // An earlier callback can detach/reuse a descriptor in this batch;
+            // its not-yet-resumed operations must remain cancellable.
+            const auto claim = [&](detail::OperationId id) {
+                auto operation = operations_.find(id);
+                if (operation == operations_.end() || !operation->second.armed) return;
+                operation->second.armed = false;
                 resolved.emplace_back(id, Result<void>{});
             };
 
@@ -449,13 +449,16 @@ public:
                     claim(it->second.write);
                 }
 
-                if (it->second.empty()) {
-                    fd_waiters_.erase(it);
-                } else {
-                    // One-shot registration is consumed; whatever still waits
-                    // on this descriptor has to be re-armed.
-                    to_rearm.emplace_back(event.fd, it->second.interest());
+                const auto remaining = interest(it->second);
+                if (remaining != detail::Interest::none) {
+                    to_rearm.emplace_back(event.fd, remaining);
                 }
+            }
+
+            // kqueue may deliver separate read/write events in one batch.
+            // Recompute after every claim to avoid rearming a consumed direction.
+            for (auto& [fd, remaining] : to_rearm) {
+                remaining = interest(fd_waiters_.at(fd));
             }
 
             timers_.extract_expired(detail::Clock::now(), expired);
@@ -494,10 +497,20 @@ public:
         }
 
         for (const auto& [fd, interest] : to_rearm) {
+            if (interest == detail::Interest::none) continue;
             if (Result<void> rearmed = poller_.arm(fd, interest); !rearmed) {
-                // Surface it rather than leaving a coroutine suspended forever
-                // with nothing armed on its behalf.
-                fail_waiters(fd, rearmed.error());
+                // Queue failures by operation ID, just like readiness. Never
+                // resume user code while the fd-based rearm snapshot is still
+                // being traversed: a callback could close/reuse a later fd.
+                const std::lock_guard lock{mutex_};
+                if (auto waiters = fd_waiters_.find(fd); waiters != fd_waiters_.end()) {
+                    for (const auto id : {waiters->second.read, waiters->second.write}) {
+                        if (auto operation = operations_.find(id); operation != operations_.end()) {
+                            operation->second.armed = false;
+                            resolved.emplace_back(id, fail(rearmed.error()));
+                        }
+                    }
+                }
             }
         }
 
@@ -575,7 +588,7 @@ private:
                     slot = detail::kNoOperation;
                 }
                 out.fd = operation.fd;
-                out.remaining = waiters->second.interest();
+                out.remaining = interest(waiters->second);
                 out.registered = operation.armed;
                 if (waiters->second.empty()) {
                     fd_waiters_.erase(waiters);
@@ -823,7 +836,15 @@ Task<Result<std::size_t>> EventLoop::write(NativeHandle handle,
         co_return std::size_t{0};
     }
     for (;;) {
+#if defined(MSG_NOSIGNAL)
+        ssize_t count = ::send(handle, source.data(), source.size(), MSG_NOSIGNAL);
+        // Preserve normal file/pipe semantics through the original syscall.
+        if (count < 0 && errno == ENOTSOCK) {
+            count = ::write(handle, source.data(), source.size());
+        }
+#else
         const ssize_t count = ::write(handle, source.data(), source.size());
+#endif
         if (count >= 0) {
             co_return static_cast<std::size_t>(count);
         }
@@ -867,7 +888,17 @@ Task<Result<std::size_t>> EventLoop::writev(NativeHandle handle,
         co_return std::size_t{0};
     }
     for (;;) {
+#if defined(MSG_NOSIGNAL)
+        msghdr message{};
+        message.msg_iov = scatter.data();
+        message.msg_iovlen = static_cast<decltype(message.msg_iovlen)>(count);
+        ssize_t written = ::sendmsg(handle, &message, MSG_NOSIGNAL);
+        if (written < 0 && errno == ENOTSOCK) {
+            written = ::writev(handle, scatter.data(), static_cast<int>(count));
+        }
+#else
         const ssize_t written = ::writev(handle, scatter.data(), static_cast<int>(count));
+#endif
         if (written >= 0) {
             co_return static_cast<std::size_t>(written);
         }

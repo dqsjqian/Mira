@@ -142,6 +142,15 @@ writev_all(S& stream, std::span<const std::span<const std::byte>> pieces) {
     std::vector<std::span<const std::byte>> tail;
     tail.reserve(pieces.size() - piece);
     while (piece < pieces.size()) {
+        // Empty fragments, including a trailing run after a short write,
+        // carry no work. Never submit an empty tail and mistake zero for EOF.
+        while (piece < pieces.size() && offset == pieces[piece].size()) {
+            ++piece;
+            offset = 0;
+        }
+        if (piece == pieces.size()) {
+            break;
+        }
         tail.clear();
         // The tail always starts with the current piece — `subspan(offset)`
         // is the whole piece when nothing of it has been written yet.
@@ -194,6 +203,15 @@ Task<Result<void>> writev_all(S& stream,
     std::vector<std::span<const std::byte>> tail;
     tail.reserve(pieces.size() - piece);
     while (piece < pieces.size()) {
+        // Empty fragments, including a trailing run after a short write,
+        // carry no work. Never submit an empty tail and mistake zero for EOF.
+        while (piece < pieces.size() && offset == pieces[piece].size()) {
+            ++piece;
+            offset = 0;
+        }
+        if (piece == pieces.size()) {
+            break;
+        }
         tail.clear();
         tail.push_back(pieces[piece].subspan(offset));
         tail.insert(tail.end(), pieces.begin() + static_cast<std::ptrdiff_t>(piece) + 1,

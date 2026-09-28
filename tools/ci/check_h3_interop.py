@@ -1,20 +1,8 @@
 #!/usr/bin/env python3
-"""Interop-test the h3 example: real curl speaking HTTP/3 over QUIC.
-
-The point is external evidence: curl's own QUIC and HTTP/3 stacks —
-ngtcp2 and nghttp3, independent implementations of RFC 9000 and RFC 9114 —
-connect to Mira's QUIC/h3 layers, complete the TLS 1.3 handshake with
-ALPN "h3", exchange a request, and the response must survive curl's
-strictness about framing, QPACK and stream states.
-
-Requires curl built with HTTP/3 support. The check degrades to a skip
-with a clear message where that is unavailable, because the raw-QUIC
-coverage lives in modules/quic/tests and modules/http3/tests.
-"""
-
+"""Request two paths using HTTP/3 curl; missing capability returns CTest skip code 77."""
 from __future__ import annotations
 
-import os
+import argparse
 import queue
 import re
 import shutil
@@ -22,78 +10,64 @@ import subprocess
 import sys
 import tempfile
 import threading
+from pathlib import Path
 
-TIMEOUT = 30
-
-
-def wait_listening(process: subprocess.Popen, lines: "queue.Queue[str]"):
-    line = lines.get(timeout=TIMEOUT)
-    match = re.search(r"listening on 127\.0\.0\.1:(\d+)", line)
-    if not match:
-        raise AssertionError(f"unexpected startup line: {line!r}")
-    port = int(match.group(1))
-    line = lines.get(timeout=TIMEOUT)
-    match = re.search(r"certificate: (.+)$", line)
-    if not match:
-        raise AssertionError(f"unexpected certificate line: {line!r}")
-    return port, match.group(1)
-
-
-def curl_supports_http3(curl: str) -> bool:
-    completed = subprocess.run([curl, "--version"], capture_output=True,
-                               text=True, timeout=TIMEOUT)
-    return "HTTP3" in completed.stdout
-
-
-def check_single_request(curl: str, port: int, cert: str) -> None:
-    """One GET over one QUIC connection; the body names its stream id."""
-    completed = subprocess.run(
-        [curl, "--http3-only", "-fsS", f"https://localhost:{port}/",
-         "--cacert", cert,
-         "-w", "\n%{http_version} %{http_code}"],
-        capture_output=True, text=True, timeout=TIMEOUT,
-    )
-    assert completed.returncode == 0, f"curl failed: {completed.stderr!r}"
-    body, _, stats = completed.stdout.rpartition("\n")
-    assert "served by Mira's HTTP/3 server, stream " in body, f"body: {body!r}"
-    assert stats.startswith("3 "), f"curl saw a non-h3 exchange: {stats!r}"
+TIMEOUT = 35
 
 
 def main() -> int:
-    executable = sys.argv[1]
-    curl = shutil.which("curl")
-    if not curl or not curl_supports_http3(curl):
-        print("h3 interop: SKIPPED (no HTTP/3-capable curl on PATH)")
-        return 0
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("server")
+    parser.add_argument("--strict", action="store_true", help="fail if HTTP/3-capable curl is unavailable")
+    parser.add_argument("--curl", default="curl")
+    parser.add_argument("--openssl", default="openssl")
+    args = parser.parse_args()
+    curl = shutil.which(args.curl)
+    version = subprocess.run([curl, "--version"], capture_output=True, text=True,
+                             timeout=TIMEOUT) if curl else None
+    if not version or version.returncode or "HTTP3" not in version.stdout:
+        status = "FAILED" if args.strict else "SKIPPED"
+        print(f"h3 interop: {status} (no HTTP/3-capable curl)")
+        return 1 if args.strict else 77
 
     with tempfile.TemporaryDirectory(prefix="mira-h3-") as runtime:
-        # The certificate the server prints must be the one it generated,
-        # so point RUNTIME_DIRECTORY at a directory both sides can read.
-        environment = dict(os.environ, RUNTIME_DIRECTORY=runtime)
-        process = subprocess.Popen(
-            [executable, "0"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, env=environment,
-        )
-        lines: "queue.Queue[str]" = queue.Queue(maxsize=4)
+        cert, key = str(Path(runtime) / "cert.pem"), str(Path(runtime) / "key.pem")
+        subprocess.run([args.openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-keyout", key, "-out", cert, "-days", "2", "-subj", "/CN=localhost",
+                        "-addext", "subjectAltName=DNS:localhost"],
+                       capture_output=True, check=True, timeout=TIMEOUT)
+        process = subprocess.Popen([args.server, "0", cert, key], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        lines: queue.Queue[str] = queue.Queue()
         assert process.stdout is not None
-        reader = threading.Thread(
-            target=lambda: [lines.put(process.stdout.readline(512)) for _ in range(4)],
-            daemon=True,
-        )
+        reader = threading.Thread(target=lambda: lines.put(process.stdout.readline()), daemon=True)
         reader.start()
-
         try:
-            port, cert = wait_listening(process, lines)
-            check_single_request(curl, port, cert)
+            startup = lines.get(timeout=TIMEOUT)
+            match = re.search(r"listening on 127\.0\.0\.1:(\d+)", startup)
+            assert match, f"unexpected startup: {startup!r}"
+            port = match.group(1)
+            completed = subprocess.run(
+                [curl, "--http3-only", "-fsS", "--noproxy", "*", "--ipv4",
+                 "--cacert", cert, "--max-time", "20", "-w", "\n%{http_version} %{http_code}\n",
+                 f"https://localhost:{port}/first", f"https://localhost:{port}/second"],
+                capture_output=True, text=True, timeout=TIMEOUT)
+            assert completed.returncode == 0, completed.stderr
+            responses = re.findall(r"stream (\d+), path (/\w+)", completed.stdout)
+            assert len(responses) == 2 and len({s for s, _ in responses}) == 2, completed.stdout
+            assert {p for _, p in responses} == {"/first", "/second"}, completed.stdout
+            assert completed.stdout.count("\n3 200\n") == 2, completed.stdout
+            _, stderr = process.communicate(timeout=TIMEOUT)
+            assert process.returncode == 0, stderr
         finally:
-            process.terminate()
-            try:
-                process.wait(timeout=TIMEOUT)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=TIMEOUT)
-
-    print("h3 interop: ok (real curl, QUIC + h3)")
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+    print("h3 interop: ok (real curl, two requests over QUIC + h3)")
     return 0
 
 

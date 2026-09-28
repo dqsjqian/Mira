@@ -125,6 +125,30 @@ void test_endpoint() {
     const Result<Endpoint> restored = Endpoint::from_bytes(v4->address_bytes());
     CHECK(restored.has_value());
     CHECK(restored->to_string() == "127.0.0.1:8080");
+    CHECK(*restored == *v4);
+    CHECK(Endpoint{} == Endpoint{});
+    CHECK(Endpoint{} != Endpoint::any(0));
+    CHECK(*v4 != Endpoint::loopback(8081));
+    CHECK(*v4 != *Endpoint::parse("127.0.0.2", 8080));
+    CHECK(*v4 != Endpoint::loopback(8080, Family::ipv6));
+    CHECK(*Endpoint::parse("fe80::1%42", 443) !=
+          *Endpoint::parse("fe80::1%43", 443));
+
+    // OS-returned socket addresses carry platform metadata (e.g. BSD
+    // sin_len) not present in factory objects. Identity is semantic.
+    auto loop_result = EventLoop::create();
+    CHECK(loop_result.has_value());
+    for (const Family family : {Family::ipv4, Family::ipv6}) {
+        auto listener = tcp::Listener::bind(*loop_result, Endpoint::loopback(0, family));
+        CHECK(listener.has_value());
+        if (listener) {
+            const auto actual = listener->local_endpoint();
+            const auto parsed = Endpoint::parse(actual.address(), actual.port());
+            CHECK(parsed.has_value());
+            CHECK(actual == Endpoint::loopback(actual.port(), family));
+            CHECK(parsed && actual == *parsed);
+        }
+    }
 }
 
 // ── bind semantics: the reason this project exists ───────────────────────────

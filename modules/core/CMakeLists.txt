@@ -53,7 +53,7 @@ set(MIRA_GENERATED_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 configure_file(
     ${PROJECT_SOURCE_DIR}/cmake/version.hpp.in
-    ${MIRA_GENERATED_INCLUDE}/Mira/core/version.hpp
+    ${MIRA_GENERATED_INCLUDE}/mira/core/version.hpp
     @ONLY
 )
 

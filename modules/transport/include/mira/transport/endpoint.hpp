@@ -69,15 +69,10 @@ public:
     /// Build an endpoint from bytes the OS produced (`getsockname`, `accept`).
     [[nodiscard]] static Result<Endpoint> from_bytes(std::span<const std::byte> address);
 
-    /// Same address family, port, and encoded address bytes.
-    [[nodiscard]] friend bool operator==(const Endpoint& left,
-                                         const Endpoint& right) noexcept {
-        return left.family_ == right.family_ && left.length_ == right.length_ &&
-               (left.length_ == 0 ||
-                std::equal(left.storage_.begin(),
-                           left.storage_.begin() + static_cast<std::ptrdiff_t>(left.length_),
-                           right.storage_.begin()));
-    }
+    /// Same family, address, port and IPv6 scope. OS padding, BSD length
+    /// fields and IPv6 flow labels do not participate in endpoint identity.
+    /// An unset endpoint compares equal only to another unset endpoint.
+    friend bool operator==(const Endpoint& left, const Endpoint& right) noexcept;
 
     /// An unset endpoint: family ipv4, zero address, zero port.
     ///

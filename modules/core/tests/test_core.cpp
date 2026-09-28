@@ -284,6 +284,68 @@ void test_stream_seam() {
     CHECK(drained.value() == "hello Mira");
 }
 
+class VectorMemoryStream {
+public:
+    explicit VectorMemoryStream(std::size_t limit) : limit_(limit) {}
+    Task<Result<std::size_t>> write_some(std::span<const std::byte> source) {
+        const std::size_t n = std::min(source.size(), limit_);
+        output.append(reinterpret_cast<const char*>(source.data()), n);
+        co_return n;
+    }
+    Task<Result<std::size_t>> writev_some(
+        std::span<const std::span<const std::byte>> pieces,
+        OperationOptions = {}) {
+        ++calls;
+        std::size_t total = 0;
+        for (const auto piece : pieces) {
+            const std::size_t n = std::min(piece.size(), limit_ - total);
+            if (n != 0) {
+                output.append(reinterpret_cast<const char*>(piece.data()), n);
+            }
+            total += n;
+            if (total == limit_) break;
+        }
+        co_return total;
+    }
+    std::string output;
+    int calls{0};
+private:
+    std::size_t limit_;
+};
+
+void test_vector_writes() {
+    test::section("scattered writes with empty fragments");
+    const std::vector<std::vector<std::span<const std::byte>>> cases{
+        {}, {{}, {}, {}}, {bytes_of("abc"), {}},
+        {{}, bytes_of("abc"), {}, bytes_of("def"), {}, {}},
+        {bytes_of("abc"), {}, bytes_of("def")},
+    };
+    for (const auto& pieces : cases) {
+        std::string expected;
+        for (const auto piece : pieces) {
+            if (!piece.empty()) expected += to_string(piece);
+        }
+        for (const std::size_t limit : {1U, 3U, 100U}) {
+            VectorMemoryStream plain{limit};
+            VectorMemoryStream bounded{limit};
+            CHECK(writev_all(plain, pieces).sync_get().has_value());
+            CHECK(writev_all(bounded, pieces, {}).sync_get().has_value());
+            CHECK(plain.output == expected);
+            CHECK(bounded.output == expected);
+            if (expected.empty()) {
+                CHECK(plain.calls == 0);
+                CHECK(bounded.calls == 0);
+            }
+        }
+    }
+    VectorMemoryStream stalled{0};
+    const std::span<const std::byte> nonempty[]{bytes_of("x")};
+    auto result = writev_all(stalled, nonempty).sync_get();
+    CHECK(!result && result.error() == Errc::eof);
+    result = writev_all(stalled, nonempty, {}).sync_get();
+    CHECK(!result && result.error() == Errc::eof);
+}
+
 // ── executor seam ────────────────────────────────────────────────────────────
 
 /// Executor that defers work until the host pumps it.
@@ -381,6 +443,7 @@ int main(int argc, char** argv) {
     test_task();
     test_buffer();
     test_stream_seam();
+    test_vector_writes();
     test_executor_seam();
     return test::summary();
 }

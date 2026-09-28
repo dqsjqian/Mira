@@ -56,7 +56,7 @@ LAYERS: dict[str, tuple[str, ...]] = {
     "transport": ("transport",),
     "tls": ("tls",),
     "quic": ("quic",),
-    "protocol": ("http", "http2", "http3", "ws", "h2", "h3", "dns"),
+    "protocol": ("http_common", "http", "http2", "http3", "ws", "h2", "h3", "dns"),
 }
 
 # Layer -> include path prefixes it is not allowed to reach for.

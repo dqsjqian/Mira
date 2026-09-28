@@ -186,9 +186,9 @@ No 408 is sent: announcing it would require a second budget the caller never gra
 | macOS | kqueue | Desktop test runs, incl. TLS / HTTPS |
 | Linux | epoll | Desktop CI, dedicated TLS matrix |
 | Windows | IOCP | Desktop loopback CI, dedicated TLS matrix |
-| iOS / Android | kqueue / epoll | Cross-compilation coverage for all non-TLS modules; Android requires **NDK 29+** |
+| iOS / Android | kqueue / epoll | Cross-compile core / transport / HTTP1; Android requires **NDK 29+** |
 
-Most recent all-platform CI pass: **16/16 jobs** (three desktop runs + MinGW + sanitizers + fuzz smoke + protocols + mobile cross-compile), covering all protocol code. Design rationale: [the architecture document](docs/ARCHITECTURE.md).
+CI covers desktop base/TLS, MinGW, sanitizers, parser fuzzing and Linux/macOS H2/H3 runs. **Windows H2/H3 and mobile protocol runtime coverage are not yet verified**; mobile jobs cross-compile base non-TLS modules, not every protocol on real devices. The Linux protocol job builds a pinned HTTP/3 curl for mandatory independent interoperability; missing tooling cannot count as a pass. See the CI link above for the current run.
 
 ## ✨ Capability overview
 
@@ -233,6 +233,32 @@ cmake --build build/tls -j && ctest --test-dir build/tls --output-on-failure
 
 Optional higher protocols: `MIRA_ENABLE_HTTP2=ON` / `MIRA_ENABLE_HTTP3=ON` (off by default, never auto-downloads; dependency versions are SHA256-pinned via `tools/ci/build_protocol_deps.py`).
 
+### Minimal client / server pairs
+
+Start each server in terminal A, then its client in terminal B. All examples use loopback, deadlines, nonzero failure exits and response verification.
+
+| Protocol | Terminal A: server | Terminal B: client |
+|---|---|---|
+| TCP echo | `build/debug/mira_echo_server 8080` | `build/debug/mira_tcp_client 8080 hello` |
+| UDP echo | `build/debug/mira_udp_server 8081` | `build/debug/mira_udp_client 8081 hello` |
+| HTTP/1.1 | `build/debug/mira_hello_world_server 8082` | `build/debug/mira_http1_client 8082` |
+| HTTP/2 prior knowledge | `build/protocols/mira_h2_prior_knowledge_server 8083` | `build/protocols/mira_h2_client 8083` |
+| HTTP/3 | `build/protocols/mira_h3_server 8443 cert.pem key.pem` | `build/protocols/mira_h3_client 8443 cert.pem` |
+
+Pass `""` to the UDP client for a zero-byte datagram. H1 makes two keep-alive requests; H2/H3 submit two distinct streams. H2 uses cleartext prior knowledge, not TLS/ALPN. H3 serves multiple requests on one connection: it is not a multi-client CID-routing listener. Callers own production certificates and private keys.
+
+Build H2/H3 after installing OpenSSL 3.5+ and setting `OPENSSL_ROOT_DIR`:
+
+```bash
+python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
+cmake -S . -B build/protocols -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix" -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"
+cmake --build build/protocols -j
+ctest --test-dir build/protocols --output-on-failure
+"$OPENSSL_ROOT_DIR/bin/openssl" req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 2 -subj /CN=localhost -addext subjectAltName=DNS:localhost
+```
+
+The final command creates a local demonstration certificate only. The client verifies that CA and `localhost`; verification is never disabled. H3 can be enabled independently of H2/nghttp2. All pairs have out-of-process smoke tests; independent curl interoperability is tracked separately from Mira-to-Mira testing.
+
 ### 📦 Using it in your project
 
 The recommended pattern — the one Aria and AriaAgent use — is a **hash-pinned release archive**: every version ships a source tarball on GitHub Releases; download it, verify its SHA256, then `add_subdirectory` it. No submodules, no vendored trees, no configure-time network beyond the pinned fetch:
@@ -258,9 +284,11 @@ Android requires **NDK 29 or newer**: NDK 27/28's libc++ gates `std::stop_token`
 
 ## 🗺 What's next
 
-1. **End-to-end resource contracts**: slow-consumer backpressure, connection- and process-level memory caps
-2. **Deepen run coverage on every platform**: more real-machine run verification of cancellation semantics
-3. **Evidence-backed expansion**: cross-platform negative tests, interop; in-process benchmarks (`bench/`, 5 scenarios), parser fuzzing (`fuzz/`, request and response harnesses) and runnable examples (`examples/`: echo, hello world, a streaming file server, an HTTP/2 prior-knowledge server, an HTTP/3 server — each with an out-of-process smoke test; the file server and h2 server include real curl interop — the latter exercised by genuine nghttp2 over concurrent streams — and the h3 server is verified by curl's native QUIC, ngtcp2 + nghttp3) now ship with the library, with more scenarios to come
+1. **Complete production composition**: multi-client QUIC/H3 CID listener, admission/process budgets, streaming outbound H2/H3 bodies, connection pools, reconnection and graceful shutdown composition.
+2. **Evidence before rankings**: reproducible real-network throughput, p50/p99 latency, peak memory and slow-consumer overload; Windows H2/H3 and mobile runtime coverage. In-process microbenchmarks do not establish a performance ranking.
+3. **Selective protocol growth**: WebSocket (RFC 6455) is the next independent protocol, with H2/H3 extended CONNECT evaluated afterward. SSE belongs first in streaming HTTP examples; Unix-domain sockets in transport. Add MQTT, SOCKS5 or DNS/DoH for concrete requirements; keep gRPC/Redis/WebRTC outside the general-purpose core.
+
+QUIC migration/NAT rebinding, 0-RTT, Retry policies and HTTP/3 extended CONNECT remain unsupported. Protocol count is not a substitute for correctness and end-to-end verification.
 
 See the [architecture document](docs/ARCHITECTURE.md) for design rationale and acceptance criteria.
 

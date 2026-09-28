@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(Mira
-    VERSION 0.4.0
+    VERSION 0.5.0
     DESCRIPTION "Coroutine-native C++23 networking library — transport, protocols, and nothing else"
     LANGUAGES CXX
 )
@@ -90,7 +90,7 @@ function(mira_install_module target)
     foreach(entry
             "mira_tls=miraTlsTargets"
             "mira_http2=miraHttp2Targets"
-            "mira_quic=miraHttp3Targets"
+            "mira_quic=miraQuicTargets"
             "mira_http3=miraHttp3Targets")
         string(REPLACE "=" ";" pair "${entry}")
         list(GET pair 0 mapped_target)
@@ -125,6 +125,7 @@ endif()
 
 # Each module registers its own tests and install rules.
 add_subdirectory(modules/core)
+add_subdirectory(modules/http_common)
 add_subdirectory(modules/transport)
 add_subdirectory(modules/http)
 
@@ -163,18 +164,39 @@ if(MIRA_BUILD_EXAMPLES)
     add_executable(mira_tiny_file_server examples/tiny_file_server.cpp)
     target_link_libraries(mira_tiny_file_server PRIVATE Mira::http Mira::transport Mira::warnings)
 
+    foreach(example IN ITEMS tcp_client udp_server udp_client)
+        add_executable(mira_${example} examples/${example}.cpp)
+        target_link_libraries(mira_${example} PRIVATE Mira::transport Mira::warnings)
+    endforeach()
+    add_executable(mira_http1_client examples/http1_client.cpp)
+    target_link_libraries(mira_http1_client PRIVATE Mira::http Mira::transport Mira::warnings)
+
     if(MIRA_ENABLE_HTTP2)
         add_executable(mira_h2_prior_knowledge_server examples/h2_prior_knowledge_server.cpp)
         target_link_libraries(mira_h2_prior_knowledge_server PRIVATE Mira::http2 Mira::transport Mira::warnings)
+        add_executable(mira_h2_client examples/h2_client.cpp)
+        target_link_libraries(mira_h2_client PRIVATE Mira::http2 Mira::transport Mira::warnings)
     endif()
     if(MIRA_ENABLE_HTTP3)
         add_executable(mira_h3_server examples/h3_server.cpp)
         target_link_libraries(mira_h3_server PRIVATE Mira::http3 Mira::transport Mira::warnings)
+        add_executable(mira_h3_client examples/h3_client.cpp)
+        target_link_libraries(mira_h3_client PRIVATE Mira::http3 Mira::transport Mira::warnings)
     endif()
 
     if(MIRA_BUILD_TESTS)
         find_package(Python3 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
+            add_test(NAME mira_client_server_examples
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_client_server_examples.py
+                    --tcp-server $<TARGET_FILE:mira_echo_server>
+                    --tcp-client $<TARGET_FILE:mira_tcp_client>
+                    --udp-server $<TARGET_FILE:mira_udp_server>
+                    --udp-client $<TARGET_FILE:mira_udp_client>
+                    --http-server $<TARGET_FILE:mira_hello_world_server>
+                    --http-client $<TARGET_FILE:mira_http1_client>)
+            set_tests_properties(mira_client_server_examples PROPERTIES TIMEOUT 90)
             add_test(NAME mira_echo_example
                 COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_echo_example.py
@@ -194,6 +216,12 @@ if(MIRA_BUILD_EXAMPLES)
             )
             set_tests_properties(mira_tiny_file_server_example PROPERTIES TIMEOUT 120)
             if(TARGET mira_h2_prior_knowledge_server)
+                add_test(NAME mira_h2_pair
+                    COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_h2_pair.py
+                        --server $<TARGET_FILE:mira_h2_prior_knowledge_server>
+                        --client $<TARGET_FILE:mira_h2_client>)
+                set_tests_properties(mira_h2_pair PROPERTIES TIMEOUT 60)
                 add_test(NAME mira_h2_interop
                     COMMAND ${Python3_EXECUTABLE}
                         ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_h2_interop.py
@@ -202,12 +230,19 @@ if(MIRA_BUILD_EXAMPLES)
                 set_tests_properties(mira_h2_interop PROPERTIES TIMEOUT 90)
             endif()
             if(TARGET mira_h3_server)
+                add_test(NAME mira_h3_pair
+                    COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_h3_pair.py
+                        $<TARGET_FILE:mira_h3_server> $<TARGET_FILE:mira_h3_client>
+                        ${MIRA_QUIC_TEST_CERT} ${MIRA_QUIC_TEST_KEY})
+                set_tests_properties(mira_h3_pair PROPERTIES TIMEOUT 120)
                 add_test(NAME mira_h3_interop
                     COMMAND ${Python3_EXECUTABLE}
                         ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_h3_interop.py
                         $<TARGET_FILE:mira_h3_server>
+                        --openssl ${MIRA_QUIC_OPENSSL_TOOL}
                 )
-                set_tests_properties(mira_h3_interop PROPERTIES TIMEOUT 120)
+                set_tests_properties(mira_h3_interop PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
             endif()
         endif()
     endif()
@@ -228,10 +263,10 @@ if(MIRA_INSTALL)
         DESTINATION ${MIRA_CMAKE_DESTINATION}
     )
 
-    foreach(optional_module IN ITEMS Tls Http2 Http3)
+    foreach(optional_module IN ITEMS Tls Http2 Quic Http3)
         if((optional_module STREQUAL "Tls" AND MIRA_ENABLE_TLS)
            OR (optional_module STREQUAL "Http2" AND MIRA_ENABLE_HTTP2)
-           OR (optional_module STREQUAL "Http3" AND MIRA_ENABLE_HTTP3))
+           OR ((optional_module STREQUAL "Quic" OR optional_module STREQUAL "Http3") AND MIRA_ENABLE_HTTP3))
             install(EXPORT mira${optional_module}Targets
                 FILE mira${optional_module}Targets.cmake
                 NAMESPACE Mira::
@@ -241,7 +276,7 @@ if(MIRA_INSTALL)
     endforeach()
 
     if(MIRA_ENABLE_HTTP3)
-        install(FILES cmake/mira-http3-dependencies.cmake
+        install(FILES cmake/mira-quic-dependencies.cmake cmake/mira-http3-dependencies.cmake
             DESTINATION ${MIRA_CMAKE_DESTINATION})
     endif()
 

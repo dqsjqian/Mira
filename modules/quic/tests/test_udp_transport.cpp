@@ -190,6 +190,135 @@ Task<void> silent_peer_budget(EventLoop& loop, const char* certificate) {
     loop.post([] {});
 }
 
+struct DelayedDatagram {
+    struct State {
+        EventLoop* loop = nullptr;
+        Clock::duration delay{};
+        std::size_t sends = 0;
+        std::size_t receives = 0;
+    };
+    static inline std::shared_ptr<State> next;
+    std::shared_ptr<State> state;
+
+    static Result<DelayedDatagram> bind(EventLoop& loop, const Endpoint&) {
+        next->loop = &loop;
+        return DelayedDatagram{next};
+    }
+
+    Task<Result<std::size_t>> send_to(std::span<const std::byte> bytes,
+                                      const Endpoint&, OperationOptions io) {
+        if (++state->sends == 1) require(co_await state->loop->sleep_for(state->delay, io));
+        co_return bytes.size();
+    }
+
+    Task<Result<transport::udp::Datagram>> receive_from(std::span<std::byte>,
+                                                       OperationOptions) {
+        ++state->receives;
+        co_return fail(Errc::cancelled);
+    }
+};
+
+Task<void> expired_engine_timer(EventLoop& loop, const char* certificate) {
+    quic::Options options;
+    options.local = Endpoint::loopback(41000);
+    options.remote = Endpoint::loopback(41001);
+    options.ca_file = certificate;
+    options.peer_name = "localhost";
+
+    DelayedDatagram::next = std::make_shared<DelayedDatagram::State>();
+    auto retransmit = DelayedDatagram::next;
+    retransmit->delay = 1200ms;
+    auto connected = co_await Connection<DelayedDatagram>::connect(loop, options);
+    check(!connected && connected.error() == Errc::cancelled,
+          "PTO regression must terminate at the fake receive");
+    check(retransmit->sends >= 2 && retransmit->receives == 1,
+          "expired PTO must retransmit before waiting for input");
+
+    DelayedDatagram::next = std::make_shared<DelayedDatagram::State>();
+    auto terminal = DelayedDatagram::next;
+    terminal->delay = 3200ms;
+    options.idle_timeout_ns = 1'000'000;
+    connected = co_await Connection<DelayedDatagram>::connect(loop, options);
+    check(!connected && connected.error().category() == quic::quic_error(0).category(),
+          "expired idle timer must propagate the terminal engine error");
+    check(terminal->receives == 0, "terminal expiry must not enter a datagram wait");
+    DelayedDatagram::next.reset();
+}
+
+Task<void> accept_only(transport::udp::Socket socket, quic::Options options,
+                       std::unique_ptr<UdpConnection>& connection) {
+    std::array<std::byte, 65536> initial{};
+    auto datagram = require(co_await socket.receive_from(initial, {.deadline = Clock::now() + 5s}));
+    options.local = require(socket.local_endpoint());
+    options.remote = datagram.peer;
+    auto accepted = require(co_await UdpConnection::serve(
+        std::move(socket), std::move(options),
+        std::span<const std::byte>{initial.data(), datagram.size},
+        {.deadline = Clock::now() + 5s}));
+    connection = std::make_unique<UdpConnection>(std::move(accepted));
+}
+
+Task<void> connect_only(EventLoop& loop, quic::Options options,
+                        std::unique_ptr<UdpConnection>& connection) {
+    auto connected = require(co_await UdpConnection::connect(
+        loop, std::move(options), {.deadline = Clock::now() + 5s}));
+    connection = std::make_unique<UdpConnection>(std::move(connected));
+}
+
+Task<void> drain_input(UdpConnection& connection) {
+    const auto deadline = Clock::now() + 30ms;
+    for (;;) {
+        auto round = co_await connection.pump({.deadline = deadline});
+        if (!round) {
+            check(round.error() == Errc::timed_out, "datagram drain failed");
+            co_return;
+        }
+    }
+}
+
+Task<void> fixed_peer(EventLoop& loop, const char* certificate, const char* key,
+                      bool target_server) {
+    auto server_socket = require(transport::udp::Socket::bind(loop, Endpoint::loopback(0)));
+    const auto server_address = require(server_socket.local_endpoint());
+    auto stranger = require(transport::udp::Socket::bind(loop, Endpoint::loopback(0)));
+    quic::Options client_options;
+    client_options.local = Endpoint::loopback(0);
+    client_options.remote = server_address;
+    client_options.ca_file = certificate;
+    client_options.peer_name = "localhost";
+    quic::Options server_options;
+    server_options.certificate_file = certificate;
+    server_options.private_key_file = key;
+    std::unique_ptr<UdpConnection> client;
+    std::unique_ptr<UdpConnection> server;
+    TaskScope scope;
+    scope.spawn(accept_only(std::move(server_socket), server_options, server));
+    scope.spawn(connect_only(loop, client_options, client));
+    co_await scope.join();
+    TaskScope drain;
+    drain.spawn(drain_input(*client));
+    drain.spawn(drain_input(*server));
+    co_await drain.join();
+
+    auto& target = target_server ? *server : *client;
+    auto& peer = target_server ? *client : *server;
+    const auto target_address = require(target.transport()->local_endpoint());
+    const std::array junk{std::byte{0xff}, std::byte{0x01}, std::byte{0x02}};
+    require(co_await stranger.send_to(junk, target_address, {.deadline = Clock::now() + 1s}));
+    co_await drain_input(target);
+    check(!target.closed(), "stranger datagram must not poison the QUIC engine");
+    require(co_await target.close(0, {.deadline = Clock::now() + 1s}));
+    const auto close_deadline = Clock::now() + 1s;
+    while (!peer.closed()) {
+        auto round = co_await peer.pump({.deadline = close_deadline});
+        if (!round) check(peer.closed(), "the original peer must receive CONNECTION_CLOSE");
+    }
+    std::array<std::byte, 2048> packet{};
+    auto leaked = co_await stranger.receive_from(packet, {.deadline = Clock::now() + 30ms});
+    check(!leaked && leaked.error() == Errc::timed_out,
+          "stranger must not receive QUIC output after a forged source datagram");
+}
+
 }  // namespace
 
 // Checkpoint: see test/timeout-expectations.md (review report C1 regression)
@@ -200,6 +329,9 @@ int main(int argc, char** argv) {
     try {
         static_cast<void>(loop->run_until_complete(run(*loop, argv[1], argv[2])));
         static_cast<void>(loop->run_until_complete(silent_peer_budget(*loop, argv[1])));
+        static_cast<void>(loop->run_until_complete(expired_engine_timer(*loop, argv[1])));
+        static_cast<void>(loop->run_until_complete(fixed_peer(*loop, argv[1], argv[2], true)));
+        static_cast<void>(loop->run_until_complete(fixed_peer(*loop, argv[1], argv[2], false)));
 
         // Outside any coroutine it is legal to drive the loop again; if the
         // failed pump had spun, we would never get here (run_until_complete
@@ -209,7 +341,7 @@ int main(int argc, char** argv) {
         check(loop->run_once(100ms).has_value(), "loop is still runnable");
         check(posted_ran, "posted work was starved");
 
-        std::cout << "QUIC over UDP loopback: handshake, 200KB bidirectional streams, flow control, close, and budget timeout passed\n";
+        std::cout << "QUIC over UDP loopback: handshake, 200KB streams, flow control, close, caller budget, expired timers, and fixed peers passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
