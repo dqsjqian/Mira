@@ -56,7 +56,15 @@ class RetryObserver:
             while not self.stop.is_set():
                 readable, _, _ = select.select([self.front, self.back], [], [], 0.1)
                 for sock in readable:
-                    packet, peer = sock.recvfrom(65536)
+                    try:
+                        packet, peer = sock.recvfrom(65536)
+                    except ConnectionResetError:
+                        # Winsock reports a late datagram to an exited curl as
+                        # WSAECONNRESET on the next front-side receive. This is
+                        # not a relay failure; backend resets still fail below.
+                        if sock is self.front:
+                            continue
+                        raise
                     if sock is self.front:
                         self.client = peer
                         if self.has_token(packet):

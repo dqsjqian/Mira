@@ -388,6 +388,8 @@ int main(int argc, char** argv) {
         auto group = LoopGroup::create({});
         std::atomic<LoopGroup*> owner{group->release()};
         auto submitted = owner.load()->try_spawn([&owner](EventLoop&, std::stop_token) -> Task<void> {
+            // MSVC keeps terminate handlers per thread; install it on the worker too.
+            std::set_terminate([] { std::_Exit(77); });
             delete owner.exchange(nullptr);
             co_return;
         });

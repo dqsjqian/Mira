@@ -3,6 +3,7 @@
 
 import socket
 import unittest
+from unittest import mock
 
 from check_h3_interop import RetryObserver
 
@@ -34,6 +35,45 @@ class RetryObserverTests(unittest.TestCase):
         wire[0] = 0xc0
         wire[4] = 2
         self.assertFalse(RetryObserver.has_token(wire))
+
+    def test_front_reset_does_not_stop_retry_observation(self):
+        relay = RetryObserver.__new__(RetryObserver)
+        relay.front, relay.back = mock.Mock(), mock.Mock()
+        relay.stop = mock.Mock()
+        relay.stop.is_set.side_effect = [False, False, False, True]
+        relay.client, relay.error = None, None
+        relay.retries, relay.token_initials = 0, 0
+        peer = ("127.0.0.1", 12345)
+        initial = self.PREFIX + b"\x02ab"
+        retry = bytes.fromhex("f00000000101bb01aa") + b"\x00" * 16
+        relay.front.recvfrom.side_effect = [ConnectionResetError(10054, "client exited"),
+                                            (initial, peer)]
+        relay.back.recvfrom.return_value = (retry, ("127.0.0.1", 4433))
+        with mock.patch("check_h3_interop.select.select", side_effect=[
+                ([relay.front], [], []), ([relay.front], [], []), ([relay.back], [], [])]):
+            relay.run()
+        relay.back.send.assert_called_once_with(initial)
+        relay.front.sendto.assert_called_once_with(retry, peer)
+        self.assertEqual(relay.token_initials, 1)
+        self.assertEqual(relay.retries, 1)
+        self.assertIsNone(relay.error)
+
+    def test_backend_reset_and_other_front_errors_still_fail(self):
+        for side, error in (("back", ConnectionResetError(10054, "server reset")),
+                            ("front", OSError("receive failure"))):
+            with self.subTest(side=side):
+                relay = RetryObserver.__new__(RetryObserver)
+                relay.front, relay.back = mock.Mock(), mock.Mock()
+                relay.stop = mock.Mock()
+                relay.stop.is_set.return_value = False
+                relay.error = None
+                sock = getattr(relay, side)
+                sock.recvfrom.side_effect = error
+                with mock.patch("check_h3_interop.select.select", return_value=([sock], [], [])):
+                    relay.run()
+                self.assertEqual(relay.error, str(error))
+                relay.front.sendto.assert_not_called()
+                relay.back.send.assert_not_called()
 
     def test_real_udp_relay_and_shutdown(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server, \
