@@ -151,6 +151,13 @@ class MainTests(TemporaryFiles):
         self.assertEqual(summary["selected"], ["1.1.1", "1.1.2"])
         self.assertTrue(printed["strict_passed"])
 
+    def test_failed_verdict_makes_the_run_fail(self):
+        code, summary, printed = self.run_fixture(verdict="FAILED")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["failed_count"], 4)
+        self.assertFalse(printed["strict_passed"])
+
     def test_partial_scope_and_non_strict_counts_are_visible(self):
         code, summary, printed = self.run_fixture(cases=["1.1.1"], verdict="NON-STRICT")
         self.assertEqual(code, 0)

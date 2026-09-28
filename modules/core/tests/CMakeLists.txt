@@ -49,3 +49,8 @@ endif()
 # An event-loop bug tends to hang rather than fail. A timeout turns that into
 # a red test instead of a stuck CI job.
 set_tests_properties(event_loop PROPERTIES TIMEOUT 60)
+
+add_executable(mira_timer_allocation_tests test_timer_allocation.cpp)
+target_link_libraries(mira_timer_allocation_tests PRIVATE Mira::core Mira::warnings)
+add_test(NAME timer_allocation COMMAND mira_timer_allocation_tests)
+set_tests_properties(timer_allocation PROPERTIES TIMEOUT 30)

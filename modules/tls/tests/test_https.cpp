@@ -1,5 +1,6 @@
 #include "check.hpp"
 #include "mira/http/connection.hpp"
+#include "mira/core/task_scope.hpp"
 #include "mira/tls/context.hpp"
 #include "mira/tls/error.hpp"
 #include "mira/tls/stream.hpp"
@@ -14,7 +15,9 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/ssl.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/x509v3.h>
@@ -213,6 +216,8 @@ struct FragmentedSocket {
 };
 
 static_assert(AsyncStream<tls::Stream<tcp::Socket>>);
+static_assert(ClosableStream<tls::Stream<tcp::Socket>>);
+static_assert(ClosableStream<tls::Stream<FragmentedSocket>>);
 static_assert(AsyncStream<tls::Stream<FragmentedSocket>>);
 
 enum class Scenario { https, truncated, verify_failure, alpn_failure };
@@ -258,7 +263,7 @@ Task<void> check_established_state(Stream& stream) {
     CHECK(written && *written == 0);
 }
 
-DetachedTask run_server(tcp::Listener& listener,
+DetachedTask run_server(EventLoop& loop, tcp::Listener& listener,
                         const tls::Context& context,
                         Exchange& exchange,
                         Scenario scenario,
@@ -271,7 +276,7 @@ DetachedTask run_server(tcp::Listener& listener,
     }
     exchange.server_socket = std::move(*accepted);
     FragmentedSocket transport{exchange.server_socket, fragment};
-    auto created = tls::Stream<FragmentedSocket>::create(transport, context);
+    auto created = tls::Stream<FragmentedSocket>::create(loop, transport, context);
     if (!created) {
         exchange.server_error = created.error();
         co_return;
@@ -342,7 +347,7 @@ DetachedTask run_client(EventLoop& loop,
     }
     exchange.client_socket = std::move(*connected);
     FragmentedSocket transport{exchange.client_socket, fragment};
-    auto created = tls::Stream<FragmentedSocket>::create(transport, context, peer_name);
+    auto created = tls::Stream<FragmentedSocket>::create(loop, transport, context, peer_name);
     if (!created) {
         exchange.client_error = created.error();
         co_return;
@@ -442,7 +447,7 @@ void run_exchange(const Certificates& certificates,
             exchange.server_socket.close();
         }
     } cleanup{exchange};
-    run_server(*listener, *server_context, exchange, scenario, fragment);
+    run_server(loop, *listener, *server_context, exchange, scenario, fragment);
     run_client(loop,
                listener->local_endpoint(),
                *client_context,
@@ -516,12 +521,8 @@ struct ControlledTransport {
     }
 };
 
-/// Records what every underlying operation was handed, and refuses the handshake
-/// once the test has seen enough.
-///
-/// `tls::Stream` drives its underlying stream an unbounded number of times per
-/// TLS operation, so "the deadline reached the underlying stream" is not one
-/// assertion but a claim about every one of those turns.
+/// Records every wire deadline. TLS owns independent loop timers and must never
+/// forward operation deadlines to ciphertext transfers or cancel them to rearm.
 struct RecordingTransport {
     std::vector<std::optional<Clock::time_point>> seen;
     std::size_t allowed_writes = 0;
@@ -542,8 +543,17 @@ struct RecordingTransport {
     }
 };
 
+Task<void> bounded_recording_handshake(tls::Stream<RecordingTransport>& stream,
+                                       Clock::time_point deadline) {
+    const auto handshake = co_await stream.handshake({.deadline = deadline});
+    CHECK(!handshake);
+}
+
 void test_options_reach_the_underlying_stream(const Certificates& certificates) {
-    test::section("TLS hands the same absolute deadline to every underlying read and write");
+    test::section("TLS owns deadline timers and leaves every wire operation deadline-free");
+    auto loop = EventLoop::create();
+    CHECK(loop.has_value());
+    if (!loop) return;
 
     Result<tls::Context> context = tls::Context::client(certificates.ca);
     CHECK(context.has_value());
@@ -554,32 +564,23 @@ void test_options_reach_the_underlying_stream(const Certificates& certificates) 
     RecordingTransport transport;
     transport.allowed_writes = 2;  // let the ClientHello out, then stop
     Result<tls::Stream<RecordingTransport>> stream =
-        tls::Stream<RecordingTransport>::create(transport, *context, "localhost");
+        tls::Stream<RecordingTransport>::create(*loop, transport, *context, "localhost");
     CHECK(stream.has_value());
     if (!stream) {
         return;
     }
 
-    // One absolute deadline for the whole handshake. No layer subtracts
-    // elapsed time — that is the property that made absolute the right choice,
-    // and it is only observable from down here.
     const auto deadline = Clock::now() + std::chrono::seconds{30};
-    const Result<void> handshake = stream->handshake({.deadline = deadline}).sync_get();
-    CHECK(!handshake);  // the transport refused before the handshake could finish
-
+    CHECK(loop->run_until_complete(bounded_recording_handshake(*stream, deadline)).has_value());
+    CHECK(loop->outstanding() == 0);
     CHECK(!transport.seen.empty());
-    bool every_turn_carried_it = !transport.seen.empty();
-    for (const std::optional<Clock::time_point>& observed : transport.seen) {
-        every_turn_carried_it =
-            every_turn_carried_it && observed.has_value() && *observed == deadline;
-    }
-    CHECK(every_turn_carried_it);
+    for (const auto& observed : transport.seen) CHECK(!observed.has_value());
 
     // And with no options, nothing is invented on the way down.
     RecordingTransport plain;
     plain.allowed_writes = 2;
     Result<tls::Stream<RecordingTransport>> bare =
-        tls::Stream<RecordingTransport>::create(plain, *context, "localhost");
+        tls::Stream<RecordingTransport>::create(*loop, plain, *context, "localhost");
     CHECK(bare.has_value());
     if (!bare) {
         return;
@@ -603,22 +604,25 @@ DetachedTask start_handshake(tls::Stream<ControlledTransport>& stream, Error& er
 
 void test_concurrent_operations(const Certificates& certificates) {
     test::section("TLS overlapping operations and zero-progress ciphertext writes");
+    auto loop = EventLoop::create();
+    CHECK(loop.has_value());
+    if (!loop) return;
     auto context = tls::Context::client(certificates.ca);
     CHECK(context.has_value());
     if (!context) {
         return;
     }
     ControlledTransport transport;
-    auto created = tls::Stream<ControlledTransport>::create(transport, *context, "localhost");
+    auto created = tls::Stream<ControlledTransport>::create(*loop, transport, *context, "localhost");
     CHECK(created.has_value());
     if (!created) {
         return;
     }
     auto moved = std::move(*created);
-    auto missing_name = tls::Stream<ControlledTransport>::create(transport, *context);
+    auto missing_name = tls::Stream<ControlledTransport>::create(*loop, transport, *context);
     CHECK(!missing_name && missing_name.error() == Errc::invalid_argument);
     const std::string embedded_nul{"localhost\0wrong.example", 23};
-    auto invalid_name = tls::Stream<ControlledTransport>::create(transport, *context, embedded_nul);
+    auto invalid_name = tls::Stream<ControlledTransport>::create(*loop, transport, *context, embedded_nul);
     CHECK(!invalid_name && invalid_name.error() == Errc::invalid_argument);
     const auto moved_from = created->handshake().sync_get();
     CHECK(!moved_from && moved_from.error() == tls::Errc::invalid_state);
@@ -647,7 +651,7 @@ void test_concurrent_operations(const Certificates& certificates) {
 
     ControlledTransport no_progress;
     no_progress.zero_write = true;
-    auto stream = tls::Stream<ControlledTransport>::create(no_progress, *context, "localhost");
+    auto stream = tls::Stream<ControlledTransport>::create(*loop, no_progress, *context, "localhost");
     CHECK(stream.has_value());
     if (stream) {
         const auto result = stream->handshake().sync_get();
@@ -685,7 +689,7 @@ DetachedTask run_alpn_peer(EventLoop& loop,
     }
     auto& socket = exchange.sockets[peer];
     socket = std::move(*connected);
-    auto stream = tls::Stream<tcp::Socket>::create(socket, *context, peer == 0 ? "" : "localhost");
+    auto stream = tls::Stream<tcp::Socket>::create(loop, socket, *context, peer == 0 ? "" : "localhost");
     if (!stream) {
         exchange.errors[peer] = stream.error();
         co_return;
@@ -899,7 +903,7 @@ DetachedTask run_mtls_peer(EventLoop& loop,
     }
     auto& socket = exchange.sockets[peer];
     socket = std::move(*connected);
-    auto stream = tls::Stream<tcp::Socket>::create(socket, *context, peer == 0 ? "" : "localhost");
+    auto stream = tls::Stream<tcp::Socket>::create(loop, socket, *context, peer == 0 ? "" : "localhost");
     if (!stream) {
         exchange.errors[peer] = stream.error();
         co_return;
@@ -1040,6 +1044,718 @@ void test_mtls(const Certificates& certificates) {
     CHECK(!missing_cert && missing_cert.error() == Errc::invalid_argument);
 }
 
+using DuplexStream = tls::Stream<FragmentedSocket>;
+
+Task<void> duplex_receive(DuplexStream& stream, const std::string& expected,
+                          std::string& received, OperationOptions options) {
+    std::array<std::byte, 2903> buffer{};
+    while (received.size() != expected.size()) {
+        const auto result = co_await stream.read_some(buffer, options);
+        CHECK(result.has_value());
+        if (!result) co_return;
+        received.append(reinterpret_cast<const char*>(buffer.data()), *result);
+        CHECK(received.size() <= expected.size());
+        if (received.size() > expected.size()) co_return;
+    }
+    CHECK(received == expected);
+}
+
+Task<void> duplex_send(DuplexStream& stream, const std::string& payload,
+                       OperationOptions options) {
+    const auto result = co_await write_all(stream, bytes_of(payload), options);
+    CHECK(result.has_value());
+}
+
+Task<void> duplex_peer(EventLoop& loop, tcp::Listener& listener, const tls::Context& context,
+                       std::size_t peer, std::array<DuplexStream*, 2>& streams,
+                       std::array<bool, 2>& reading, const std::array<std::string, 2>& payloads) {
+    const OperationOptions options{.deadline = Clock::now() + 8s};
+    Result<tcp::Socket> socket;
+    if (peer == 0) socket = co_await listener.accept(options);
+    else socket = co_await tcp::connect(loop, listener.local_endpoint(), {}, options);
+    CHECK(socket.has_value());
+    if (!socket) co_return;
+    FragmentedSocket transport{*socket, 113};
+    auto stream = DuplexStream::create(loop, transport, context, peer == 0 ? "" : "localhost");
+    CHECK(stream.has_value());
+    if (!stream) co_return;
+    const auto handshake = co_await stream->handshake(options);
+    CHECK(handshake.has_value());
+    if (!handshake) co_return;
+    streams[peer] = &*stream;
+    while (!streams[1 - peer]) co_await loop.yield();
+    std::string received;
+    TaskScope scope;
+    scope.spawn(duplex_receive(*stream, payloads[1 - peer], received, options));
+    CHECK(scope.pending() == 1);
+    std::array<std::byte, 1> duplicate{};
+    const auto overlap = co_await stream->read_some(duplicate, options);
+    CHECK(!overlap && overlap.error() == tls::Errc::operation_in_progress);
+    const auto repeated_handshake = co_await stream->handshake(options);
+    CHECK(!repeated_handshake && repeated_handshake.error() == tls::Errc::operation_in_progress);
+    const auto early_shutdown = co_await stream->shutdown(options);
+    CHECK(!early_shutdown && early_shutdown.error() == tls::Errc::operation_in_progress);
+    reading[peer] = true;
+    while (!reading[1 - peer]) co_await loop.yield();
+    scope.spawn(duplex_send(*stream, payloads[peer], options));
+    co_await scope.join();
+    const auto closed = co_await stream->shutdown(options);
+    CHECK(closed.has_value());
+    CHECK(transport.writes > payloads[peer].size() / transport.limit);
+}
+
+Task<void> duplex_exchange(EventLoop& loop, tcp::Listener& listener,
+                           const tls::Context& server, const tls::Context& client) {
+    std::array<DuplexStream*, 2> streams{};
+    std::array<bool, 2> reading{};
+    std::array<std::string, 2> payloads{std::string(320 * 1024 + 17, 'a'),
+                                     std::string(384 * 1024 + 31, 'b')};
+    for (std::size_t i = 0; i < payloads[0].size(); ++i)
+        payloads[0][i] = static_cast<char>('a' + i % 23);
+    TaskScope scope;
+    scope.spawn(duplex_peer(loop, listener, server, 0, streams, reading, payloads));
+    scope.spawn(duplex_peer(loop, listener, client, 1, streams, reading, payloads));
+    co_await scope.join();
+}
+
+void test_duplex(const Certificates& certificates) {
+    test::section("TLS duplex: both socket peers park reads before large fragmented writes");
+    auto server = tls::Context::server(certificates.server, certificates.key);
+    auto client = tls::Context::client(certificates.ca);
+    auto loop = EventLoop::create();
+    CHECK(server && client && loop);
+    if (!server || !client || !loop) return;
+    auto listener = tcp::Listener::bind(*loop, Endpoint::loopback(0));
+    CHECK(listener.has_value());
+    if (!listener) return;
+    CHECK(loop->run_until_complete(duplex_exchange(*loop, *listener, *server, *client)).has_value());
+}
+
+enum class Fault {
+    reader_timeout, writer_timeout, reader_cancel, writer_cancel, zero_write, exception, corrupt_record, close
+};
+
+struct StalledSocket {
+    tcp::Socket& socket;
+    EventLoop& loop;
+    bool stall = false;
+    bool zero = false;
+    bool throws = false;
+    std::size_t pending_read = 0;
+    std::size_t pending_write = 0;
+
+    Task<Result<std::size_t>> read_some(std::span<std::byte> bytes, OperationOptions options = {}) {
+        ++pending_read;
+        const auto result = co_await socket.read_some(bytes, options);
+        --pending_read;
+        co_return result;
+    }
+    Task<Result<std::size_t>> write_some(std::span<const std::byte> bytes, OperationOptions options = {}) {
+        if (throws) throw std::runtime_error("injected transport exception");
+        if (zero) co_return std::size_t{0};
+        if (stall) {
+            ++pending_write;
+            const auto pause = co_await loop.sleep_for(30s, options);
+            --pending_write;
+            if (!pause) co_return fail(pause.error());
+        }
+        co_return co_await socket.write_some(bytes, options);
+    }
+};
+
+using FaultStream = tls::Stream<StalledSocket>;
+
+Task<void> fault_operation(FaultStream& stream, bool reading, OperationOptions options,
+                           Error& error, bool& threw) {
+    std::array<std::byte, 4096> buffer{};
+    try {
+        Result<std::size_t> result;
+        if (reading) result = co_await stream.read_some(buffer, options);
+        else result = co_await stream.write_some(buffer, options);
+        CHECK(!result);
+        if (!result) error = result.error();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+}
+
+Task<void> fault_peer(EventLoop& loop, tcp::Listener& listener, const tls::Context& context,
+                      std::size_t peer, Fault fault, bool& exercised, bool& attack) {
+    const OperationOptions bounded{.deadline = Clock::now() + 4s};
+    Result<tcp::Socket> socket;
+    if (peer == 0) socket = co_await listener.accept(bounded);
+    else socket = co_await tcp::connect(loop, listener.local_endpoint(), {}, bounded);
+    CHECK(socket.has_value());
+    if (!socket) co_return;
+    StalledSocket transport{*socket, loop};
+    auto stream = FaultStream::create(loop, transport, context, peer == 0 ? "" : "localhost");
+    CHECK(stream.has_value());
+    if (!stream) co_return;
+    const auto handshake = co_await stream->handshake(bounded);
+    CHECK(handshake.has_value());
+    if (!handshake) co_return;
+    if (peer == 0) {
+        if (fault == Fault::corrupt_record) {
+            while (!attack) co_await loop.yield();
+            const std::array<std::byte, 7> corrupt{
+                std::byte{0x15}, std::byte{3}, std::byte{3}, std::byte{0}, std::byte{2},
+                std::byte{2}, std::byte{0x50}};
+            const auto sent = co_await write_all(*socket, corrupt, bounded);
+            CHECK(sent.has_value());
+        }
+        while (!exercised) co_await loop.yield();
+        co_return;
+    }
+    const bool reading = fault == Fault::reader_cancel || fault == Fault::reader_timeout ||
+                         fault == Fault::corrupt_record;
+    std::stop_source stop;
+    OperationOptions limited;
+    if (fault == Fault::reader_timeout || fault == Fault::writer_timeout)
+        limited.deadline = Clock::now() + 20ms;
+    if (fault == Fault::reader_cancel || fault == Fault::writer_cancel)
+        limited.stop = stop.get_token();
+    transport.stall = true;
+    std::array<Error, 2> errors{};
+    std::array<bool, 2> threw{};
+    TaskScope scope;
+    scope.spawn(fault_operation(*stream, true, reading ? limited : OperationOptions{}, errors[0], threw[0]));
+    transport.zero = fault == Fault::zero_write;
+    transport.throws = fault == Fault::exception;
+    scope.spawn(fault_operation(*stream, false, reading ? OperationOptions{} : limited, errors[1], threw[1]));
+    if (fault != Fault::zero_write && fault != Fault::exception) {
+        for (int turn = 0; turn < 16 && (transport.pending_read == 0 || transport.pending_write == 0); ++turn)
+            co_await loop.yield();
+        std::array<std::byte, 1> duplicate{};
+        const auto overlap = co_await stream->write_some(duplicate);
+        CHECK(!overlap && overlap.error() == tls::Errc::operation_in_progress);
+        CHECK(transport.pending_read == 1);
+        CHECK(transport.pending_write == 1);
+    }
+    attack = true;
+    if (fault == Fault::reader_cancel || fault == Fault::writer_cancel) {
+        std::jthread cancelling([source = stop] () mutable { source.request_stop(); });
+    }
+    if (fault == Fault::close) stream->close();
+    co_await scope.join();
+    CHECK(transport.pending_read == 0 && transport.pending_write == 0);
+    if (fault == Fault::close) {
+        CHECK(errors[0] == tls::Errc::invalid_state && errors[1] == tls::Errc::invalid_state);
+    } else if (fault == Fault::exception) {
+        CHECK(threw[1] && !threw[0]);
+        CHECK(errors[0] == tls::Errc::invalid_state);
+    } else {
+        const auto expected = fault == Fault::reader_timeout || fault == Fault::writer_timeout
+            ? Mira::make_error_code(Errc::timed_out)
+            : fault == Fault::zero_write || fault == Fault::corrupt_record
+                ? tls::make_error_code(tls::Errc::protocol_error)
+                : Mira::make_error_code(Errc::cancelled);
+        CHECK(errors[reading ? 0U : 1U] == expected);
+        CHECK(errors[reading ? 1U : 0U] == tls::Errc::invalid_state);
+    }
+    std::array<std::byte, 1> byte{};
+    const auto invalid = co_await stream->write_some(byte);
+    CHECK(!invalid && invalid.error() == tls::Errc::invalid_state);
+    exercised = true;
+}
+
+Task<void> fault_exchange(EventLoop& loop, tcp::Listener& listener, const tls::Context& server,
+                          const tls::Context& client, Fault fault) {
+    bool exercised = false;
+    bool attack = false;
+    TaskScope scope;
+    scope.spawn(fault_peer(loop, listener, server, 0, fault, exercised, attack));
+    scope.spawn(fault_peer(loop, listener, client, 1, fault, exercised, attack));
+    co_await scope.join();
+}
+
+void test_faults(const Certificates& certificates) {
+    test::section("TLS independent deadlines and cross-thread cancellation wake both directions");
+    for (const auto fault : {Fault::reader_timeout, Fault::writer_timeout, Fault::reader_cancel,
+                             Fault::writer_cancel, Fault::zero_write, Fault::exception,
+                             Fault::corrupt_record, Fault::close}) {
+        auto server = tls::Context::server(certificates.server, certificates.key);
+        auto client = tls::Context::client(certificates.ca);
+        auto loop = EventLoop::create();
+        CHECK(server && client && loop);
+        if (!server || !client || !loop) return;
+        auto listener = tcp::Listener::bind(*loop, Endpoint::loopback(0));
+        CHECK(listener.has_value());
+        if (!listener) return;
+        CHECK(loop->run_until_complete(fault_exchange(*loop, *listener, *server, *client, fault)).has_value());
+        CHECK(loop->outstanding() == 0);
+    }
+}
+
+struct Gate {
+    EventLoop& loop;
+    std::stop_source wake;
+    bool waiting = false;
+    bool released = false;
+
+    explicit Gate(EventLoop& executor) : loop(executor) {}
+
+    struct Forward {
+        std::stop_source wake;
+        void operator()() const noexcept {
+            auto retained = wake;
+            retained.request_stop();
+        }
+    };
+
+    Task<Result<void>> wait(OperationOptions options) {
+        if (options.stop.stop_requested()) co_return fail(Errc::cancelled);
+        if (released) co_return Result<void>{};
+        waiting = true;
+        {
+            std::stop_callback forward(options.stop, Forward{wake});
+            const auto result = co_await loop.sleep_for(5s, {.stop = wake.get_token()});
+            static_cast<void>(result);
+        }
+        waiting = false;
+        if (options.stop.stop_requested()) co_return fail(Errc::cancelled);
+        if (!released) co_return fail(Errc::timed_out);
+        co_return Result<void>{};
+    }
+
+    void release() {
+        released = true;
+        auto retained = wake;
+        retained.request_stop();
+    }
+
+    void reset() {
+        CHECK(!waiting);
+        wake = std::stop_source{};
+        released = false;
+    }
+};
+
+// A synchronous TLS peer with controllable completion gates. A gated read has
+// already removed ciphertext from the transport before cancellation can erase
+// its completion, reproducing IOCP's consumed-bytes/cancelled-result ordering.
+struct EngineTransport {
+    tls::Engine peer;
+    Gate available;
+    Gate read_completion;
+    Gate write_completion;
+    std::vector<std::byte> incoming;
+    Error peer_error;
+    bool peer_ready = false;
+    bool hold_read = false;
+    bool hold_write = false;
+    std::stop_source* stop_after_read = nullptr;
+    unsigned cancelled_reads = 0;
+    unsigned cancelled_writes = 0;
+    unsigned reads = 0;
+    unsigned writes = 0;
+
+    EngineTransport(EventLoop& loop, tls::Engine engine)
+        : peer(std::move(engine)), available{loop}, read_completion{loop}, write_completion{loop} {}
+
+    void drain_peer() {
+        std::array<std::byte, tls::Engine::buffer_capacity> bytes{};
+        const auto drained = peer.drain(bytes);
+        CHECK(drained.has_value());
+        if (!drained || *drained == 0) return;
+        incoming.insert(incoming.end(), bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(*drained));
+        available.release();
+    }
+
+    void handshake_peer() {
+        if (peer_ready || peer_error) return;
+        const auto result = peer.handshake();
+        if (!result) peer_error = result.error();
+        else peer_ready = result->status == tls::Engine::Status::complete;
+        drain_peer();
+    }
+
+    void send(std::string_view text) {
+        const auto result = peer.write(bytes_of(text));
+        CHECK(result && result->status == tls::Engine::Status::complete);
+        drain_peer();
+    }
+
+    Task<Result<std::size_t>> read_some(std::span<std::byte> bytes, OperationOptions options = {}) {
+        CHECK(!options.deadline);
+        ++reads;
+        while (incoming.empty()) {
+            available.reset();
+            const auto waiting = co_await available.wait(options);
+            if (!waiting) {
+                if (waiting.error() == Errc::cancelled) ++cancelled_reads;
+                co_return fail(waiting.error());
+            }
+        }
+        const auto size = std::min(bytes.size(), incoming.size());
+        std::copy_n(incoming.begin(), size, bytes.begin());
+        incoming.erase(incoming.begin(), incoming.begin() + static_cast<std::ptrdiff_t>(size));
+        if (auto* stopped = std::exchange(stop_after_read, nullptr)) stopped->request_stop();
+        if (std::exchange(hold_read, false)) {
+            const auto waiting = co_await read_completion.wait(options);
+            if (!waiting) {
+                if (waiting.error() == Errc::cancelled) ++cancelled_reads;
+                co_return fail(waiting.error());
+            }
+        }
+        co_return size;
+    }
+
+    Task<Result<std::size_t>> write_some(std::span<const std::byte> bytes, OperationOptions options = {}) {
+        CHECK(!options.deadline);
+        ++writes;
+        const auto fed = peer.feed(bytes);
+        CHECK(fed && *fed == bytes.size());
+        if (!fed) co_return fail(fed.error());
+        handshake_peer();
+        if (std::exchange(hold_write, false)) {
+            const auto waiting = co_await write_completion.wait(options);
+            if (!waiting) {
+                if (waiting.error() == Errc::cancelled) ++cancelled_writes;
+                co_return fail(waiting.error());
+            }
+        }
+        co_return bytes.size();
+    }
+};
+
+using GatedStream = tls::Stream<EngineTransport>;
+
+Task<void> gated_read(GatedStream& stream, bool& done, Error& error, OperationOptions options = {}) {
+    std::array<std::byte, 8> bytes{};
+    const auto result = co_await stream.read_some(bytes, options);
+    if (!result) error = result.error();
+    else CHECK(std::string_view(reinterpret_cast<const char*>(bytes.data()), *result) == "reply");
+    done = true;
+}
+
+Task<void> gated_write(GatedStream& stream, bool& done, Error& error, OperationOptions options = {}) {
+    const auto result = co_await stream.write_some(bytes_of("request"), options);
+    if (!result) error = result.error();
+    else CHECK(*result == 7);
+    done = true;
+}
+
+Task<void> gated_handshake(GatedStream& stream, bool& done, Error& error, OperationOptions options) {
+    const auto result = co_await stream.handshake(options);
+    if (!result) error = result.error();
+    done = true;
+}
+
+Task<void> test_late_deadline(EventLoop& loop, GatedStream& stream, EngineTransport& transport) {
+    const auto handshake = co_await stream.handshake();
+    CHECK(handshake.has_value());
+    if (!handshake) co_return;
+    transport.send("reply");
+    transport.hold_read = true;
+    bool read_done = false;
+    bool write_done = false;
+    Error read_error, write_error;
+    TaskScope scope;
+    scope.spawn(gated_read(stream, read_done, read_error));
+    CHECK(transport.read_completion.waiting);
+    CHECK(!read_done);
+    scope.spawn(gated_write(stream, write_done, write_error, {.deadline = Clock::now() + 2s}));
+    while (!write_done) co_await loop.yield();
+    CHECK(!write_error);
+    CHECK(!read_done);
+    CHECK(transport.cancelled_reads == 0);
+    transport.read_completion.release();
+    co_await scope.join();
+    CHECK(read_done && !read_error);
+    CHECK(transport.cancelled_reads == 0 && transport.cancelled_writes == 0);
+    const auto subsequent = co_await stream.write_some({});
+    CHECK(subsequent.has_value());
+}
+
+Task<void> test_independent_watermark(EventLoop& loop, GatedStream& stream, EngineTransport& transport) {
+    const auto handshake = co_await stream.handshake();
+    CHECK(handshake.has_value());
+    if (!handshake) co_return;
+    transport.send("reply");
+    transport.hold_write = true;
+    bool read_done = false;
+    bool write_done = false;
+    Error read_error, write_error;
+    TaskScope scope;
+    scope.spawn(gated_write(stream, write_done, write_error));
+    CHECK(transport.write_completion.waiting && !write_done);
+    scope.spawn(gated_read(stream, read_done, read_error, {.deadline = Clock::now() + 100ms}));
+    while (!read_done) co_await loop.yield();
+    CHECK(!read_error);
+    CHECK(!write_done);
+    CHECK(transport.cancelled_writes == 0);
+    transport.write_completion.release();
+    co_await scope.join();
+    CHECK(write_done && !write_error);
+}
+
+Task<void> test_registration_stop(EventLoop& loop, std::optional<GatedStream>& owner,
+                                  EngineTransport& transport) {
+    const auto handshake = co_await owner->handshake();
+    CHECK(handshake.has_value());
+    if (!handshake) co_return;
+    transport.send("reply");
+    std::stop_source stop;
+    transport.stop_after_read = &stop;
+    std::array<std::byte, 8> bytes{};
+    const auto result = co_await owner->read_some(bytes, {.stop = stop.get_token()});
+    CHECK(!result && result.error() == Errc::cancelled);
+    // Cancellation was posted during await_suspend's synchronous transport
+    // drive. Destroy the owner before the queued weak callback is dispatched.
+    owner.reset();
+    co_await loop.yield();
+    CHECK(loop.outstanding() == 0);
+}
+
+Task<void> test_rejected_options(GatedStream& stream, EngineTransport& transport) {
+    const auto handshake = co_await stream.handshake();
+    CHECK(handshake.has_value());
+    if (!handshake) co_return;
+    bool read_done = false;
+    Error read_error;
+    TaskScope scope;
+    scope.spawn(gated_read(stream, read_done, read_error));
+    CHECK(!read_done);
+    std::stop_source stopped;
+    stopped.request_stop();
+    const auto cancelled = co_await stream.write_some(bytes_of("ignored"), {.stop = stopped.get_token()});
+    CHECK(!cancelled && cancelled.error() == Errc::cancelled);
+    const auto expired = co_await stream.write_some(bytes_of("ignored"), {.deadline = Clock::now()});
+    CHECK(!expired && expired.error() == Errc::timed_out);
+    CHECK(!read_done && transport.cancelled_reads == 0);
+    transport.send("reply");
+    co_await scope.join();
+    CHECK(read_done && !read_error);
+    CHECK(transport.cancelled_reads == 0);
+}
+
+Task<void> test_pending_alert(EventLoop& loop, GatedStream& stream, EngineTransport& transport,
+                              bool cancel_alert) {
+    transport.hold_write = true;
+    bool done = false;
+    Error error;
+    std::stop_source stop;
+    TaskScope scope;
+    scope.spawn(gated_handshake(stream, done, error,
+                                {.stop = stop.get_token(), .deadline = Clock::now() + 2s}));
+    CHECK(!done && transport.write_completion.waiting);
+    CHECK(transport.reads > 0);
+    CHECK(transport.cancelled_writes == 0);
+    if (cancel_alert) stop.request_stop();
+    else transport.write_completion.release();
+    co_await scope.join();
+    CHECK(done && error == tls::Errc::certificate_verify_failed);
+    if (cancel_alert) {
+        CHECK(transport.cancelled_writes == 1);
+        CHECK(transport.writes == 1);
+    } else {
+        CHECK(transport.cancelled_writes == 0);
+        CHECK(transport.writes > 1);
+        CHECK(transport.peer_error == tls::Errc::protocol_error);
+    }
+    CHECK(loop.outstanding() == 0);
+}
+
+Task<void> destroy_after_read(std::optional<GatedStream>& owner, bool& done) {
+    std::array<std::byte, 8> bytes{};
+    const auto result = co_await owner->read_some(bytes, {.deadline = Clock::now() + 2s});
+    CHECK(result && *result == 5);
+    owner.reset();
+    done = true;
+}
+
+Task<void> test_owner_destruction(EventLoop& loop, std::optional<GatedStream>& owner,
+                                  EngineTransport& transport) {
+    const auto handshake = co_await owner->handshake();
+    CHECK(handshake.has_value());
+    if (!handshake) co_return;
+    bool done = false;
+    TaskScope scope;
+    scope.spawn(destroy_after_read(owner, done));
+    CHECK(!done);
+    transport.send("reply");
+    co_await scope.join();
+    CHECK(done && !owner);
+    CHECK(loop.outstanding() == 0);
+}
+
+void test_deterministic_scheduling(const Certificates& certificates) {
+    test::section("TLS deterministic completion ordering, cancellation, watermarks and fatal alerts");
+    for (unsigned scenario = 0; scenario < 7; ++scenario) {
+        auto loop = EventLoop::create();
+        auto server = tls::Context::server(certificates.server, certificates.key);
+        auto client = tls::Context::client(scenario == 3 || scenario == 4
+                                              ? certificates.other_ca : certificates.ca);
+        CHECK(loop && server && client);
+        if (!loop || !server || !client) return;
+        auto peer = tls::Engine::create(*server);
+        CHECK(peer.has_value());
+        if (!peer) return;
+        EngineTransport transport{*loop, std::move(*peer)};
+        auto created = GatedStream::create(*loop, transport, *client, "localhost");
+        CHECK(created.has_value());
+        if (!created) return;
+        std::optional<GatedStream> owner{std::move(*created)};
+        if (scenario == 0)
+            CHECK(loop->run_until_complete(test_late_deadline(*loop, *owner, transport)).has_value());
+        else if (scenario == 1)
+            CHECK(loop->run_until_complete(test_independent_watermark(*loop, *owner, transport)).has_value());
+        else if (scenario == 2)
+            CHECK(loop->run_until_complete(test_rejected_options(*owner, transport)).has_value());
+        else if (scenario == 3 || scenario == 4)
+            CHECK(loop->run_until_complete(test_pending_alert(*loop, *owner, transport, scenario == 4)).has_value());
+        else if (scenario == 5)
+            CHECK(loop->run_until_complete(test_owner_destruction(*loop, owner, transport)).has_value());
+        else
+            CHECK(loop->run_until_complete(test_registration_stop(*loop, owner, transport)).has_value());
+        CHECK(loop->outstanding() == 0);
+    }
+}
+
+struct KeyUpdateTransport {
+    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> context{nullptr, SSL_CTX_free};
+    std::unique_ptr<SSL, decltype(&SSL_free)> peer{nullptr, SSL_free};
+    BIO* input = nullptr;
+    BIO* output = nullptr;
+    Gate available;
+    Gate write_completion;
+    std::string received;
+    bool ready = false;
+    bool hold_write = false;
+    unsigned updates = 0;
+
+    explicit KeyUpdateTransport(EventLoop& loop, const Certificates& certificates)
+        : available{loop}, write_completion{loop} {
+        context.reset(SSL_CTX_new(TLS_server_method()));
+        require(context != nullptr);
+        require(SSL_CTX_use_certificate_chain_file(context.get(), certificates.server.c_str()) == 1);
+        require(SSL_CTX_use_PrivateKey_file(context.get(), certificates.key.c_str(), SSL_FILETYPE_PEM) == 1);
+        peer.reset(SSL_new(context.get()));
+        require(peer != nullptr);
+        input = BIO_new(BIO_s_mem());
+        output = BIO_new(BIO_s_mem());
+        require(input && output);
+        SSL_set_bio(peer.get(), input, output);
+        SSL_set_accept_state(peer.get());
+        SSL_set_msg_callback(peer.get(), &KeyUpdateTransport::message);
+        SSL_set_msg_callback_arg(peer.get(), this);
+    }
+
+    static void message(int writing, int, int content_type, const void* data,
+                         std::size_t size, SSL*, void* argument) {
+        if (writing == 0 && content_type == SSL3_RT_HANDSHAKE && size != 0 &&
+            *static_cast<const unsigned char*>(data) == SSL3_MT_KEY_UPDATE)
+            ++static_cast<KeyUpdateTransport*>(argument)->updates;
+    }
+
+    void notify() {
+        if (BIO_ctrl_pending(output) != 0) available.release();
+    }
+
+    void drive() {
+        ERR_clear_error();
+        if (!ready) {
+            const int result = SSL_do_handshake(peer.get());
+            const int error = result == 1 ? SSL_ERROR_NONE : SSL_get_error(peer.get(), result);
+            CHECK(error == SSL_ERROR_NONE || error == SSL_ERROR_WANT_READ);
+            ready = result == 1;
+        } else {
+            std::array<std::byte, 16384> bytes{};
+            for (;;) {
+                std::size_t count = 0;
+                ERR_clear_error();
+                const int result = SSL_read_ex(peer.get(), bytes.data(), bytes.size(), &count);
+                const int error = result == 1 ? SSL_ERROR_NONE : SSL_get_error(peer.get(), result);
+                if (result == 1) {
+                    received.append(reinterpret_cast<const char*>(bytes.data()), count);
+                } else {
+                    CHECK(error == SSL_ERROR_WANT_READ);
+                    break;
+                }
+            }
+        }
+        notify();
+    }
+
+    void update_and_send() {
+        require(SSL_version(peer.get()) == TLS1_3_VERSION);
+        ERR_clear_error();
+        require(SSL_key_update(peer.get(), SSL_KEY_UPDATE_REQUESTED) == 1);
+        std::size_t count = 0;
+        ERR_clear_error();
+        require(SSL_write_ex(peer.get(), "reply", 5, &count) == 1 && count == 5);
+        notify();
+    }
+
+    Task<Result<std::size_t>> read_some(std::span<std::byte> bytes, OperationOptions options = {}) {
+        while (BIO_ctrl_pending(output) == 0) {
+            available.reset();
+            const auto waiting = co_await available.wait(options);
+            if (!waiting) co_return fail(waiting.error());
+        }
+        const auto result = BIO_read(output, bytes.data(), static_cast<int>(bytes.size()));
+        CHECK(result > 0);
+        co_return static_cast<std::size_t>(result);
+    }
+
+    Task<Result<std::size_t>> write_some(std::span<const std::byte> bytes, OperationOptions options = {}) {
+        const auto result = BIO_write(input, bytes.data(), static_cast<int>(bytes.size()));
+        CHECK(result == static_cast<int>(bytes.size()));
+        drive();
+        if (std::exchange(hold_write, false)) {
+            const auto waiting = co_await write_completion.wait(options);
+            if (!waiting) co_return fail(waiting.error());
+        }
+        co_return bytes.size();
+    }
+};
+
+Task<void> key_update_writer(tls::Stream<KeyUpdateTransport>& stream, bool& done) {
+    const auto result = co_await stream.write_some(bytes_of("request"));
+    CHECK(result && *result == 7);
+    done = true;
+}
+
+Task<void> key_update_exchange(EventLoop& loop, tls::Stream<KeyUpdateTransport>& stream,
+                               KeyUpdateTransport& transport) {
+    const auto handshake = co_await stream.handshake({.deadline = Clock::now() + 2s});
+    CHECK(handshake.has_value());
+    if (!handshake) co_return;
+    transport.hold_write = true;
+    bool write_done = false;
+    TaskScope scope;
+    scope.spawn(key_update_writer(stream, write_done));
+    // This continuation can run inside TLS pump(); the nested request is
+    // registered immediately, but its wire submission follows after yielding.
+    co_await loop.yield();
+    CHECK(!write_done && transport.write_completion.waiting);
+    transport.update_and_send();
+    std::array<std::byte, 8> bytes{};
+    const auto read = co_await stream.read_some(bytes, {.deadline = Clock::now() + 2s});
+    CHECK(read && *read == 5);
+    CHECK(!write_done);
+    transport.write_completion.release();
+    co_await scope.join();
+    const auto reply = co_await stream.write_some(bytes_of("updated"), {.deadline = Clock::now() + 2s});
+    CHECK(reply && *reply == 7);
+    CHECK(transport.received == "requestupdated");
+    CHECK(transport.updates == 1);
+}
+
+void test_key_update(const Certificates& certificates) {
+    test::section("TLS 1.3 KeyUpdate while the opposite ciphertext write is pending");
+    auto loop = EventLoop::create();
+    auto client = tls::Context::client(certificates.ca);
+    CHECK(loop && client);
+    if (!loop || !client) return;
+    KeyUpdateTransport transport{*loop, certificates};
+    auto stream = tls::Stream<KeyUpdateTransport>::create(*loop, transport, *client, "localhost");
+    CHECK(stream.has_value());
+    if (!stream) return;
+    CHECK(loop->run_until_complete(key_update_exchange(*loop, *stream, transport)).has_value());
+    CHECK(loop->outstanding() == 0);
+}
+
 void test_configuration(const Certificates& certificates) {
     test::section("TLS configuration errors and error domains");
     const auto missing = (certificates.directory / "does-not-exist.pem").string();
@@ -1054,11 +1770,40 @@ void test_configuration(const Certificates& certificates) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2) {
+        std::set_terminate([] { std::_Exit(77); });
+        auto context = tls::Context::client();
+        auto loop = EventLoop::create();
+        if (!context || !loop) return 2;
+        ControlledTransport transport;
+        auto created = tls::Stream<ControlledTransport>::create(*loop, transport, *context, "localhost");
+        if (!created) return 2;
+        std::optional<tls::Stream<ControlledTransport>> stream{std::move(*created)};
+        Error error;
+        int done = 0;
+        start_handshake(*stream, error, done);
+        if (done != 0 || !transport.waiting) return 3;
+        const std::string_view mode(argv[1]);
+        if (mode == "--destroy-active") stream.reset();
+        else if (mode == "--move-active") {
+            auto moved = std::move(*stream);
+            static_cast<void>(moved);
+        } else if (mode == "--replace-active") {
+            auto replacement = tls::Stream<ControlledTransport>::create(*loop, transport, *context, "localhost");
+            if (!replacement) return 2;
+            *stream = std::move(*replacement);
+        }
+        return 4;
+    }
     try {
         Certificates certificates;
         certificates.create();
         test_configuration(certificates);
+        test_duplex(certificates);
+        test_deterministic_scheduling(certificates);
+        test_key_update(certificates);
+        test_faults(certificates);
         test_mtls(certificates);
         test_alpn(certificates);
         test_concurrent_operations(certificates);

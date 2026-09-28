@@ -194,18 +194,19 @@ Task<void> drain_peer(tcp::Socket& socket, OperationOptions options) {
     }
 }
 
-Task<void> server_task(tcp::Listener& listener, Results& results, OperationOptions options
+Task<void> server_task(EventLoop& loop, tcp::Listener& listener, Results& results, OperationOptions options
 #ifdef MIRA_HTTP2_TEST_TLS
     , const tls::Context* context
 #endif
 ) {
+    (void)loop;
     auto socket = co_await listener.accept(options);
     CHECK(socket.has_value());
     if (!socket) co_return;
     FragmentedSocket fragmented{*socket};
 #ifdef MIRA_HTTP2_TEST_TLS
     if (context) {
-        auto secured = tls::Stream<FragmentedSocket>::create(fragmented, *context);
+        auto secured = tls::Stream<FragmentedSocket>::create(loop, fragmented, *context);
         require(secured.has_value());
         auto result = co_await secured->handshake(options);
         CHECK(result.has_value());
@@ -232,13 +233,27 @@ Task<void> client_task(EventLoop& loop, Endpoint endpoint, Results& results, Ope
     FragmentedSocket fragmented{*socket};
 #ifdef MIRA_HTTP2_TEST_TLS
     if (context) {
-        auto secured = tls::Stream<FragmentedSocket>::create(fragmented, *context, "localhost");
+        auto secured = tls::Stream<FragmentedSocket>::create(loop, fragmented, *context, "localhost");
         require(secured.has_value());
         auto result = co_await secured->handshake(options);
         CHECK(result.has_value());
         if (!result) co_return;
         CHECK(secured->negotiated_protocol() == "h2");
         co_await query(*secured, results, options);
+        // Consume the server's TLS close_notify before closing TCP. GOAWAY
+        // ends HTTP/2 admission, not the TLS record stream; unread close bytes
+        // may otherwise turn a normal socket close into a reset.
+        std::array<std::byte, 4096> remaining{};
+        for (;;) {
+            auto read = co_await secured->read_some(remaining, options);
+            if (!read) {
+                CHECK(read.error() == Errc::eof);
+                break;
+            }
+        }
+        auto shutdown = co_await secured->shutdown(options);
+        CHECK(shutdown.has_value());
+        co_await drain_peer(*socket, options);
         co_return;
     }
 #endif
@@ -254,7 +269,7 @@ Task<void> scenario(EventLoop& loop
     Results results;
     OperationOptions options{.deadline = Clock::now() + 15s};
     TaskScope tasks;
-    tasks.spawn(server_task(*listener, results, options
+    tasks.spawn(server_task(loop, *listener, results, options
 #ifdef MIRA_HTTP2_TEST_TLS
         , server
 #endif

@@ -14,3 +14,12 @@ target_compile_definitions(mira_tls_https_tests PRIVATE
 )
 add_test(NAME tls_https COMMAND mira_tls_https_tests)
 set_tests_properties(tls_https PROPERTIES TIMEOUT 60)
+
+foreach(mode IN ITEMS destroy-active move-active replace-active)
+    add_test(NAME tls.contract.${mode}
+        COMMAND ${CMAKE_COMMAND}
+            -DPROGRAM=$<TARGET_FILE:mira_tls_https_tests>
+            -DMODE=--${mode}
+            -P ${PROJECT_SOURCE_DIR}/modules/core/tests/check_terminates.cmake)
+    set_tests_properties(tls.contract.${mode} PROPERTIES TIMEOUT 15)
+endforeach()

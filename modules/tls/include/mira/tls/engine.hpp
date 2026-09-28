@@ -41,6 +41,7 @@ public:
     [[nodiscard]] std::string_view negotiated_protocol() const noexcept;
 
     [[nodiscard]] std::size_t input_capacity() const noexcept;
+    [[nodiscard]] std::size_t output_pending() const noexcept;
     [[nodiscard]] Result<std::size_t> feed(std::span<const std::byte> ciphertext);
     /// After a failure the already-generated ciphertext (such as a fatal alert)
     /// can still be collected; the SSL I/O is never driven again.

@@ -161,7 +161,7 @@ auto client = Mira::tls::Context::client({
 });
 ```
 
-- `tls::Stream<T>::create(transport, ctx, "localhost")` → `co_await stream.handshake()` → 正常读写
+- `tls::Stream<T>::create(loop, transport, ctx, "localhost")` → `co_await stream.handshake()` → 正常读写
 - 无不安全的验证绕过开关；TLS 1.0/1.1 永远被拒绝
 - ALPN 协商后必须检查 `negotiated_protocol()` 再选择 H1/H2 —— 库不自动切换协议
 </details>
@@ -284,10 +284,10 @@ Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` �
 
 ## 已落地的生产组合能力
 
-- **单端口多客户端 QUIC/H3**：`quic::Dispatcher` 按实际 DCID 路由（含新 CID），`http3::make_server` 组合 H3；准入、payload 与队列预留有界，连接关闭归还额度，陌生 peer 不得迁移连接。多个 dispatcher 可共享 `ResourceBudget`。这是可核算资源上限，不冒充进程 RSS 的硬限制。
+- **单端口多客户端 QUIC/H3**：`quic::Dispatcher` 按实际 DCID 路由（含新 CID），`http3::make_server` 组合 H3；准入、payload 与队列预留有界，陌生 peer 不得迁移连接。多个 dispatcher 可共享 `ResourceBudget`。连接终止释放应用预算，保留全部已签发 CID 至少三个 PTO；本地主动关闭按匹配入包限频重发，对端 draining 静默丢弃。关闭槽在准入时预留，不驱逐尚受保护的 CID；显式 `remove()` 才强制清除。这是可核算资源上限，不冒充进程 RSS 的硬限制，也不是完整重放/洪泛防护。
 - **H2/H3 出站流式 body**：`request_stream` / `respond_stream` → `write_body` → `finish_body`；预算满返回 `would_block` 且不污染连接。H3 chunk 保留到 ACK，QUIC 双向流轮转避免长流饿死短流。
 - **连接生命周期**：`ConnectionPool<T>` 提供每源有界租约池与 idle 淘汰，默认丢弃、显式归还已排空连接；`tcp::connect_with_retry` 只重试建连，绝不暗中重放业务请求；`tcp::serve` 提供准入和停止接入、取消、join 的协作关闭。
-- **WebSocket/WSS**：`MIRA_ENABLE_WEBSOCKET=ON`，独立 `Mira::ws` + OpenSSL Crypto（安全 nonce/mask、RFC6455 SHA-1 握手）；分片、UTF-8、ping/pong/close、消息限额、双向独立 Python 互操作及 TLS 组合测试。TCP 上允许一读一写并行；当前 TLS Stream 仍要求串行操作，因此 WSS 并行读写尚未支持。无压缩/子协议/H2/H3 Extended CONNECT。
+- **WebSocket/WSS**：`MIRA_ENABLE_WEBSOCKET=ON`，独立 `Mira::ws` + OpenSSL Crypto（安全 nonce/mask、RFC6455 SHA-1 握手）；分片、增量 UTF-8、ping/pong/close、消息限额、双向独立互操作。TCP 和 TLS/WSS 均支持同一事件循环上一读一写并行，握手与关闭独占；每个 TLS 请求有独立期限，取消或超时令整个 TLS 会话永久失效并唤醒同伴，不取消后重放密文。`Stream::create` 显式接收事件循环，`close()` 终止包装器但不拥有底层流。无压缩/子协议/H2/H3 Extended CONNECT。
 - **SSE / 本地流**：`mira_sse_server` 演示 chunked SSE、事件 ID 与 Last-Event-ID 恢复；`transport::local` 提供 POSIX filesystem Unix-domain socket，Windows 显式 `not_supported`，不自动删除调用方路径。
 
 ```bash
@@ -303,9 +303,9 @@ ctest --test-dir build/ws --output-on-failure
 
 ## 接下来：仍需验证的边界
 
-1. WSS 全双工 TLS 调度、Windows H3 运行、iOS/Android TLS 与协议真机运行；当前移动仅交叉编译。
-2. WebSocket Autobahn 全量一致性套件、更长时故障注入、真实多机负载与进程内存治理；当前独立 Python 互操作不等于全套认证。
-3. QUIC migration/NAT rebinding、0-RTT、Retry/地址验证、draining tombstone 与 HTTP/3 Extended CONNECT 尚未实现；listener 不是互联网抗洪泛防护系统。
+1. Windows H3 运行门禁正在验收；iOS/Android TLS 与协议真机运行仍待设备，当前移动仅交叉编译。WSS 全双工及 TLS 1.3 KeyUpdate 并行回归已落地。
+2. 更长时故障注入、真实多机负载与进程内存治理。官方 Autobahn 25.10.1 已完成双端 RFC6455 非压缩用例：每端 301 项，298 OK + 3 INFORMATIONAL，零失败、零 NON-STRICT、零缺项；每端 216 项 RFC7692 压缩用例明确排除，不代表支持压缩。可用 `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker` 在 Linux 复现，完整报告由 CI 保存。
+3. QUIC migration/NAT rebinding、0-RTT、Retry/地址验证与 HTTP/3 Extended CONNECT 尚未实现；closing/draining 已保护已准入连接，但 listener 不是互联网抗洪泛防护系统。
 4. MQTT、SOCKS5、DNS/DoH 依具体需求独立扩展；gRPC/Redis/WebRTC 保持生态层边界，不将专业子系统全部塞进网络内核。
 
 设计依据与验收要求见[架构文档](docs/ARCHITECTURE.md)。

@@ -9,6 +9,16 @@ version is 0, the minor version is where breaking changes land: a request for
 
 ### Added
 
+- Same-event-loop TLS and WSS duplex I/O, with independent request deadline
+  timers and permanent session cancellation instead of unsafe wire retries.
+  TLS `Stream::create` now requires its `EventLoop&` as the first argument.
+- Bounded QUIC closing/draining tombstones retaining all issued CIDs for three
+  PTOs, paced input-triggered close retransmission and shared cache accounting.
+- Official Autobahn 25.10.1 client/server coverage: 301 non-compression cases per
+  role (298 OK, 3 informational, zero failures/non-strict/missing cases).
+  The 216 compression cases per role remain explicitly excluded.
+- WebSocket framing and handshake libFuzzer harnesses, plus regression-tested
+  conformance report checking and cross-platform pinned dependency extraction.
 - CID-routed single-port QUIC/H3 dispatchers, bounded admission and resource
   reservations, shared payload budgets, multi-client runtime tests and example.
 - H2/H3 incremental request/response bodies with bounded chunk queues,
@@ -22,6 +32,12 @@ version is 0, the minor version is where breaking changes land: a request for
 
 ### Fixed
 
+- Incremental UTF-8 validation rejects impossible text prefixes without waiting
+  for the remainder of a frame or fragmented message.
+- Event-loop timer/deadline registration rolls back every partially registered
+  operation on allocation failure; IOCP accept also releases its pending socket.
+- HTTP/2 TLS tests consume close_notify before completing the TCP shutdown,
+  preventing unread ciphertext from turning successful responses into resets.
 - QUIC rotates bidirectional stream output instead of starving higher stream IDs.
 - Installed consumer verification restricts multi-config generators to the
   configuration actually installed, including vcpkg's configuration mappings.

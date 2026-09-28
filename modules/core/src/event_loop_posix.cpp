@@ -244,18 +244,28 @@ public:
             id = ++next_id_;
             // Record and deadline registered under one lock: a timer naming an
             // operation not yet in the table would fire into nothing.
-            Operation& operation = operations_[id];
-            operation = Operation{.id = id,
-                                  .handle = handle,
-                                  .result = result,
-                                  .kind = Kind::readiness,
-                                  .fd = fd,
-                                  .writable = writable,
-                                  .armed = true};
-            if (options.deadline) {
-                operation.deadline = timers_.add(
-                    *options.deadline,
-                    detail::TimerTarget{.operation = id, .is_deadline = true});
+            try {
+                Operation& operation = operations_[id];
+                operation = Operation{.id = id,
+                                      .handle = handle,
+                                      .result = result,
+                                      .kind = Kind::readiness,
+                                      .fd = fd,
+                                      .writable = writable,
+                                      .armed = true};
+                if (options.deadline) {
+                    operation.deadline = timers_.add(
+                        *options.deadline,
+                        detail::TimerTarget{.operation = id, .is_deadline = true});
+                }
+            } catch (...) {
+                // No kernel interest was added, and the caller has not suspended.
+                (void)unlink(id);
+                if (auto it = fd_waiters_.find(fd);
+                    it != fd_waiters_.end() && it->second.empty()) {
+                    fd_waiters_.erase(it);
+                }
+                throw;
             }
             slot = id;
             combined = interest(waiters);
@@ -290,18 +300,21 @@ public:
         {
             const std::lock_guard lock{mutex_};
             id = ++next_id_;
-            Operation& operation = operations_[id];
-            operation = Operation{
-                .id = id, .handle = handle, .result = result, .kind = Kind::timer};
-            // Two timers, not `min(wake_at, deadline)`: they mean opposite
-            // things, and whichever fires first resolves the operation while
-            // `unlink` cancels the other. One combined timer would have to
-            // remember which of the two it was standing in for.
-            operation.wake = timers_.add(wake_at, detail::TimerTarget{.operation = id});
-            if (options.deadline) {
-                operation.deadline = timers_.add(
-                    *options.deadline,
-                    detail::TimerTarget{.operation = id, .is_deadline = true});
+            try {
+                Operation& operation = operations_[id];
+                operation = Operation{
+                    .id = id, .handle = handle, .result = result, .kind = Kind::timer};
+                // Both timers and the operation form one registration. A failed
+                // allocation must not leave a handle naming an unwound frame.
+                operation.wake = timers_.add(wake_at, detail::TimerTarget{.operation = id});
+                if (options.deadline) {
+                    operation.deadline = timers_.add(
+                        *options.deadline,
+                        detail::TimerTarget{.operation = id, .is_deadline = true});
+                }
+            } catch (...) {
+                (void)unlink(id);
+                throw;
             }
         }
         wake();  // a nearer deadline may shorten the current wait

@@ -529,8 +529,13 @@ public:
             return fail(last_socket_error());
         }
 
-        const Acquired acquired =
-            acquire_operation(Kind::accept, coroutine, std::nullopt, options);
+        Acquired acquired;
+        try {
+            acquired = acquire_operation(Kind::accept, coroutine, std::nullopt, options);
+        } catch (...) {
+            ::closesocket(accepted);
+            throw;
+        }
         Operation* operation = acquired.operation;
         operation->size_result = result;
         operation->socket = listening;
@@ -982,18 +987,25 @@ private:
         const std::lock_guard lock{mutex_};
         const detail::OperationId id = ++next_id_;
         pointer->id = id;
-        if (wake_at) {
-            // Two timers, not `min(wake_at, deadline)`: they mean opposite
-            // things, and whichever fires first resolves the operation while
-            // `take` cancels the other.
-            pointer->wake = timers_.add(*wake_at, detail::TimerTarget{.operation = id});
+        const auto entry = operations_.emplace(id, std::move(owned)).first;
+        try {
+            if (wake_at) {
+                // Two timers, not `min(wake_at, deadline)`: they mean opposite
+                // things, and whichever fires first resolves the operation while
+                // `take` cancels the other.
+                pointer->wake = timers_.add(*wake_at, detail::TimerTarget{.operation = id});
+            }
+            if (options.deadline) {
+                pointer->deadline =
+                    timers_.add(*options.deadline,
+                                detail::TimerTarget{.operation = id, .is_deadline = true});
+            }
+        } catch (...) {
+            timers_.cancel(pointer->wake);
+            timers_.cancel(pointer->deadline);
+            operations_.erase(entry);
+            throw;
         }
-        if (options.deadline) {
-            pointer->deadline =
-                timers_.add(*options.deadline,
-                            detail::TimerTarget{.operation = id, .is_deadline = true});
-        }
-        operations_.emplace(id, std::move(owned));
         return Acquired{id, pointer};
     }
 

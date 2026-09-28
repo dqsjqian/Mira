@@ -161,7 +161,7 @@ auto client = Mira::tls::Context::client({
 });
 ```
 
-- `tls::Stream<T>::create(transport, ctx, "localhost")` → `co_await stream.handshake()` → normal reads/writes
+- `tls::Stream<T>::create(loop, transport, ctx, "localhost")` → `co_await stream.handshake()` → normal reads/writes
 - No insecure verification bypass exists; TLS 1.0/1.1 are always refused
 - After ALPN you must inspect `negotiated_protocol()` and pick H1/H2 yourself — the library never switches protocols implicitly
 </details>
@@ -284,10 +284,10 @@ Android requires **NDK 29 or newer**: NDK 27/28's libc++ gates `std::stop_token`
 
 ## Production composition now available
 
-- **Single-port multi-client QUIC/H3**: `quic::Dispatcher` routes actual DCIDs, including newly issued IDs; `http3::make_server` composes H3. Admission, payload and queue reservations are bounded and returned on close. Dispatchers can share `ResourceBudget`. Accounting limits do not claim a hard process-RSS bound; peers remain fixed.
+- **Single-port multi-client QUIC/H3**: `quic::Dispatcher` routes actual DCIDs, including newly issued IDs; `http3::make_server` composes H3. Admission, payload and queue reservations are bounded, and dispatchers can share `ResourceBudget`. Termination releases application budgets while retaining all issued CIDs for at least three PTOs. Local closes retransmit on matching input with bounded pacing; peer draining is silent. Closing slots are reserved at admission, never evicted early; explicit `remove()` purges protection. These are accounting limits, not a hard RSS cap or complete replay/flood protection; peers remain fixed.
 - **Streaming H2/H3 output**: `request_stream` / `respond_stream` → `write_body` → `finish_body`. Exhaustion returns `would_block` without failing the connection. H3 chunks survive until ACK; QUIC bidirectional streams rotate to prevent starvation.
 - **Connection lifecycle**: `ConnectionPool<T>` provides bounded per-origin leases and idle eviction; leases discard by default and recycle only drained connections. `tcp::connect_with_retry` retries connection establishment, never application requests. `tcp::serve` bounds admission and cooperatively stops, cancels and joins handlers.
-- **WebSocket/WSS**: `MIRA_ENABLE_WEBSOCKET=ON` builds `Mira::ws` and OpenSSL Crypto-backed nonce/masking/RFC6455 handshake support. Fragmentation, UTF-8, ping/pong/close, limits, independent Python peers and TLS composition are tested. One read and one write can overlap on TCP; the current TLS Stream still requires serial operations, so concurrent WSS I/O is not yet supported. No compression, subprotocol negotiation or H2/H3 Extended CONNECT.
+- **WebSocket/WSS**: `MIRA_ENABLE_WEBSOCKET=ON` builds `Mira::ws` and OpenSSL Crypto-backed nonce/masking/RFC6455 handshake support. Fragmentation, incremental UTF-8, ping/pong/close, limits and independent peers are tested. TCP and TLS/WSS support one concurrent read and write on the same event loop; handshake/shutdown remain exclusive. Each TLS request owns its deadline timer. Cancellation/timeouts permanently invalidate the session and wake its companion, never replay ciphertext after cancellation. `Stream::create` takes the event loop explicitly; `close()` stops the wrapper without owning the transport. No compression, subprotocol negotiation or H2/H3 Extended CONNECT.
 - **SSE / local streams**: `mira_sse_server` demonstrates chunked SSE, IDs and Last-Event-ID resume. `transport::local` provides POSIX filesystem Unix-domain streams; Windows explicitly returns `not_supported`. Caller-owned paths are never automatically removed.
 
 ```bash
@@ -303,9 +303,9 @@ Real network benchmark: `python3 tools/bench/network_bench.py --server build/rel
 
 ## Next: remaining verification boundaries
 
-1. Full-duplex TLS scheduling for WSS, Windows H3 runtime and iOS/Android TLS/protocol device runs; mobile currently cross-compiles only.
-2. Full Autobahn conformance, longer fault injection, multi-machine load and process-memory governance. Independent Python interoperability is not full conformance certification.
-3. QUIC migration/NAT rebinding, 0-RTT, Retry/address validation, draining tombstones and HTTP/3 Extended CONNECT remain unsupported; the listener is not an Internet flood-protection system.
+1. Windows H3 runtime validation is in progress. iOS/Android TLS/protocol device runs still require connected devices; mobile currently cross-compiles only. WSS duplex and concurrent TLS 1.3 KeyUpdate regression coverage are implemented.
+2. Longer fault injection, multi-machine load and process-memory governance. Official Autobahn 25.10.1 non-compression RFC6455 coverage is complete for both roles: 301 cases each, 298 OK + 3 INFORMATIONAL, zero failures, NON-STRICT results or missing cases. The 216 RFC7692 compression cases per role are explicitly excluded; this is not compression support. Reproduce on Linux with `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker`; CI preserves the complete reports.
+3. QUIC migration/NAT rebinding, 0-RTT, Retry/address validation and HTTP/3 Extended CONNECT remain unsupported. Closing/draining protects admitted connections; the listener is not an Internet flood-protection system.
 4. MQTT, SOCKS5 and DNS/DoH are demand-driven independent extensions. Keep gRPC/Redis/WebRTC in the ecosystem layer, not bundled into the network core.
 
 See the [architecture document](docs/ARCHITECTURE.md) for design rationale and acceptance criteria.

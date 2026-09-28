@@ -185,6 +185,10 @@ std::size_t Engine::input_capacity() const noexcept {
     return BIO_ctrl_get_write_guarantee(impl_->wire);
 }
 
+std::size_t Engine::output_pending() const noexcept {
+    return impl_ ? static_cast<std::size_t>(BIO_ctrl_pending(impl_->wire)) : 0;
+}
+
 Result<std::size_t> Engine::feed(std::span<const std::byte> ciphertext) {
     if (!impl_ || impl_->failed) return fail(make_error_code(Errc::invalid_state));
     if (ciphertext.empty()) return std::size_t{0};
