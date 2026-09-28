@@ -74,8 +74,8 @@ int main(int argc, char** argv) {
     }
     std::uint16_t port = 0;
     const std::string_view text{argv[1]};
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), port);
-    if (error != std::errc{} || end != text.data() + text.size() || !port) return 2;
+    const auto [end, parse_error] = std::from_chars(text.data(), text.data() + text.size(), port);
+    if (parse_error != std::errc{} || end != text.data() + text.size() || !port) return 2;
     try {
         auto loop = require(Mira::EventLoop::create());
         require(loop.run_until_complete(run(loop, port, argv[2])));
