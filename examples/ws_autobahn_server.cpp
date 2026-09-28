@@ -14,7 +14,9 @@ Mira::Task<Mira::Result<void>> echo(Mira::transport::tcp::Socket& socket,
                                    Mira::OperationOptions options) {
     // Raise only harness limits for Autobahn 9.*; preserve the library's production defaults.
     Mira::ws::Limits limits{.max_frame = 64 * 1024 * 1024, .max_message = 64 * 1024 * 1024};
-    Mira::ws::Connection connection(socket, Mira::ws::Role::server, limits);
+    Mira::ws::HandshakeOptions handshake_options;
+    handshake_options.compression.enabled = true;
+    Mira::ws::Connection connection(socket, Mira::ws::Role::server, limits, handshake_options);
     auto handshake = co_await connection.handshake({}, "/", options);
     if (!handshake) co_return handshake;
     for (;;) {

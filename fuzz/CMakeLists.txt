@@ -44,7 +44,7 @@ target_compile_options(fuzz_response_parser PRIVATE -fsanitize=fuzzer)
 target_link_options(fuzz_response_parser PRIVATE -fsanitize=fuzzer)
 
 if(MIRA_ENABLE_WEBSOCKET)
-    foreach(harness IN ITEMS ws_parser ws_handshake)
+    foreach(harness IN ITEMS ws_parser ws_handshake ws_compression)
         add_executable(fuzz_${harness} ${harness}.cpp)
         target_link_libraries(fuzz_${harness} PRIVATE Mira::ws Mira::warnings)
         target_compile_features(fuzz_${harness} PRIVATE cxx_std_23)

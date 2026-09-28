@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the official Autobahn corpus for both roles, excluding unsupported RFC7692 compression."""
+"""Run official Autobahn cases in both roles; --compression includes RFC7692."""
 
 import argparse
 import collections
@@ -213,7 +213,9 @@ def main():
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--case-timeout", type=int, default=300)
     parser.add_argument("--cases", nargs="+", default=["*"], help="Diagnostic subset; the summary is marked partial")
+    parser.add_argument("--compression", action="store_true", help="include RFC7692 compression cases 12.* and 13.*")
     args = parser.parse_args()
+    excluded_patterns = [] if args.compression else EXCLUDED.copy()
     if not 1 <= args.timeout <= 86400 or not 1 <= args.case_timeout <= 3600:
         parser.error("timeout must be in 1..86400 and case-timeout must be in 1..3600")
     args.server = args.server.resolve()
@@ -223,7 +225,8 @@ def main():
     summary = {"status": "blocked", "scope": "full" if args.cases == ["*"] else "partial",
                "suite": "official crossbario/autobahn-testsuite", "run_directory": str(run_dir),
                "case_patterns": args.cases, "accepted_behaviors": sorted(ACCEPTED),
-               "excluded_patterns": EXCLUDED, "excluded_reason": "Mira does not implement RFC7692 permessage-deflate",
+               "compression": args.compression, "excluded_patterns": excluded_patterns,
+               "excluded_reason": None if args.compression else "Compression cases require --compression",
                "excluded_count": None, "executed_count": 0, "failed_count": None,
                "non_strict_count": None, "informational_count": None, "strict_passed": False,
                "harness_limits": {"max_frame": 67108864, "max_message": 67108864},
@@ -244,7 +247,7 @@ def main():
         catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
         summary["versions"] = {key: catalog[key] for key in ("autobahn", "autobahntestsuite")}
         all_cases = set(catalog["case_ids"])
-        excluded = sorted((c for c in all_cases if any(fnmatch.fnmatchcase(c, p) for p in EXCLUDED)), key=case_key)
+        excluded = sorted((c for c in all_cases if any(fnmatch.fnmatchcase(c, p) for p in excluded_patterns)), key=case_key)
         expected = sorted((c for c in all_cases - set(excluded)
                            if any(fnmatch.fnmatchcase(c, p) for p in args.cases)), key=case_key)
         summary.update({"catalog_count": len(all_cases), "excluded_count": len(excluded),
@@ -252,7 +255,7 @@ def main():
                         "selected": expected, "status": "running"})
         if not expected:
             raise RuntimeError("No official cases selected; refusing an empty passing result")
-        common = {"cases": expected, "exclude-cases": EXCLUDED, "exclude-agent-cases": {}}
+        common = {"cases": expected, "exclude-cases": excluded_patterns, "exclude-agent-cases": {}}
         server_reports = run_dir / "servers"
         try:
             with process([str(args.server), "0", str(args.timeout)], run_dir / "mira-server.log", ready=True) as (server, lines):
@@ -313,6 +316,7 @@ def main():
                     summary["status"] = "failed"
                 summary["strict_passed"] = False
     print(json.dumps({"status": summary["status"], "scope": summary["scope"],
+                      "compression": summary["compression"],
                       "executed_count": summary["executed_count"],
                       "non_strict_count": summary["non_strict_count"],
                       "informational_count": summary["informational_count"],

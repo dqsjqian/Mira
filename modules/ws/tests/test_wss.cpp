@@ -39,7 +39,7 @@ Task<void> exchange_parallel(Connection& connection, EventLoop& loop, std::size_
 }
 
 Task<void> server(EventLoop& loop, transport::tcp::Listener& listener, tls::Context& context,
-                  bool& done, std::array<bool, 2>& reading) {
+                  bool& done, std::array<bool, 2>& reading, bool compression) {
     OperationOptions options{.deadline = Clock::now() + std::chrono::seconds(10)};
     auto accepted = co_await listener.accept(options);
     CHECK(accepted.has_value());
@@ -50,17 +50,23 @@ Task<void> server(EventLoop& loop, transport::tcp::Listener& listener, tls::Cont
     auto tls_handshake = co_await secure->handshake(options);
     CHECK(tls_handshake.has_value());
     if (!tls_handshake) co_return;
-    ws::Connection connection(*secure, ws::Role::server);
+    ws::HandshakeOptions extensions;
+    extensions.subprotocols = {"mira-binary"};
+    extensions.require_subprotocol = true;
+    extensions.compression.enabled = compression;
+    ws::Connection connection(*secure, ws::Role::server, {}, extensions);
     auto handshake = co_await connection.handshake({}, "/", options);
     CHECK(handshake.has_value());
     if (!handshake) co_return;
+    CHECK(connection.subprotocol() == "mira-binary");
+    CHECK(connection.compression_parameters().enabled == compression);
     co_await exchange_parallel(connection, loop, 0, reading, options);
     auto closing = co_await connection.read_message(options);
     CHECK(closing && closing->opcode == ws::Opcode::close);
     done = closing.has_value();
 }
 Task<void> client(EventLoop& loop, transport::Endpoint endpoint, tls::Context& context, bool& done,
-                  std::array<bool, 2>& reading) {
+                  std::array<bool, 2>& reading, bool compression) {
     OperationOptions options{.deadline = Clock::now() + std::chrono::seconds(10)};
     auto socket = co_await transport::tcp::connect(loop, endpoint, {}, options);
     CHECK(socket.has_value());
@@ -71,22 +77,28 @@ Task<void> client(EventLoop& loop, transport::Endpoint endpoint, tls::Context& c
     auto tls_handshake = co_await secure->handshake(options);
     CHECK(tls_handshake.has_value());
     if (!tls_handshake) co_return;
-    ws::Connection connection(*secure, ws::Role::client);
+    ws::HandshakeOptions extensions;
+    extensions.subprotocols = {"mira-binary"};
+    extensions.require_subprotocol = true;
+    extensions.compression.enabled = compression;
+    ws::Connection connection(*secure, ws::Role::client, {}, extensions);
     auto handshake = co_await connection.handshake("localhost", "/", options);
     CHECK(handshake.has_value());
     if (!handshake) co_return;
+    CHECK(connection.subprotocol() == "mira-binary");
+    CHECK(connection.compression_parameters().enabled == compression);
     co_await exchange_parallel(connection, loop, 1, reading, options);
     auto closed = co_await connection.close(1000, options);
     CHECK(closed.has_value());
     done = closed.has_value();
 }
 Task<void> run(EventLoop& loop, transport::tcp::Listener& listener, tls::Context& server_context,
-               tls::Context& client_context) {
+               tls::Context& client_context, bool compression) {
     bool server_done = false, client_done = false;
     TaskScope scope;
     std::array<bool, 2> reading{};
-    scope.spawn(server(loop, listener, server_context, server_done, reading));
-    scope.spawn(client(loop, listener.local_endpoint(), client_context, client_done, reading));
+    scope.spawn(server(loop, listener, server_context, server_done, reading, compression));
+    scope.spawn(client(loop, listener.local_endpoint(), client_context, client_done, reading, compression));
     co_await scope.join();
     CHECK(server_done && client_done);
 }
@@ -101,6 +113,7 @@ int main(int argc, char** argv) {
     if (!server_context || !client_context || !loop || !endpoint) return 1;
     auto listener = transport::tcp::Listener::bind(*loop, *endpoint);
     if (!listener) return 1;
-    CHECK(loop->run_until_complete(run(*loop, *listener, *server_context, *client_context)).has_value());
+    for (bool compression : {false, true})
+        CHECK(loop->run_until_complete(run(*loop, *listener, *server_context, *client_context, compression)).has_value());
     return test::summary();
 }

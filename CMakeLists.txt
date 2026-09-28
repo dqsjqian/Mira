@@ -32,7 +32,7 @@ option(MIRA_BUILD_EXAMPLES "Build Mira examples" ${MIRA_BUILD_EXAMPLES_DEFAULT})
 
 option(MIRA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(MIRA_ENABLE_TLS "Build the optional OpenSSL 3 TLS stream module" OFF)
-option(MIRA_ENABLE_WEBSOCKET "Build RFC6455 WebSocket (OpenSSL Crypto for handshake and masking)" OFF)
+option(MIRA_ENABLE_WEBSOCKET "Build WebSocket (OpenSSL Crypto and zlib for optional compression)" OFF)
 option(MIRA_ENABLE_HTTP2 "Build the optional nghttp2 HTTP/2 module" OFF)
 option(MIRA_ENABLE_HTTP3 "Build the optional QUIC and HTTP/3 modules (experimental)" OFF)
 
@@ -181,7 +181,7 @@ if(MIRA_BUILD_EXAMPLES)
     target_link_libraries(mira_sse_server PRIVATE Mira::http Mira::transport Mira::warnings)
 
     if(MIRA_ENABLE_WEBSOCKET)
-        foreach(example IN ITEMS ws_server ws_client ws_autobahn_server ws_autobahn_client)
+        foreach(example IN ITEMS ws_server ws_client ws_autobahn_server ws_autobahn_client ws_extensions_peer)
             add_executable(mira_${example} examples/${example}.cpp)
             target_link_libraries(mira_${example} PRIVATE Mira::ws Mira::transport Mira::warnings)
         endforeach()
@@ -245,6 +245,10 @@ if(MIRA_BUILD_EXAMPLES)
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_ws_interop.py
                         --server $<TARGET_FILE:mira_ws_server> --client $<TARGET_FILE:mira_ws_client>)
                 set_tests_properties(mira_ws_interop PROPERTIES TIMEOUT 60)
+                add_test(NAME mira_ws_extensions_interop
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_ws_interop.py
+                        --extensions-peer $<TARGET_FILE:mira_ws_extensions_peer>)
+                set_tests_properties(mira_ws_extensions_interop PROPERTIES TIMEOUT 120)
             endif()
             if(TARGET mira_h2_prior_knowledge_server)
                 add_test(NAME mira_h2_pair

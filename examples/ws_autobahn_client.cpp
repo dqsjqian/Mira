@@ -21,7 +21,9 @@ Mira::Task<Mira::Result<std::string>> session(
     auto socket = std::move(*connected);
     // Raise harness limits for official large-message cases without changing library defaults.
     Mira::ws::Limits limits{.max_frame = 64 * 1024 * 1024, .max_message = 64 * 1024 * 1024};
-    Mira::ws::Connection connection(socket, Mira::ws::Role::client, limits);
+    Mira::ws::HandshakeOptions handshake_options;
+    handshake_options.compression.enabled = true;
+    Mira::ws::Connection connection(socket, Mira::ws::Role::client, limits, handshake_options);
     auto handshake = co_await connection.handshake(endpoint.to_string(), std::move(target), options);
     if (!handshake) co_return Mira::fail(handshake.error());
     std::string response;

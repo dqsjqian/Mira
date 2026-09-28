@@ -101,7 +101,7 @@ def main():
             common.append('-DCMAKE_DISABLE_FIND_PACKAGE_NGHTTP2=TRUE')
 
         def case(name, find, *, source=None, links='core transport http',
-                 checks='', hidden=False, success=True, diagnostic=None):
+                 checks='', hidden=False, success=True, diagnostic=None, extra=()):
             directory = root / name
             directory.mkdir()
             text = ('cmake_minimum_required(VERSION 3.20)\n'
@@ -116,10 +116,11 @@ def main():
                          'add_test(NAME installed_api COMMAND consumer)\n')
             (directory / 'CMakeLists.txt').write_text(text, encoding='utf-8')
             command = ['cmake', '-S', str(directory), '-B', str(directory / 'build'),
-                       *common]
+                       *common, *extra]
             if hidden:
                 command += ['-DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=TRUE',
-                            '-DCMAKE_DISABLE_FIND_PACKAGE_NGHTTP2=TRUE']
+                            '-DCMAKE_DISABLE_FIND_PACKAGE_NGHTTP2=TRUE',
+                            '-DCMAKE_DISABLE_FIND_PACKAGE_ZLIB=TRUE']
             run(command, success=success, diagnostic=diagnostic)
             if source and success:
                 run(['cmake', '--build', str(directory / 'build'), '--config', args.config])
@@ -151,6 +152,29 @@ endforeach()
                 case('explicit-' + component, 'COMPONENTS ' + component,
                      checks=f'if(NOT Mira_{component}_FOUND OR NOT TARGET Mira::{component})\n'
                             f'  message(FATAL_ERROR "Explicit component not loaded {component}")\nendif()')
+        if 'ws' in installed:
+            no_zlib = ('-DCMAKE_DISABLE_FIND_PACKAGE_ZLIB=TRUE',)
+            case('ws-missing-zlib', 'COMPONENTS ws', extra=no_zlib, success=False,
+                 diagnostic="Mira component 'ws' is unavailable")
+            case('ws-optional-missing-zlib', 'COMPONENTS core crypto OPTIONAL_COMPONENTS ws',
+                 extra=no_zlib, checks='''
+if(Mira_ws_FOUND OR TARGET Mira::ws OR NOT Mira_crypto_FOUND)
+  message(FATAL_ERROR "Missing zlib must hide ws without hiding crypto")
+endif()
+''')
+            case('ws-codec', 'COMPONENTS ws', links='ws', source='''
+#include <mira/ws/compression.hpp>
+int main() {
+    Mira::ws::CompressionParameters parameters;
+    parameters.enabled = true;
+    auto codec = Mira::ws::DeflateEncoder::create(Mira::ws::Role::client, parameters);
+    if (!codec) return 1;
+    Mira::ws::Frame frame;
+    frame.payload.assign(1024, std::byte{0x61});
+    auto compressed = codec->encode(frame);
+    return compressed && compressed->compressed && compressed->payload.size() < frame.payload.size() ? 0 : 2;
+}
+''')
         case('unknown-required', 'COMPONENTS unknown', success=False,
              diagnostic="Mira component 'unknown' is unavailable")
         optional = 'tls crypto ws http2 quic http3 unknown'

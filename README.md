@@ -289,7 +289,7 @@ Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` �
 - **QUIC Retry / 来源地址验证**：向 `http3::make_server` / `quic::Listener::create` 传入 `RetryOptions{.policy = RetryPolicy::required}`，在 token 验证前不创建连接、不占连接预算。token 使用 ngtcp2 官方 AEAD，绑定地址、端口、版本、Retry CID、服务作用域与本地端点；过期、未来时间、篡改或来源变化静默拒绝。默认独立随机密钥，可显式轮转并保留一代旧密钥。`ingest().reply` 由调用方即时发送或丢弃，没有内部 Retry 队列。默认每 listener 每个固定 1 秒窗口最多 128 个 Retry，跨窗口边界可突发 256 个；这不是任意滑动秒限额或完整 DDoS 防护，也不提供一次性 token / 防重放保证。默认策略仍为 disabled，公网入口需显式 required。共享密钥要求相同作用域、本地端点、ALPN 与单调时钟基准。
 - **H2/H3 出站流式 body**：`request_stream` / `respond_stream` → `write_body` → `finish_body`；预算满返回 `would_block` 且不污染连接。H3 chunk 保留到 ACK，QUIC 双向流轮转避免长流饿死短流。
 - **连接生命周期**：`ConnectionPool<T>` 提供每源有界租约池与 idle 淘汰，默认丢弃、显式归还已排空连接；`tcp::connect_with_retry` 只重试建连，绝不暗中重放业务请求；`tcp::serve` 提供准入和停止接入、取消、join 的协作关闭。
-- **WebSocket/WSS**：`MIRA_ENABLE_WEBSOCKET=ON`，独立 `Mira::ws` + OpenSSL Crypto（安全 nonce/mask、RFC6455 SHA-1 握手）；分片、增量 UTF-8、ping/pong/close、消息限额、双向独立互操作。TCP 和 TLS/WSS 均支持同一事件循环上一读一写并行，握手与关闭独占；每个 TLS 请求有独立期限，取消或超时令整个 TLS 会话永久失效并唤醒同伴，不取消后重放密文。`Stream::create` 显式接收事件循环，`close()` 终止包装器但不拥有底层流。无压缩/子协议/H2/H3 Extended CONNECT。
+- **WebSocket/WSS**：`MIRA_ENABLE_WEBSOCKET=ON`，独立 `Mira::ws` + OpenSSL Crypto（安全 nonce/mask、RFC6455 SHA-1 握手）+ zlib；分片、增量 UTF-8、ping/pong/close、消息限额、双向独立互操作。TCP 和 TLS/WSS 均支持同一事件循环上一读一写并行，握手与关闭独占；每个 TLS 请求有独立期限，取消或超时令整个 TLS 会话永久失效并唤醒同伴，不取消后重放密文。`Stream::create` 显式接收事件循环，`close()` 终止包装器但不拥有底层流。支持可选子协议协商与 permessage-deflate，尚无 H2/H3 Extended CONNECT。
 - **SSE / 本地流**：`mira_sse_server` 演示 chunked SSE、事件 ID 与 Last-Event-ID 恢复；`transport::local` 提供 POSIX filesystem Unix-domain socket，Windows 显式 `not_supported`，不自动删除调用方路径。
 
 ```bash
@@ -302,6 +302,16 @@ ctest --test-dir build/ws --output-on-failure
 ```
 
 真实网络基准：`python3 tools/bench/network_bench.py --server build/release/mira_managed_echo_server --clients 8 --requests 1000 --slow-clients 4`，输出吞吐、p50/p99、峰值 RSS 采样和环境 JSON。负载发生器使用独立进程 Python sockets；loopback 数字不是跨库性能排名，也不是公网性能。
+
+### WebSocket 子协议与压缩
+
+向 `ws::Connection` 的第四个构造参数传入 `HandshakeOptions`：`subprotocols` 指定有序协议列表，服务端按自身偏好选择交集；`require_subprotocol` 可要求必须达成协商。握手后用 `subprotocol()` 读取选择结果。协议名大小写敏感，客户端拒绝未提议协议、多重选择和重复响应头。
+
+`compression.enabled = true` 才提议/接受 RFC7692 permessage-deflate，默认关闭。支持双向 context takeover、no-context-takeover、窗口协商、压缩分片与穿插控制帧；`read_frame` / `read_message` 返回已解压明文，文本在解压后增量验证 UTF-8。`Limits::max_frame` 同时约束 wire 帧及该帧解压输出，`max_message` 分别约束压缩累计与明文累计。发送窗口支持 9–15，接收支持 8–15；zlib 无法可靠发送 8 位窗口，协商不虚报该能力。压缩状态按方向独立，错误后不再复用。
+
+`compression_parameters()` 返回 wire 协商结果；客户端仍在本地遵守 offer 中更小的窗口及 no-context 承诺。压缩会引入大小侧信道，不应在同一压缩上下文混合秘密与攻击者可控内容；敏感数据默认保持压缩关闭。启用 ws 构建需要 zlib，但基础模块和只用 Crypto 的安装消费不强制查找 zlib。
+
+独立 Python socket/zlib 双向互操作：`python3 tools/ci/check_ws_interop.py --extensions-peer build/ws/mira_ws_extensions_peer`。官方 Autobahn 的完整压缩模式以 `run_autobahn.py --compression` 启动，报告明确标示实际执行、信息项、失败和缺项；配置入口不等于官方验证已完成。
 
 ### Retry 真实 UDP 故障验收
 
@@ -317,7 +327,7 @@ python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak 
 ## 接下来：仍需验证的边界
 
 1. iOS/Android TLS 与协议真机运行仍待设备，当前移动仅交叉编译。Windows MSVC H3、WSS 全双工及 TLS 1.3 KeyUpdate 并行回归已实跑；Windows 独立第三方 HTTP/3 互操作和 MinGW H3 尚未覆盖。
-2. 更长时故障注入、真实多机负载与进程内存治理。官方 Autobahn 25.10.1 已完成双端 RFC6455 非压缩用例：每端 301 项，298 OK + 3 INFORMATIONAL，零失败、零 NON-STRICT、零缺项；每端 216 项 RFC7692 压缩用例明确排除，不代表支持压缩。可用 `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker` 在 Linux 复现，完整报告由 CI 保存。
+2. 更长时故障注入、真实多机负载与进程内存治理。官方 Autobahn 25.10.1 已完成双端 RFC6455 非压缩用例：每端 301 项，298 OK + 3 INFORMATIONAL，零失败、零 NON-STRICT、零缺项；这是此前排除每端 216 项压缩用例的已确认结果。当前压缩实现及独立互操作已落地，新增 `--compression` 全量门禁待实际报告确认，不能沿用旧数字冒充压缩认证。可用 `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker` 在 Linux 复现，完整报告由 CI 保存。
 3. QUIC migration/NAT rebinding、0-RTT 与 HTTP/3 Extended CONNECT 尚未实现。Retry 来源地址验证与 closing/draining 已落地，但不保证 token 一次性使用或完整防重放，listener 不是互联网抗洪泛防护系统。
 4. MQTT、SOCKS5、DNS/DoH 依具体需求独立扩展；gRPC/Redis/WebRTC 保持生态层边界，不将专业子系统全部塞进网络内核。
 

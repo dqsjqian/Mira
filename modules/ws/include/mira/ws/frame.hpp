@@ -26,6 +26,7 @@ struct Frame {
     Opcode opcode = Opcode::binary;
     bool final = true;
     std::vector<std::byte> payload;
+    bool compressed = false; // Wire RSV1: only the first data frame of a compressed message.
 };
 
 struct ParseResult {
@@ -40,7 +41,7 @@ Result<std::vector<std::byte>> close_payload(std::uint16_t code = 1000,
 
 class FrameParser {
 public:
-    explicit FrameParser(Role local_role, Limits limits = {});
+    explicit FrameParser(Role local_role, Limits limits = {}, bool allow_compression = false);
     Result<ParseResult> feed(std::span<const std::byte> bytes);
     bool failed() const noexcept { return static_cast<bool>(error_); }
     void reset() noexcept;
@@ -49,6 +50,8 @@ private:
     Result<void> validate_frame();
     Role role_;
     Limits limits_;
+    bool allow_compression_ = false;
+    bool message_compressed_ = false;
     std::array<std::byte, 14> header_{};
     std::size_t header_size_ = 0;
     std::size_t header_needed_ = 2;
@@ -69,6 +72,7 @@ private:
 // Explicit mask keys support deterministic codec tests. Network clients must use
 // Connection, which obtains a fresh mask from the crypto module for every frame.
 Result<std::vector<std::byte>> serialize(const Frame& frame, Role sender,
-    std::optional<std::array<std::byte, 4>> mask = std::nullopt, Limits limits = {});
+    std::optional<std::array<std::byte, 4>> mask = std::nullopt, Limits limits = {},
+    bool allow_compression = false);
 
 } // namespace Mira::ws

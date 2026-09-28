@@ -88,7 +88,7 @@ class SummaryTests(TemporaryFiles):
 
 class MainTests(TemporaryFiles):
     def run_fixture(self, *, cases=None, catalog=("1.1.1", "1.1.2", "12.1.1", "13.1.1"),
-                    verdict="OK", omit_client=False):
+                    verdict="OK", omit_client=False, compression=False, unexpected=None, failed_case=None):
         output = self.directory / "results"
         binary = self.directory / "harness"
         binary.touch()
@@ -96,6 +96,8 @@ class MainTests(TemporaryFiles):
                      "--output", str(output)]
         if cases is not None:
             arguments += ["--cases", *cases]
+        if compression:
+            arguments.append("--compression")
         runtime = mock.Mock(docker=False, image=runner.IMAGE)
         runtime.path.side_effect = str
         runtime.command.side_effect = lambda arguments: arguments
@@ -108,11 +110,20 @@ class MainTests(TemporaryFiles):
         def write_report(spec_path, agent):
             spec = json.loads(spec_path.read_text(encoding="utf-8"))
             selected = spec["cases"]
+            self.assertEqual(spec["exclude-cases"], [] if compression else ["12.*", "13.*"])
+            expected = sorted((case for case in catalog
+                               if (compression or not case.startswith(("12.", "13."))) and
+                               any(runner.fnmatch.fnmatchcase(case, pattern) for pattern in (cases or ["*"]))),
+                              key=runner.case_key)
+            self.assertEqual(selected, expected)
             if agent == "Mira-client" and omit_client:
                 selected = selected[:-1]
+            if unexpected:
+                selected = [*selected, unexpected]
             reports = Path(spec["outdir"])
             reports.mkdir()
-            rows = {case: {"behavior": verdict, "behaviorClose": "OK"} for case in selected}
+            rows = {case: {"behavior": "FAILED" if case == failed_case else verdict,
+                           "behaviorClose": "OK"} for case in selected}
             runner.write_json(reports / "index.json", {agent: rows})
 
         @contextlib.contextmanager
@@ -149,7 +160,79 @@ class MainTests(TemporaryFiles):
         self.assertEqual(summary["executed_count"], 4)
         self.assertEqual(summary["excluded_count"], 2)
         self.assertEqual(summary["selected"], ["1.1.1", "1.1.2"])
+        self.assertEqual(summary["excluded"], ["12.1.1", "13.1.1"])
+        self.assertEqual(summary["excluded_patterns"], ["12.*", "13.*"])
+        self.assertFalse(summary["compression"])
+        self.assertFalse(printed["compression"])
         self.assertTrue(printed["strict_passed"])
+
+    def test_compression_full_scope_includes_every_catalog_case_in_both_roles(self):
+        code, summary, printed = self.run_fixture(compression=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["scope"], "full")
+        self.assertEqual(summary["selected"], ["1.1.1", "1.1.2", "12.1.1", "13.1.1"])
+        self.assertEqual(summary["executed_count"], 8)
+        self.assertEqual(summary["selected_count_per_role"], summary["catalog_count"])
+        self.assertEqual(summary["excluded_count"], 0)
+        self.assertEqual(summary["excluded_patterns"], [])
+        self.assertEqual(summary["excluded"], [])
+        self.assertIsNone(summary["excluded_reason"])
+        self.assertTrue(summary["compression"])
+        self.assertTrue(printed["compression"])
+        self.assertTrue(printed["strict_passed"])
+
+    def test_missing_compression_case_fails_the_full_run(self):
+        code, summary, printed = self.run_fixture(compression=True, omit_client=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["client"]["missing"], ["13.1.1"])
+        self.assertEqual(summary["client"]["missing_count"], 1)
+        self.assertEqual(summary["excluded_count"], 0)
+        self.assertFalse(printed["strict_passed"])
+
+    def test_failed_compression_case_is_not_hidden_by_normal_success(self):
+        code, summary, printed = self.run_fixture(compression=True, failed_case="12.1.1")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["executed_count"], 8)
+        self.assertEqual(summary["failed_count"], 2)
+        for role in ("server", "client"):
+            self.assertEqual(summary[role]["failed"][0]["case"], "12.1.1")
+        self.assertFalse(printed["strict_passed"])
+
+    def test_compression_subset_preserves_informational_classification(self):
+        code, summary, printed = self.run_fixture(compression=True, cases=["12.*", "13.*"],
+                                                  verdict="INFORMATIONAL")
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["scope"], "partial")
+        self.assertEqual(summary["selected"], ["12.1.1", "13.1.1"])
+        self.assertEqual(summary["excluded_count"], 0)
+        self.assertEqual(summary["informational_count"], 4)
+        self.assertFalse(printed["strict_passed"])
+
+    def test_compression_non_strict_pass_remains_distinct_from_strict_pass(self):
+        code, summary, printed = self.run_fixture(compression=True, verdict="NON-STRICT")
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["scope"], "full")
+        self.assertEqual(summary["non_strict_count"], 8)
+        self.assertEqual(printed["non_strict_count"], 8)
+        self.assertEqual(summary["excluded_count"], 0)
+        self.assertFalse(printed["strict_passed"])
+
+    def test_unexpected_cases_fail_in_both_modes(self):
+        for compression in (False, True):
+            with self.subTest(compression=compression):
+                code, summary, printed = self.run_fixture(compression=compression, unexpected="99.1.1")
+                self.assertEqual(code, 1)
+                self.assertEqual(summary["server"]["unexpected"], ["99.1.1"])
+                self.assertEqual(summary["client"]["unexpected"], ["99.1.1"])
+                self.assertFalse(printed["strict_passed"])
+
+    def test_compression_only_selection_requires_explicit_flag(self):
+        code, summary, printed = self.run_fixture(cases=["12.*", "13.*"])
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["selected"], [])
+        self.assertEqual(summary["excluded"], ["12.1.1", "13.1.1"])
+        self.assertEqual(summary["executed_count"], 0)
+        self.assertFalse(printed["strict_passed"])
 
     def test_failed_verdict_makes_the_run_fail(self):
         code, summary, printed = self.run_fixture(verdict="FAILED")

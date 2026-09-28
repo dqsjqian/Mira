@@ -83,18 +83,22 @@ Result<std::vector<std::byte>> close_payload(std::uint16_t code, std::span<const
     bytes.insert(bytes.end(), reason.begin(), reason.end());
     return bytes;
 }
-FrameParser::FrameParser(Role local_role, Limits limits) : role_(local_role), limits_(limits) {}
+FrameParser::FrameParser(Role local_role, Limits limits, bool allow_compression)
+    : role_(local_role), limits_(limits), allow_compression_(allow_compression) {}
 void FrameParser::reset() noexcept {
     header_size_ = 0; header_needed_ = 2; payload_size_ = 0; header_ready_ = false;
-    frame_ = {}; fragmented_.reset(); message_size_ = 0;
+    frame_ = {}; fragmented_.reset(); message_size_ = 0; message_compressed_ = false;
     utf8_remaining_ = 0; utf8_value_ = 0; utf8_min_ = 0; closed_ = false; error_.clear();
 }
 Result<void> FrameParser::parse_header() {
     auto a = value(header_[0]), b = value(header_[1]);
     frame_.opcode = static_cast<Opcode>(a & 15);
     frame_.final = (a & 0x80) != 0;
+    frame_.compressed = (a & 0x40) != 0;
     masked_ = (b & 0x80) != 0;
-    if ((a & 0x70) || !known(frame_.opcode) || masked_ != (role_ == Role::server))
+    if ((a & 0x30) || !known(frame_.opcode) || masked_ != (role_ == Role::server) ||
+        (frame_.compressed && (!allow_compression_ ||
+         (frame_.opcode != Opcode::text && frame_.opcode != Opcode::binary))))
         return fail(make_error_code(Errc::protocol));
     std::uint64_t size = b & 127;
     std::size_t pos = 2;
@@ -115,6 +119,7 @@ Result<void> FrameParser::parse_header() {
             return fail(make_error_code(Errc::protocol));
         if (size > limits_.max_message || message_size_ > limits_.max_message - size)
             return fail(Mira::Errc::limit_exceeded);
+        if (frame_.opcode != Opcode::continuation) message_compressed_ = frame_.compressed;
     }
     if (masked_) std::copy_n(header_.begin() + static_cast<std::ptrdiff_t>(pos), 4, mask_.begin());
     payload_size_ = static_cast<std::size_t>(size);
@@ -130,9 +135,9 @@ Result<void> FrameParser::validate_frame() {
     } else if (!control(frame_.opcode)) {
         auto type = fragmented_.value_or(frame_.opcode);
         message_size_ += frame_.payload.size();
-        if (type == Opcode::text && frame_.final && utf8_remaining_ != 0)
+        if (!message_compressed_ && type == Opcode::text && frame_.final && utf8_remaining_ != 0)
             return fail(make_error_code(Errc::invalid_utf8));
-        if (frame_.final) { fragmented_.reset(); message_size_ = 0; }
+        if (frame_.final) { fragmented_.reset(); message_size_ = 0; message_compressed_ = false; }
         else fragmented_ = type;
     }
     return {};
@@ -162,7 +167,8 @@ Result<ParseResult> FrameParser::feed(std::span<const std::byte> bytes) {
         frame_.payload.push_back(byte);
     }
     // RFC6455 UTF-8 state spans a message; control frames must not interrupt text validation.
-    if (!control(frame_.opcode) && fragmented_.value_or(frame_.opcode) == Opcode::text &&
+    if (!control(frame_.opcode) && !message_compressed_ &&
+        fragmented_.value_or(frame_.opcode) == Opcode::text &&
         !utf8(std::span<const std::byte>(frame_.payload).subspan(previous_size),
               utf8_remaining_, utf8_value_, utf8_min_)) {
         error_ = make_error_code(Errc::invalid_utf8);
@@ -177,8 +183,10 @@ Result<ParseResult> FrameParser::feed(std::span<const std::byte> bytes) {
     return result;
 }
 Result<std::vector<std::byte>> serialize(const Frame& frame, Role sender,
-    std::optional<std::array<std::byte, 4>> mask, Limits limits) {
+    std::optional<std::array<std::byte, 4>> mask, Limits limits, bool allow_compression) {
     if (!known(frame.opcode) || (sender == Role::client) != mask.has_value() ||
+        (frame.compressed && (!allow_compression ||
+         (frame.opcode != Opcode::text && frame.opcode != Opcode::binary))) ||
         (control(frame.opcode) && (!frame.final || frame.payload.size() > 125)))
         return fail(make_error_code(Errc::protocol));
     if (frame.payload.size() > limits.max_frame ||
@@ -193,11 +201,12 @@ Result<std::vector<std::byte>> serialize(const Frame& frame, Role sender,
             value(frame.payload[0]) == 3 && value(frame.payload[1]) == 242)
             return fail(make_error_code(Errc::protocol));
     }
-    if (frame.opcode == Opcode::text && frame.final && !valid_utf8(frame.payload))
+    if (!frame.compressed && frame.opcode == Opcode::text && frame.final && !valid_utf8(frame.payload))
         return fail(make_error_code(Errc::invalid_utf8));
     std::vector<std::byte> output;
     output.reserve(frame.payload.size() + 14);
-    output.push_back(std::byte((frame.final ? 0x80 : 0) | static_cast<unsigned>(frame.opcode)));
+    output.push_back(std::byte((frame.final ? 0x80 : 0) | (frame.compressed ? 0x40 : 0) |
+                               static_cast<unsigned>(frame.opcode)));
     auto size = frame.payload.size();
     unsigned flag = mask ? 0x80 : 0;
     if (size < 126) output.push_back(std::byte(flag | static_cast<unsigned>(size)));

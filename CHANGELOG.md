@@ -9,6 +9,15 @@ version is 0, the minor version is where breaking changes land: a request for
 
 ### Added
 
+- Case-sensitive WebSocket subprotocol negotiation, required-selection policy,
+  and negotiated-protocol accessors.
+- Opt-in RFC7692 permessage-deflate with bounded raw zlib codecs, directional
+  context takeover and window negotiation, fragmented UTF-8 validation,
+  decompression limits, WSS duplex coverage and independent Python zlib peers.
+  Sending supports window bits 9-15 and receiving 8-15; ws now links zlib.
+- Compression-aware fuzzing, installed zlib dependency-isolation checks and
+  a full official Autobahn `--compression` mode; final conformance remains
+  subject to the generated reports, not the earlier non-compression counts.
 - Opt-in stateless QUIC Retry admission with ngtcp2 AEAD tokens, source-address
   binding, strict expiry, service-scoped key rotation and bounded reply limiting.
 - Required-Retry HTTP/3 multi-client example, independent curl interoperability
@@ -23,7 +32,8 @@ version is 0, the minor version is where breaking changes land: a request for
   PTOs, paced input-triggered close retransmission and shared cache accounting.
 - Official Autobahn 25.10.1 client/server coverage: 301 non-compression cases per
   role (298 OK, 3 informational, zero failures/non-strict/missing cases).
-  The 216 compression cases per role remain explicitly excluded.
+  That verified baseline excluded 216 compression cases per role; the new
+  compression mode includes them and requires a separate conformance result.
 - WebSocket framing and handshake libFuzzer harnesses, plus regression-tested
   conformance report checking and cross-platform pinned dependency extraction.
 - CID-routed single-port QUIC/H3 dispatchers, bounded admission and resource

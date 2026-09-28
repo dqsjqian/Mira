@@ -80,7 +80,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install OpenSSL on Linux
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
       - name: Locate OpenSSL on macOS
         if: runner.os == 'macOS'
         shell: bash
@@ -91,7 +91,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install openssl:x64-windows nghttp2:x64-windows
+          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install openssl:x64-windows nghttp2:x64-windows zlib:x64-windows
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "CMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Build pinned Windows QUIC and HTTP3 dependencies
@@ -139,6 +139,7 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-openssl
             mingw-w64-ucrt-x86_64-nghttp2
+            mingw-w64-ucrt-x86_64-zlib
       - name: Configure with TLS
         run: cmake -S . -B build/mingw -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_HTTP2=ON
       - name: Build
@@ -161,7 +162,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install OpenSSL on Linux
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
       - name: Locate OpenSSL on macOS
         if: runner.os == 'macOS'
         shell: bash
@@ -195,7 +196,7 @@ jobs:
         # _LIBCPP_HAS_NO_EXPERIMENTAL_STOP_TOKEN (CI-proven with both 18 and
         # 19; the android job describes the same gate), while libstdc++ ships
         # the complete library — exactly what epoll-clang already validates.
-        run: sudo apt-get update && sudo apt-get install -y clang-19 libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y clang-19 libssl-dev zlib1g-dev
       - name: Configure with libFuzzer
         run: >
           cmake -S . -B build/fuzz -DCMAKE_BUILD_TYPE=Debug
@@ -217,10 +218,11 @@ jobs:
           ./build/fuzz/fuzz/fuzz_ws_parser
           -max_total_time=60 -max_len=8192 -rss_limit_mb=2560 &&
           ./build/fuzz/fuzz/fuzz_ws_handshake
-          -max_total_time=60 -max_len=16384 -rss_limit_mb=2560
+          -max_total_time=60 -max_len=16384 -rss_limit_mb=2560 &&
+          ./build/fuzz/fuzz/fuzz_ws_compression
+          -max_total_time=60 -max_len=4096 -rss_limit_mb=2560
 
-  # Run the official RFC6455 corpus against both roles. RFC7692 compression
-  # cases are explicitly excluded until extension negotiation is implemented.
+  # Run the official RFC6455 and RFC7692 corpus against both roles.
   websocket-conformance:
     needs: discipline
     runs-on: ubuntu-latest
@@ -228,7 +230,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install WebSocket build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
       - name: Configure and build both conformance harnesses
         run: |
           cmake -S . -B build/autobahn -DCMAKE_BUILD_TYPE=Release -DMIRA_ENABLE_WEBSOCKET=ON
@@ -238,7 +240,7 @@ jobs:
           python3 tools/ci/run_autobahn.py
           --server build/autobahn/mira_ws_autobahn_server
           --client build/autobahn/mira_ws_autobahn_client
-          --runtime docker --output build/autobahn-results --timeout 2400
+          --runtime docker --compression --output build/autobahn-results --timeout 2400
       - name: Preserve complete conformance evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -263,7 +265,7 @@ jobs:
       - name: Install protocol toolchain on Linux
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update && sudo apt-get install -y libssl-dev g++-14
+          sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev g++-14
           echo "CC=gcc-14" >> "$GITHUB_ENV"
           echo "CXX=g++-14" >> "$GITHUB_ENV"
       - name: Build OpenSSL 3.5 for QUIC (Linux)

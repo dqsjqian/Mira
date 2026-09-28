@@ -17,14 +17,16 @@ namespace Mira::ws {
 // adapter may impose a stricter contract. Handshake and close are exclusive.
 // Automatic pong/close replies are serialized behind an active writer, with
 // at most one pending pong and one pending close. No unbounded output queue.
-// Messages are bounded; compression, subprotocols and H2/H3 CONNECT are absent.
+// Messages are bounded; negotiated compression and subprotocols are opt-in.
+// HTTP/2 and HTTP/3 Extended CONNECT are separate protocols, not handled here.
 // Complete TLS handshake first. Do not mix read_frame/read_message mid-fragment.
 // Keep this object and its transport alive until every operation completes.
 template<AsyncStream Transport>
 class Connection {
 public:
-    Connection(Transport& transport, Role role, Limits limits = {})
-        : transport_(&transport), role_(role), limits_(limits), incoming_(role, limits),
+    Connection(Transport& transport, Role role, Limits limits = {}, HandshakeOptions handshake_options = {})
+        : transport_(&transport), role_(role), limits_(limits),
+          handshake_options_(std::move(handshake_options)), incoming_(role, limits),
           outgoing_(role == Role::client ? Role::server : Role::client, limits) {}
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
@@ -35,6 +37,8 @@ public:
         }
     }
     bool closed() const noexcept { return failed_ || (close_sent_ && close_received_); }
+    std::string_view subprotocol() const noexcept { return negotiated_.subprotocol; }
+    const CompressionParameters& compression_parameters() const noexcept { return negotiated_.compression; }
 
     Task<Result<void>> handshake(std::string host = {}, std::string target = "/",
                                   OperationOptions options = {}) {
@@ -46,7 +50,7 @@ public:
         if (role_ == Role::client) {
             if (host.size() > limits_.max_handshake || target.size() > limits_.max_handshake)
                 co_return terminate(make_error_code(Mira::Errc::limit_exceeded));
-            auto request = client_handshake(host, target);
+            auto request = client_handshake(host, target, handshake_options_, limits_);
             if (!request) co_return terminate(request.error());
             if (request->request.size() > limits_.max_handshake)
                 co_return terminate(make_error_code(Mira::Errc::limit_exceeded));
@@ -63,13 +67,19 @@ public:
             head.push_back(static_cast<char>(std::to_integer<unsigned char>(byte[0])));
         }
         if (role_ == Role::server) {
-            auto response = server_handshake(head, limits_);
+            auto response = negotiate_server_handshake(head, handshake_options_, limits_);
             if (!response) co_return terminate(response.error());
-            auto sent = co_await write_bytes(std::as_bytes(std::span(response->data(), response->size())), options);
+            auto configured = configure_extensions(response->negotiated);
+            if (!configured) co_return terminate(configured.error());
+            auto sent = co_await write_bytes(std::as_bytes(std::span(response->response.data(), response->response.size())), options);
             if (!sent) co_return sent;
+            negotiated_ = std::move(response->negotiated);
         } else {
-            auto validated = validate_server_handshake(head, key, limits_);
+            auto validated = negotiate_client_handshake(head, key, handshake_options_, limits_);
             if (!validated) co_return terminate(validated.error());
+            auto configured = configure_extensions(*validated);
+            if (!configured) co_return terminate(configured.error());
+            negotiated_ = std::move(*validated);
         }
         ready_ = true;
         co_return Result<void>{};
@@ -174,6 +184,27 @@ private:
         DirectionGuard guard{*this, writing_};
         co_return co_await send_locked(frame, options, true);
     }
+    Result<void> configure_extensions(const Negotiated& negotiated) {
+        if (!negotiated.compression.enabled) return {};
+        auto outbound = negotiated.compression;
+        if (role_ == Role::client) {
+            // Offer hints are promises about our encoder even when the server
+            // omits them or responds with a less restrictive receive limit.
+            outbound.client_no_context_takeover = outbound.client_no_context_takeover ||
+                handshake_options_.compression.client_no_context_takeover;
+            if (handshake_options_.compression.client_max_window_bits)
+                outbound.client_max_window_bits = std::min(outbound.client_max_window_bits,
+                    *handshake_options_.compression.client_max_window_bits);
+        }
+        auto encoder = DeflateEncoder::create(role_, outbound, limits_);
+        if (!encoder) return fail(encoder.error());
+        auto decoder = DeflateDecoder::create(role_, negotiated.compression, limits_);
+        if (!decoder) return fail(decoder.error());
+        encoder_.emplace(std::move(*encoder));
+        decoder_.emplace(std::move(*decoder));
+        incoming_ = FrameParser(role_, limits_, true);
+        return {};
+    }
     Result<void> check_options(OperationOptions options) const {
         if constexpr (!BoundedStream<Transport>) {
             if (options.stop.stop_possible() || options.deadline) return fail(Mira::Errc::not_supported);
@@ -225,11 +256,21 @@ private:
             auto random = crypto::random_bytes(*mask);
             if (!random) co_return terminate(random.error());
         }
-        auto wire = serialize(frame, role_, mask, limits_);
-        if (!wire) co_return fail(wire.error());
-        if (!closing_pong) {
-            auto valid = outgoing_.feed(*wire);
-            if (!valid) co_return terminate(valid.error());
+        // Validate application data before advancing the compression context.
+        // In compressed mode the codec owns fragmented UTF-8 and size state.
+        Result<std::vector<std::byte>> wire;
+        if (encoder_) {
+            auto encoded = encoder_->encode(frame);
+            if (!encoded) co_return terminate(encoded.error());
+            wire = serialize(*encoded, role_, mask, limits_, true);
+            if (!wire) co_return terminate(wire.error());
+        } else {
+            wire = serialize(frame, role_, mask, limits_);
+            if (!wire) co_return fail(wire.error());
+            if (!closing_pong) {
+                auto valid = outgoing_.feed(*wire);
+                if (!valid) co_return terminate(valid.error());
+            }
         }
         auto sent = co_await write_bytes(*wire, options);
         if (!sent) co_return sent;
@@ -248,6 +289,11 @@ private:
                 begin_ = 0; end_ = *n;
             }
             auto parsed = incoming_.feed(std::span<const std::byte>(buffer_).subspan(begin_, end_ - begin_));
+            if (parsed && parsed->frame && decoder_) {
+                auto decoded = decoder_->decode(std::move(*parsed->frame));
+                if (!decoded) parsed = fail(decoded.error());
+                else parsed->frame = std::move(*decoded);
+            }
             if (!parsed) {
                 auto error = parsed.error();
                 if (!close_sent_) {
@@ -288,6 +334,10 @@ private:
     Transport* transport_;
     Role role_;
     Limits limits_;
+    HandshakeOptions handshake_options_;
+    Negotiated negotiated_;
+    std::optional<DeflateEncoder> encoder_;
+    std::optional<DeflateDecoder> decoder_;
     FrameParser incoming_;
     FrameParser outgoing_;
     std::array<std::byte, 4096> buffer_{};
