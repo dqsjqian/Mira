@@ -292,13 +292,14 @@ jobs:
         # The distro OpenSSL (3.0) predates SSL_set_quic_tls_cbs, which the
         # ngtcp2 ossl adapter requires. Build a private 3.5 copy for the
         # protocol dependencies; the core/TLS matrix above keeps using the
-        # system OpenSSL.
+        # system OpenSSL. 3.5.1 also fixes x509 -addreject, which the QUIC
+        # trust-purpose regression fixture requires (broken in 3.5.0).
         run: |
           set -eux
           curl -fsSL -o openssl.tar.gz \
-            https://github.com/openssl/openssl/releases/download/openssl-3.5.0/openssl-3.5.0.tar.gz
+            https://github.com/openssl/openssl/releases/download/openssl-3.5.1/openssl-3.5.1.tar.gz
           tar xzf openssl.tar.gz
-          cd openssl-3.5.0
+          cd openssl-3.5.1
           ./Configure --prefix="$RUNNER_TEMP/openssl35" --libdir=lib no-shared no-tests
           make -j"$(nproc)"
           make install_sw

@@ -176,6 +176,7 @@ Task<Result<void>> throw_first(tcp::Socket& socket, OperationOptions io, Handler
     CHECK(!result && result.error() == Errc::cancelled);
     ++state.finished;
     throw std::runtime_error("cleanup failure must not replace first");
+    co_return Result<void>{};  // MSVC requires an explicit non-void coroutine return.
 }
 Task<void> exception_skips_grace(EventLoop& loop) {
     test::section("synchronous child exception cancels siblings, joins and preserves first cause");
@@ -264,6 +265,7 @@ Task<Result<void>> finish_then_throw(tcp::Socket&, OperationOptions io, HandlerS
     state.io = io;
     co_await gate;
     throw std::runtime_error("failure during grace");
+    co_return Result<void>{};  // MSVC requires an explicit non-void coroutine return.
 }
 Task<void> exception_during_drain(EventLoop& loop) {
     test::section("an exception during grace cancels the long watchdog and still joins");

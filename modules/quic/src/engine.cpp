@@ -95,9 +95,9 @@ ngtcp2_path native_path(const Path& path) {
 }
 Path owned_path(const ngtcp2_path& path) {
     auto local = transport::Endpoint::from_bytes({
-        reinterpret_cast<const std::byte*>(path.local.addr), path.local.addrlen});
+        reinterpret_cast<const std::byte*>(path.local.addr), static_cast<std::size_t>(path.local.addrlen)});
     auto remote = transport::Endpoint::from_bytes({
-        reinterpret_cast<const std::byte*>(path.remote.addr), path.remote.addrlen});
+        reinterpret_cast<const std::byte*>(path.remote.addr), static_cast<std::size_t>(path.remote.addrlen)});
     return {local.value_or(transport::Endpoint{}), remote.value_or(transport::Endpoint{})};
 }
 Bytes cid_bytes(const ngtcp2_cid& cid) {

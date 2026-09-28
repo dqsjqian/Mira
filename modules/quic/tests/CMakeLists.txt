@@ -52,9 +52,9 @@ endforeach()
 set(MIRA_QUIC_REJECTED_CERT "${CMAKE_CURRENT_BINARY_DIR}/rejected-ca.pem")
 execute_process(COMMAND "${MIRA_QUIC_OPENSSL_TOOL}" x509 -in "${MIRA_QUIC_TEST_CERT}"
     -addreject serverAuth -trustout -out "${MIRA_QUIC_REJECTED_CERT}"
-    RESULT_VARIABLE rejected_cert_result OUTPUT_QUIET ERROR_QUIET)
+    RESULT_VARIABLE rejected_cert_result OUTPUT_QUIET ERROR_VARIABLE rejected_cert_error)
 if(NOT rejected_cert_result EQUAL 0)
-    message(FATAL_ERROR "Failed to generate the rejected-purpose QUIC test CA")
+    message(FATAL_ERROR "Failed to generate the rejected-purpose QUIC test CA (${rejected_cert_result}): ${rejected_cert_error}")
 endif()
 add_test(NAME quic_ca-aux COMMAND test_quic_engine
     "${MIRA_QUIC_TEST_CERT}" "${MIRA_QUIC_TEST_KEY}" ca-aux "${MIRA_QUIC_REJECTED_CERT}")
