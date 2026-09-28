@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🎵 Mira
+# 🌐 Mira
 
 **Coroutine-native C++23 networking · transport first, protocols on top** · TCP / UDP / TLS / HTTP/1.1 / HTTP/2 / QUIC / HTTP/3
 
