@@ -13,7 +13,7 @@
 // IOCP without emulating it badly.
 //
 // Threading contract:
-//   * `post()` and `stop()` are safe from any thread.
+//   * `post()`, `try_post()`, and `stop()` are safe from any thread.
 //   * `OperationOptions::stop` may be requested from any thread; the
 //     cancellation is delivered on the loop thread.
 //   * everything else must be called on the thread running the loop.
@@ -25,6 +25,7 @@
 #include "mira/core/error.hpp"
 #include "mira/core/operation.hpp"
 #include "mira/core/platform.hpp"
+#include "mira/core/resource_budget.hpp"
 #include "mira/core/task.hpp"
 
 #include <array>
@@ -193,7 +194,26 @@ public:
     /// Move-only: a callable capturing a `Task` (itself move-only) can be
     /// posted without wrapping, which is a routine need in a coroutine
     /// library. `std::function` would demand copyability and reject it.
+    /// This is the unbounded control/resumption channel. Application admission
+    /// limits never apply to it or to operation cancellation. The caller must
+    /// keep the loop alive and pumping until its continuations have returned;
+    /// destruction discards ordinary posted callables, rather than running them.
     void post(move_only_function<void()> work);
+
+    /// Accounted application admission, separate from reliable post(). A shared
+    /// budget can bound queued slots (cost=1), or caller-declared resource units
+    /// across several loops. Saturation returns would_block, shutdown returns
+    /// cancelled, and rejected callables are destroyed without being invoked.
+    /// Allocation failures may throw; any reservation is rolled back.
+    ///
+    /// The charge covers queued and already-dequeued-but-not-started work. It
+    /// is released immediately before invocation so reentrant posting can make
+    /// progress. This does not bound work created by the callback, retained
+    /// queue capacity, allocator overhead, or RSS. Never use this overload for
+    /// a coroutine resumption unless rejection is handled without suspending.
+    [[nodiscard]] Result<void> try_post(move_only_function<void()> work,
+                                        const ResourceBudget& budget,
+                                        std::size_t cost = 1);
 
     // ── driving ─────────────────────────────────────────────────────────────
 
@@ -201,7 +221,9 @@ public:
     Result<void> run();
 
     /// Run a single iteration: wait for completions (up to `timeout`), then
-    /// dispatch expired timers, finished operations, and posted work.
+    /// dispatch expired timers, finished operations, and posted work. If a
+    /// posted callback throws, the rest of its already-dequeued post batch is
+    /// still invoked before the first exception is rethrown to the caller.
     ///
     /// A default timeout blocks until something happens. Exposed because a
     /// host with its own main loop needs to interleave, and because tests

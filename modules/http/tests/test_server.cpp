@@ -273,6 +273,45 @@ std::size_t count_occurrences(std::string_view haystack, std::string_view needle
 
 // ── connection loop ──────────────────────────────────────────────────────────
 
+void test_shared_buffer_budget() {
+    test::section("shared server input and request body budget");
+    ResourceBudget budget{256};
+    ServerOptions options;
+    options.max_buffer_size = 128;
+    options.limits.max_body_size = 128;
+    options.buffer_budget = budget;
+    auto handler = [&budget](const Request&, auto& writer, std::span<const std::byte> body)
+        -> Task<Result<void>> {
+        CHECK(budget.used() == 256);
+        CHECK(text_of(body) == "test");
+        auto extra = budget.try_acquire(1);
+        CHECK(!extra && extra.error() == Errc::would_block);
+        Response response;
+        co_return co_await writer.send(response);
+    };
+    ScriptedStream stream{"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntest"};
+    CHECK(serve_connection(stream, handler, options).sync_get().has_value());
+    CHECK(budget.used() == 0);
+    auto occupied = budget.try_acquire(1);
+    CHECK(occupied.has_value());
+    ScriptedStream rejected{"GET / HTTP/1.1\r\nHost: x\r\n\r\n"};
+    const auto untouched = rejected.unread();
+    auto result = serve_connection(rejected, handler, options).sync_get();
+    CHECK(!result && result.error() == Errc::would_block);
+    CHECK(rejected.unread() == untouched && rejected.sent().empty());
+    CHECK(budget.used() == 1);
+    occupied->reset();
+    ScriptedStream too_long{"GET /" + std::string(150, 'x') + " HTTP/1.1\r\n\r\n", 4096};
+    result = serve_connection(too_long, handler, options).sync_get();
+    CHECK(!result && result.error() == Errc::limit_exceeded);
+    CHECK(budget.used() == 0);
+    options.request_timeout = -std::chrono::seconds(1);
+    ScriptedStream invalid{""};
+    result = serve_connection(invalid, handler, options).sync_get();
+    CHECK(!result && result.error() == Errc::invalid_argument);
+    CHECK(budget.used() == 0);
+}
+
 void test_single_exchange() {
     test::section("single exchange");
 
@@ -843,6 +882,7 @@ int main() {
     test_chunk_framing();
     test_keep_alive_rules();
 
+    test_shared_buffer_budget();
     test_single_exchange();
     test_keep_alive_pipeline();
     test_handler_exception_is_contained();

@@ -4,6 +4,11 @@ add_executable(mira_core_tests test_core.cpp)
 add_executable(mira_event_loop_tests test_event_loop.cpp)
 
 add_executable(mira_task_scope_tests test_task_scope.cpp)
+add_executable(mira_runtime_tests test_runtime.cpp)
+target_link_libraries(mira_runtime_tests PRIVATE Mira::core Mira::warnings)
+target_include_directories(mira_runtime_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME runtime COMMAND mira_runtime_tests)
+set_tests_properties(runtime PROPERTIES TIMEOUT 60)
 
 foreach(target mira_core_tests mira_event_loop_tests mira_task_scope_tests)
     target_link_libraries(${target} PRIVATE
@@ -29,6 +34,8 @@ function(mira_add_terminate_tests prefix target)
         set_tests_properties(${prefix}_${mode} PROPERTIES TIMEOUT 15)
     endforeach()
 endfunction()
+
+mira_add_terminate_tests(runtime mira_runtime_tests self-destruction)
 
 mira_add_terminate_tests(task_scope mira_task_scope_tests
     pending-destruction unobserved-failure abandoned-join unstarted-join)

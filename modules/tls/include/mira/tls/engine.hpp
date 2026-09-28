@@ -2,9 +2,11 @@
 
 #include "mira/tls/context.hpp"
 #include "mira/tls/error.hpp"
+#include "mira/core/resource_budget.hpp"
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 
@@ -22,8 +24,12 @@ public:
     };
     static constexpr std::size_t buffer_capacity = 64 * 1024;
 
+    // Charges both fixed BIO buffers before SSL allocation and retains the charge
+    // until destruction. This excludes OpenSSL's internal allocations and RSS.
+    static constexpr std::size_t reserved_buffer_bytes = 2 * buffer_capacity;
     [[nodiscard]] static Result<Engine> create(const Context& context,
-                                               std::string_view peer_name = {});
+                                               std::string_view peer_name = {},
+                                               std::optional<ResourceBudget> budget = {});
     Engine(Engine&&) noexcept;
     Engine& operator=(Engine&&) noexcept;
     Engine(const Engine&) = delete;

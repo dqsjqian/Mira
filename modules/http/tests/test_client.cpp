@@ -154,10 +154,10 @@ Task<void> limits_and_errors() {
     Script big;
     big.input = "HTTP/1.1 200 " + std::string(1000, 'x');
     big.chunk = 1000;
-    options = {};
-    options.max_buffer_size = 32;
-    options.read_chunk = 4096;
-    ClientConnection bounded{big, options};
+    ClientOptions buffer_options;
+    buffer_options.max_buffer_size = 32;
+    buffer_options.read_chunk = 4096;
+    ClientConnection bounded{big, buffer_options};
     result = co_await bounded.start(req);
     CHECK_VALUE(!result && result.error() == Errc::limit_exceeded);
     CHECK_VALUE(big.max_read <= 32);
@@ -186,9 +186,9 @@ Task<void> limits_and_errors() {
 
     Script timed;
     timed.input = "HTTP/1.1 204 X\r\n\r\n";
-    options = {};
-    options.request_timeout = 1s;
-    ClientConnection timed_client{timed, options};
+    ClientOptions timed_options;
+    timed_options.request_timeout = 1s;
+    ClientConnection timed_client{timed, timed_options};
     const auto earlier = Clock::now();
     CHECK_VALUE(co_await timed_client.start(req, {}, {.deadline = earlier + 10s}));
     CHECK_VALUE(!timed.seen.empty());
@@ -199,7 +199,7 @@ Task<void> limits_and_errors() {
 
     Script early;
     early.input = "HTTP/1.1 204 X\r\n\r\n";
-    ClientConnection earlier_client{early, options};
+    ClientConnection earlier_client{early, timed_options};
     const auto short_deadline = Clock::now() + 500ms;
     CHECK_VALUE(co_await earlier_client.start(req, {}, {.deadline = short_deadline}));
     for (const auto& io : early.seen)

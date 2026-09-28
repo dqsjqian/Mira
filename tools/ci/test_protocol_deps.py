@@ -11,6 +11,38 @@ import unittest
 from unittest import mock
 
 import build_protocol_deps as deps
+import build_interop_curl as interop
+from types import SimpleNamespace
+
+
+class InteropConfigurationTests(unittest.TestCase):
+    def test_configuration_and_dependency_paths(self):
+        args = SimpleNamespace(config="Debug", generator="Visual Studio 17 2022",
+                               architecture="x64", toolchain=Path("toolchain.cmake"))
+        with mock.patch.object(Path, "is_file", return_value=True):
+            flags = interop.configuration_arguments(args, Path("deps"), Path("ssl"), Path("out"), True)
+        self.assertIn("-DCMAKE_BUILD_TYPE=Debug", flags)
+        self.assertIn("-DCMAKE_TRY_COMPILE_CONFIGURATION=Debug", flags)
+        self.assertIn("Visual Studio 17 2022", flags)
+        self.assertIn("x64", flags)
+        self.assertIn("-DCURL_USE_SCHANNEL=OFF", flags)
+        self.assertIn("-DNGTCP2_CRYPTO_OSSL_LIBRARY=deps/lib/ngtcp2_crypto_ossl_static.lib", flags)
+        self.assertIn("-DNGHTTP3_LIBRARY=deps/lib/nghttp3_static.lib", flags)
+        self.assertTrue(any(item.startswith("-DCMAKE_TOOLCHAIN_FILE=") for item in flags))
+
+    def test_mingw_archive_fallback_and_missing_library(self):
+        with mock.patch.object(Path, "is_file", lambda path: path.name == "libngtcp2_static.a"):
+            self.assertEqual(interop.static_dependency(Path("deps"), "ngtcp2", True),
+                             Path("deps/lib/libngtcp2_static.a"))
+        with mock.patch.object(Path, "is_file", return_value=False):
+            with self.assertRaises(ValueError):
+                interop.static_dependency(Path("deps"), "ngtcp2", True)
+
+    def test_posix_keeps_native_dependency_discovery(self):
+        args = SimpleNamespace(config="Release", generator=None, architecture=None, toolchain=None)
+        flags = interop.configuration_arguments(args, Path("deps"), Path("ssl"), Path("out"), False)
+        self.assertIn("-DCMAKE_BUILD_TYPE=Release", flags)
+        self.assertFalse(any("STATICLIB" in item or "SCHANNEL" in item for item in flags))
 
 
 class ProtocolArchiveTests(unittest.TestCase):

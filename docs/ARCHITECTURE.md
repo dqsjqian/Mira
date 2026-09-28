@@ -5,7 +5,11 @@
 An independent, coroutine-native C++23 networking library: a transport core,
 and protocols that ride on it. HTTP is one protocol family, not the purpose.
 
-### Design mandate (2026-09-23, updated 2026-09-27)
+This document describes the current `main` development tree. The published
+consumption pin remains v0.4.0; newer APIs and local verification below do not
+change that archive or certify a new release.
+
+### Design mandate (2026-09-23, updated 2026-09-28)
 
 - Design from networking requirements, not cpp-httplib feature parity or an
   existing consumer's API. Neither cpp-httplib nor a host framework constrains
@@ -32,12 +36,12 @@ and remaining acceptance work must be described separately.
 
 | Concern | Current foundation | Remaining acceptance work |
 |---|---|---|
-| Execution and ownership | Lazy, move-only `Task` that terminates rather than destroy a started, unfinished frame; single-threaded `TaskScope` with immediate spawn and one-shot join; executor seam; single-threaded `EventLoop` whose operations carry never-reused identities | Explicit operation/buffer ownership across layers and continued join/drain validation; loop destruction during dispatch is refused rather than supported |
+| Execution and ownership | Lazy, move-only `Task` and single-threaded `TaskScope`; reliable continuation posting separate from bounded application admission; `LoopGroup` owns independent thread-affine loops and bounded root tasks | Continued cross-layer join/drain validation; attached sockets cannot migrate between workers; loop destruction during dispatch is refused |
 | Cancellation and deadlines | `OperationOptions` on core/TCP/HTTP operations; TLS owns independent loop timers for each application request without rearming wire I/O; `BoundedStream` exposes cancellation support; registration is rolled back on allocation failure | Maintain runtime evidence for backend-specific completion races; a cancelled IOCP read may lose bytes, so that connection cannot be resumed; `stop()` is a stop-pumping request, not I/O cancellation |
-| Transport and composition | TCP and completion-shaped kqueue/epoll/IOCP implementations; stream concepts; message-preserving UDP datagrams with cancellation/deadline support; `transport::DatagramTransport` pins the datagram contract (`mira/transport/datagram.hpp`), positive and negative conformance asserted at compile time | Equivalent observable semantics across backends, verified teardown, bounded queues |
+| Transport and composition | Completion-shaped TCP/UDP/local streams; `DatagramTransport` conformance assertions; bounded family-interleaved `tcp::dial`; separately composed HTTP/HTTPS client pools and grace-draining TCP serving | Maintain backend-specific teardown evidence; DNS is bounded system getaddrinfo, not independent asynchronous A/AAAA resolution |
 | Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered and streaming request bodies (`RequestBodyReader`), chunked trailers, connection-loop drain guarantees; request- and response-parser fuzzing in CI; curl interop exercised out-of-process against the example servers — HTTP/1.1 against the file server, real-nghttp2 HTTP/2 (prior knowledge, including concurrent streams) against `examples/h2_prior_knowledge_server`, native-QUIC HTTP/3 (ngtcp2 + nghttp3) against `examples/h3_server` | Protocol conformance evidence, slow-consumer backpressure bounds and bounded aggregate memory measurements |
-| Security and robustness | Optional duplex OpenSSL TLS stream with terminal cancellation, bounded parser limits, HTTP and WebSocket parser/handshake fuzzing, official Autobahn non-compression cases in both roles, timer-registration allocation-failure rollback | Longer fault injection, additional resource-exhaustion scenarios and mobile TLS runtime evidence |
-| Engineering evidence | C++23-only desktop runtime CI, independent HTTP/3 curl, full non-compression Autobahn client/server reports, sanitizer builds and real-socket benchmarks; mobile jobs cross-compile | Track the current CI commit rather than a stale baseline; mobile runtime evidence, multi-machine load and longer resource measurements remain outstanding; no stable ABI promise |
+| Security and robustness | Duplex TLS with terminal cancellation, bounded parsers, shared accounting budgets, HTTP/WS fuzzing, opt-in validated QUIC paths and explicit replay-safe raw-QUIC early data | No complete anti-replay or process-RSS guarantee; HTTP/3 0-RTT is unsupported; longer exhaustion tests and mobile TLS runtime evidence remain open |
+| Engineering evidence | `d3424f0` desktop CI and full compression-inclusive Autobahn reports; snapshot-scoped sanitizer suites, real-network H2/H3 CONNECT tests and a 600-second H3 loopback soak | Local final Release/GCC/ASan+UBSan each passed 85/85; new Windows H3/MinGW entry points await execution, iOS lacks signed device evidence, Android devices and multi-host/WAN remain unverified; no stable ABI promise |
 
 Rejecting ambiguous or malformed input is part of protocol correctness, not a
 substitute for the other contracts. The HTTP parser rejects conflicting
@@ -99,25 +103,27 @@ core lifetime and backpressure work.
 ## Layering
 
 ```
-protocol   HTTP/1.1              future protocol modules
-                  │                    │
-                  └────────────────────┘
-                      core I/O concepts
-                  ┌───────────┴───────────┐
-adapter       optional TLS          direct transport
-                  │                       │
-transport        TCP             future datagram/local transports
-                  └───────────┬───────────┘
-core       EventLoop · Buffer · Task · TaskScope · Executor · errors
+composition       client / client_tls          application drivers
+                      │                              │
+protocol       HTTP/1.1 · HTTP/2 · WS          HTTP/3 / QUIC
+                      │                              │
+adapter          optional TLS                  path-aware datagrams
+                      │                              │
+transport          TCP / local                      UDP
+                      └──────────────┬───────────────┘
+core       EventLoop · Buffer · Task · TaskScope · Executor · LoopGroup
                               │
 backend                kqueue · epoll · IOCP
 ```
 
 This diagram describes runtime composition, not concrete header dependencies.
-Protocols and TLS depend on core concepts; application composition connects
-TLS to a transport. Stream protocols must not assume every future transport is
-a byte stream: datagrams need their own message-boundary and truncation
-contracts. A protocol only composes with a transport whose semantics it needs.
+HTTP/1 and TLS use core stream concepts and do not depend on TCP. Shared HTTP
+fields live in dependency-free `Mira::http_common`; H3 does not require H2.
+`Mira::client` is a separate composition target linking HTTP and transport;
+`Mira::client_tls` adds TLS only with `MIRA_ENABLE_TLS=ON`. Installed components
+are `client` / `client_tls`; a base client consumer does not discover OpenSSL.
+Stream protocols must not assume datagrams are byte streams: a protocol only
+composes with a transport whose semantics it needs.
 
 Four dependency invariants are checked by `tools/ci/check_layering.py`.
 These static checks do not prove lifetime safety or runtime substitutability:
@@ -163,19 +169,38 @@ thread-affinity and backpressure contracts below.
 ### `Executor` — who resumes a coroutine
 
 ```cpp
-template <typename E>
-concept Executor = requires(E& e, void (*work)()) {
-    { e.post(work) } -> std::same_as<void>;
+template<typename E>
+concept Executor = requires(E& executor, detail::PostedResumption&& work) {
+    { executor.post(std::move(work)) } -> std::same_as<void>;
 };
 ```
 
-One function, because `post` is the smallest thing every scheduler already has.
-The host chooses scheduling policy; this does not make loop-bound objects
-thread-safe. `EventLoop` is single-threaded except for its documented `post()`
-and `stop()` entry points. `co_await schedule_on(executor)` schedules a
-continuation on the chosen executor; subsequent scheduling may move it again.
-Executor/loop lifetime and permitted thread transitions must be explicit before
-claiming arbitrary GUI-loop or thread-pool integration is safe.
+The concept checks the actual resumption closure, not merely a function pointer.
+`post` is the reliable, unbounded control/continuation channel; saturation of an
+application queue must never discard a coroutine resumption. `EventLoop` is
+single-threaded except for `post()`, `try_post()` and `stop()`. An operation's
+stop token may be requested cross-thread; its cancellation is delivered on the
+loop thread. `stop()` itself only stops pumping. `schedule_on` changes
+continuation scheduling, not ownership or thread safety of loop objects.
+
+`try_post` and `BoundedExecutor` provide a separate application admission gate,
+returning `would_block` on saturation. `BoundedExecutor` deliberately is not an
+`Executor`. Its queued-slot and caller-declared cost reservations end before
+invocation, so they do not cover asynchronous work created by callbacks.
+
+`LoopGroup` creates/drives/destroys one independent loop per worker. Its quota
+covers queued and unfinished root tasks; accepted factories survive their task
+frames, while captured references remain borrowed. Tasks cooperate with the
+worker stop token and remain on that worker; attached sockets, especially IOCP
+associations, cannot move between workers. Stop closes admission; join drains
+before threads exit. Uncooperative tasks can block shutdown. This is not several
+threads pumping one `EventLoop`.
+
+`ResourceBudget` is thread-safe shared accounting with RAII reservations and
+limit/used/peak/rejected observations. It can account selected connection slots,
+HTTP input, TLS buffers, H2 queues or QUIC reservations, not all allocations,
+third-party internals or RSS. These independently read counters are not a
+transactional snapshot or a memory-publication mechanism.
 
 ### `AsyncStream` — what a protocol reads and writes
 
@@ -188,8 +213,8 @@ concept AsyncReadStream = requires(S& s, std::span<std::byte> d) {
 
 Short-transfer semantics match the underlying I/O. Protocol code depends on a
 stream contract rather than a concrete socket type; TCP, TLS and in-memory
-streams exercise this seam. Unix-domain sockets are a possible future
-transport, not an implemented capability. Richer operations can be composed
+streams exercise this seam. POSIX filesystem Unix-domain sockets also
+implement this contract; Windows reports not_supported. Richer operations can be composed
 on the minimal contract; the existing `write_all` helper is tested with a
 non-socket `MemoryStream`.
 
@@ -207,10 +232,10 @@ handler chooses the delivery shape: a `std::span<const std::byte>` third
 parameter gets the buffered body byte-for-byte as before, while any other
 callable receives a `RequestBodyReader` and pulls slices while it runs —
 chunked trailers included, the connection loop draining what the handler
-left unread (or dropping the connection when the drain fails). End-to-end
-streaming still leaves open buffer ownership across protocol layers and the
-way slow consumers suspend producers; those are measured contracts, not
-delivered ones.
+left unread (or dropping the connection when the drain fails). HTTP/1 client
+uploads and H2/H3 outputs now also have incremental backpressure. These local
+contracts do not bound all caller buffers, third-party state or aggregate RSS;
+end-to-end slow-consumer and lifetime evidence remains configuration-specific.
 
 ### `TaskScope` — implemented single-threaded child ownership
 
@@ -280,8 +305,8 @@ These are broader design/acceptance requirements, beyond the scope foundation:
   operation resolving exactly once, with the precedence of the
   close/completion/cancellation/timeout races fixed (see below). What composes
   them for free is the deadline being absolute: no layer subtracts elapsed
-  time. What remains is evidence rather than mechanism — the Windows half has
-  no local runtime coverage at all.
+  time. Backend-specific runtime evidence must remain tied to the tested
+  revision; existing Windows CI does not certify every later working-tree edit.
 - **Backpressure:** bound outstanding operations, buffered bytes and work
   queues; define whether reaching each limit suspends or rejects a producer.
   Test slow peers and stalled consumers. A parser size limit or bounded TLS
@@ -369,15 +394,15 @@ is made about racing a request against a resolution.
 
 ### Composition through the stack
 
-`Socket::read_some` / `write_some`, `Listener::accept`, `connect`, and every
-`tls::Stream` operation take an `OperationOptions` and forward it downwards
-unchanged. That "unchanged" is the whole benefit of the deadline being
-absolute: one `{.deadline = T}` given to a TLS handshake becomes the same `T`
-on each of the arbitrarily many underlying reads and writes it performs, so
-"no underlying operation may extend past T" composes into "this handshake must
-finish by T" with no layer subtracting elapsed time. A duration would have
-required that subtraction at every level, and every level would have been a
-separate opportunity to get it wrong.
+`Socket::read_some` / `write_some`, `Listener::accept` and `connect` carry
+`OperationOptions` unchanged. TLS accepts the same absolute request budget but
+owns a separate event-loop deadline timer for each application operation.
+Ciphertext I/O does not inherit that request deadline: changing a request budget
+must not cancel and replay wire I/O, which could hide transferred bytes on IOCP.
+Expiry/cancellation permanently invalidates the TLS session, wakes the other
+direction and drains associated work before returning. The deadline is not
+refreshed across partial transfers, but kernel completion/drain may finish later
+than that time; it is not a hard return-time guarantee.
 
 `tls::Stream` requires a `BoundedStream` underneath for the same reason: a TLS
 operation drives its transport an unbounded number of times, so a handshake
@@ -417,6 +442,147 @@ Both windows default to zero, which disables them. That default is a
 compatibility choice, not a recommendation: it leaves a slow peer bounded by
 `limits` alone, which bounds one message's size and not the time it may take
 to arrive.
+
+## Current main-branch composition contracts
+
+### Dialing, streaming uploads and owned clients
+
+`tcp::dial` consumes a deduplicated endpoint list, preserving initial family
+preference and within-family order while interleaving IPv4/IPv6. Starts are
+staggered by `fallback_delay`; `max_attempts` and `max_parallel` bound work.
+A failure advances the next attempt immediately. One absolute budget covers
+resolution and attempts, and all losers are cancelled/joined before return,
+including closing late successful sockets. The resolver overload waits for
+bounded-worker system getaddrinfo first: it is not independent asynchronous
+A/AAAA DNS. Cancelling the wait cannot interrupt a system call already entered.
+
+HTTP/1 `ClientConnection::begin` sends the head, `send_body` borrows one chunk
+until sent, and `finish` completes framing then reads the final response head.
+Content-length and chunked uploads do not collect the whole body; size/framing
+errors invalidate reuse. The exchange budget covers producer pauses, upload
+and response without reset. This is send-first, not full-duplex HTTP upload:
+`Expect: 100-continue`, concurrent early-response reads and request trailers
+are unsupported. A peer that rejects without consuming may require the total
+deadline to end blocked writes. No business request is automatically retried.
+
+`client::HttpClient` / `HttpsClient` own resolver/dial/pool composition above
+HTTP's transport-independent layer. Pools use normalized host/port origins,
+matching Host headers, bounded origins/connections and lazy idle expiry.
+Instances never share pools, even when sharing a fixed TLS factory; HTTPS
+negotiates HTTP/1.1 only, not implicit H2. One acquire budget covers DNS, TCP,
+TLS, upload and response. Sessions heap-pin connection state, including through
+lazy tasks. Body spans remain borrowed; started tasks must finish on the owning
+loop. Recycling requires a drained reusable response and no retained session
+tasks. Otherwise recycle fails; destruction discards, never silently returns a
+partially consumed connection to the pool. No background reads detect idle
+peer closure, and a failed reuse does not replay the request.
+
+### QUIC paths, tickets and raw early data
+
+`quic::Options::migration` defaults to `MigrationPolicy::fixed_peer`.
+`validated` opt-in enables ngtcp2 path validation for migration/NAT rebinding;
+matching a known CID alone never authorizes a new peer. Use path-aware
+`receive(Path, ...)`, `poll_datagram` and `close_datagram`. Clients use
+`initiate_migration`; `validated_path` and pending state expose progress.
+Applications keep both required paths alive during validation and send packets
+using the returned path. A fixed-local-socket adapter cannot magically move a
+socket to another local endpoint. Dispatcher peer bookkeeping advances with
+the validated path, while fixed-peer mode continues dropping changed sources.
+
+`SessionCache` is a bounded, single-threaded, in-memory ticket cache with
+entry/byte/per-ticket/lifetime limits, no disk export and cleansing on removal.
+Resumption and 0-RTT require an explicit `ca_file`: the cache key includes a
+SHA-256 fingerprint of the actual loaded store, covering certificate AUX trust
+and rejection attributes plus CRLs. It does not re-read a path separately from
+OpenSSL loading, avoiding a hash/load race. Replacing trust material at the same
+path therefore cannot resume an old trust domain. An empty `ca_file` selects
+system trust, whose lazy directory/provider sources cannot be fully snapshotted;
+no tickets are stored or resumed, and a fresh authenticated handshake is required.
+A loaded connection retains its trust snapshot; file edits do not revoke it.
+`ServerContext` explicitly shares a server ticket domain with immutable
+certificate, ALPN, scope and limits. Normal `open_stream` / `write` do not send
+early data. Raw QUIC 0-RTT additionally requires `EarlyDataPolicy::replay_safe`,
+a compatible cached ticket and explicit `open_early_stream` / `write_early`.
+Applications inspect `early_data_status` and own the replay-safety decision;
+rejected data is never replayed automatically. This provides no anti-replay
+guarantee. HTTP/3 needs remembered SETTINGS/QPACK policy beyond a QUIC ticket:
+its engine rejects the early-data opt-in with `not_supported`. H3 0-RTT is not
+implemented. Retry tokens also are not guaranteed single-use or replay-proof.
+
+### H2/H3 Extended CONNECT and WebSocket
+
+Set `Limits::enable_connect_protocol` explicitly. A client waits for actual
+peer `SETTINGS_ENABLE_CONNECT_PROTOCOL` before submitting `request_stream`
+with `:method=CONNECT`, `:protocol`, `:scheme`, `:authority` and `:path`.
+Servers accept using `respond_stream`. Successful 2xx establishes a tunnel,
+except status 204: pinned nghttp2/nghttp3 treat it as bodyless, so Mira returns
+`not_supported` rather than claiming a usable tunnel. Ordinary CONNECT proxying
+is not implemented. Tunnel consumption returns flow-control credit; unread and
+retained output remain bounded. FIN and RESET stay distinct terminal states.
+
+`http2::ConnectStream<Driver>` / `http3::ConnectStream<Driver>` borrow accepted
+streams and stable engine/driver objects. Drivers supply
+`progress(OperationOptions)` / `flush(OperationOptions)` returning
+`Task<Result<void>>`, serialize connection I/O and honor budgets. One adapter
+allows one operation at a time, not a simultaneous read/write pair. The caller
+owns cross-stream scheduling and all borrowed lifetimes; do not mix direct body
+operations with adapter I/O. `finish` half-closes local output, while
+close/cancellation resets the stream. A connection-level driver failure can
+still affect other streams. Destruction during a pending operation aborts.
+
+WebSocket `extended_connect_request`, `accept_extended_connect` and
+`validate_extended_connect` validate complete fields and negotiate subprotocols
+and optional permessage-deflate; lower-level field-only negotiation helpers
+also exist. After SETTINGS, accepted-stream and transport-security checks,
+pass the resulting `Negotiated` to `Connection::adopt_extended_connect`.
+No HTTP/1 Upgrade, nonce or accept-digest exchange runs on this path. These
+helpers do not perform network I/O or relax ConnectStream's single-operation
+contract. The default compression policy remains disabled.
+
+### Managed serving and grace shutdown
+
+`tcp::serve(loop, listener, handler, options)` stops admission, drains accept,
+closes the listener and lets existing handlers finish during `grace_period`.
+It then requests cooperative cancellation and joins all work. Admission
+`io.deadline` is separate from optional `handler_deadline`. Zero grace cancels
+immediately; a positive grace requires the EventLoop overload. Handler
+exceptions skip grace and cancel siblings, then rethrow after cleanup. Grace
+bounds when cancellation is requested, never forces destruction of a suspended
+handler or guarantees a hard serve-return deadline.
+
+With TLS and H2 enabled, `mira_https_managed_server` demonstrates separate
+connection/handshake admission, handshake deadlines, explicit H1/H2 ALPN
+dispatch, missing/unknown-ALPN refusal and drain/cancel/join. It serves one H1
+request or one H2 batch per connection; it is a composition example, not a
+complete production HTTP server. `mira_loop_group_server` demonstrates separate
+worker loops, not cross-worker transfer of already attached sockets.
+
+## Verification snapshots and remaining evidence
+
+- Commit `d3424f0`: CI 17/17 and official Autobahn 25.10.1 including compression,
+  517 cases per role (514 OK + 3 INFORMATIONAL), 1,034 total (1,028 OK +
+  6 INFORMATIONAL), zero failures/NON-STRICT/missing/excluded cases.
+- Final 2026-09-28 source including trust-bound ticket caching: local AppleClang
+  Release, GCC and ASan+UBSan each passed 85/85; installed-consumer and dependency
+  isolation checks passed. macOS LeakSanitizer was not run. This is local evidence,
+  not a substitute for this revision's remote cross-platform CI.
+- Trust-cache fix: Release affected QUIC/H3/CONNECT regression 22/22; final
+  targeted normal-resumption plus four trust tests 5/5 each on Release, GCC
+  and ASan+UBSan. Tests cover same-path CA rotation with/without 0-RTT, an
+  unchanged certificate with AUX serverAuth rejection, and uncached default
+  system trust. macOS uses `detect_leaks=0`; this is not LeakSanitizer evidence.
+- Latest `ws.connect_network`: real TCP H2 and UDP H3, each with compression
+  off/on, four passing scenarios. This is same-library networking, not an
+  independent CONNECT peer. The first-Initial-flight drop setting was removed;
+  this test does not establish PTO recovery.
+- `build/all-main/sustained-600.json`: 600-second real-UDP H3 loopback soak,
+  13,548/13,548 requests and 10,161/10,161 short streams completed during slow
+  response overlap. Final connections/routes/tombstones/queued bytes/reserved
+  payload bytes are all zero. One host, not multi-host/WAN or an RSS limit.
+- New Windows independent-H3/MinGW entry points have only 3/3 parameter unit
+  tests, not actual entry-point runs. iOS host smoke and unsigned cross-build
+  passed; a signing profile is missing for device execution. Android device
+  runs, multi-host/WAN and longer resource measurements remain without evidence.
 
 ## What CI found that local testing could not
 
@@ -470,20 +636,27 @@ run is worth doing anyway. It turns a class of mistake that would otherwise
 cost a twenty-minute CI round trip into a local error message, without
 pretending to be verification.
 
+## Next-phase goals
+
+HTTP/3 0-RTT, HTTP/1 `Expect: 100-continue` and concurrent early-response reads,
+plus independent MQTT, SOCKS5 and DoH modules are deferred to the next phase.
+They are not included in this delivery. Release and downstream migrations remain
+separate from work on Mira itself.
+
 ## Decisions on record
 
 | Decision | Choice | Why |
 |---|---|---|
 | **I/O model** | **completion-shaped public API** | A common operation contract for IOCP and reactor implementations |
-| Platform scope | macOS, Linux and Windows runtime targets; iOS/Android targets currently cross-compiled | Runtime correctness must be demonstrated per platform; BSD has no dedicated CI evidence |
+| Platform scope | Desktop runtime targets; iOS host smoke/unsigned cross-build and Android cross-build | Device execution is not yet evidenced; new Windows H3/MinGW entry points also need runs; BSD has no dedicated CI evidence |
 | Readiness API | POSIX-only, behind an explicit macro | A platform extension, not part of the portable operation contract |
-| Execution model | Lazy `Task<T>` with explicit single-threaded `TaskScope` spawn / join | Owned child frames and cooperative stop are implemented; full I/O cancellation and deadlines remain acceptance work |
+| Execution model | Lazy `Task<T>`, single-threaded `TaskScope` spawn/join and independent-worker `LoopGroup` | Bounded root-task admission does not make one loop or its sockets multi-thread-safe; suspended tasks cannot be arbitrarily destroyed |
 | Library form | Compiled library with modular public headers | Keep implementation boundaries explicit; an ABI policy must be decided before stabilization |
 | Error model | `std::error_code` + `Result<T>` for operational failures | `Task` can still propagate body exceptions; this is not a no-exceptions guarantee |
 | Standard floor | C++23-only build; `Result<T>` directly aliases `std::expected<T, Error>` | Validate each toolchain and standard library; no C++20 compatibility mandate |
 | Buffer shape | Current `Buffer` is contiguous | Future segmented or borrowed-buffer designs need measured benefit and an explicit ownership contract |
 | Framework coupling | No host-framework dependency or old Aria API compatibility promise | Consumers adapt to the independent library after its contracts are established |
-| Protocol scope | HTTP/1.1 and optional TLS exercise the core; later protocols remain proposals | Stabilize lifecycle and resource semantics before broadening scope |
+| Protocol scope | HTTP/1.1, TLS, WebSocket/WSS, HTTP/2, QUIC and HTTP/3 are implemented modules | Track protocol implementation separately from independent interoperability and per-platform runtime evidence |
 
 ## Staged acceptance
 
@@ -502,9 +675,9 @@ configuration; the historical milestones below do not certify these gates.
    repeated cancellation and simultaneous completion. Require exactly-once
    completion and no dangling kernel buffers, resumptions or resource leaks
    across kqueue, epoll and IOCP, using applicable sanitizers and fault injection.
-3. **Bounded composable data flow.** Incremental body consumption is delivered
-   (`RequestBodyReader`); the open half is producer/consumer limits. Verify
-   short transfers, partial failures,
+3. **Bounded composable data flow.** Incremental body consumption, HTTP/1
+   uploads and bounded H2/H3 outputs are delivered; acceptance still requires
+   end-to-end producer/consumer measurements. Verify short transfers, partial failures,
    early termination and slow peers over memory streams, TCP and TLS; measure
    peak memory and outstanding work against configured bounds. Datagram
    semantics are defined and delivered; UDP-based modules now owe conformance
@@ -605,9 +778,10 @@ Tests generate fresh private CA/certificate/key fixtures at runtime; no private
 keys are committed. HTTPS exercises the existing HTTP loop unchanged, with
 trusted/untrusted chains, DNS and IP identity mismatches, short encrypted I/O,
 large payloads, orderly close and truncated TCP. The optional TLS CI matrix is
-separate from the dependency-free build. iOS/Android jobs currently compile all
-non-TLS libraries only; target OpenSSL and mobile TLS runtime validation remain
-outstanding. BSD also has no dedicated CI evidence.
+separate from the dependency-free build. Mobile base-library cross-compilation
+and iOS host smoke/unsigned app builds are not mobile TLS runtime validation;
+iOS device execution lacks a signing profile and Android has no device evidence.
+BSD also has no dedicated CI evidence.
 
 This integration also fixes HTTP EOF before the end of a partial request head
 being mistaken for idle disconnect, and rejects a zero read-chunk policy.
@@ -626,8 +800,9 @@ destroying or re-entering a dispatching loop, both became terminating refusals
 rather than undefined behaviour. Two bugs that were live before this work also
 went: `run_once` stranded already-extracted operations when re-arming its
 wake-up pipe failed, and the HTTP grammar existed as two independent copies.
-Options are now forwarded by transport, TLS and HTTP. UDP and system resolver
-waits use the same cancellation/deadline foundation. Cancelling a system
+Options now reach transport, TLS and HTTP; TLS enforces application deadlines
+with its own timers rather than forwarding them to ciphertext I/O. UDP and
+system resolver waits use the same cancellation/deadline foundation. Cancelling a system
 resolver wait does not interrupt getaddrinfo; worker-owned state outlives the
 wait without retaining the loop.
 
@@ -661,8 +836,11 @@ cancellation-safety claim.
 resolution, HTTP/1 client, HTTP/2 engines and request-body streaming exist.
 QUIC/HTTP3 have real UDP scheduling, CID-routed multi-client dispatchers,
 closing/draining protection and optional Retry source-address validation.
-Mobile protocol runtime acceptance, native OS trust-store integration,
-process-wide memory bounds and multi-threaded loops remain incomplete.
+Opt-in validated migration, bounded ticket resumption, raw-QUIC early data and
+H2/H3 Extended CONNECT now exist, with the boundaries described above.
+Mobile protocol runtime acceptance, native OS trust-store integration and
+process-wide memory bounds remain incomplete. `LoopGroup` supplies independent
+thread-affine loops, not concurrent pumping of one loop.
 mTLS policy is available on `tls::Context`; protocol queue and payload
 budgets are not hard process-RSS bounds.
 Judge the current tested snapshot by the repository's own CI and tests rather

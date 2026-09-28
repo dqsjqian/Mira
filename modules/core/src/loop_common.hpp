@@ -10,6 +10,7 @@
 
 #include "mira/core/error.hpp"
 #include "mira/core/operation.hpp"
+#include "mira/core/resource_budget.hpp"
 
 #include <chrono>
 #include <coroutine>
@@ -344,10 +345,40 @@ template<typename Impl>
     return [](OperationId) noexcept {};
 }
 
+/// Keep admission charged even after a queue is swapped into a dispatch
+/// batch. Move the callable out so captures are released as soon as invocation
+/// returns, not on the next loop turn. Both release and invocation are outside
+/// the backend lock; a destructor may itself post work.
+[[nodiscard]] inline move_only_function<void()> budgeted_post(
+    move_only_function<void()> work, ResourceBudget::Reservation reservation) {
+    return [work = std::move(work), reservation = std::move(reservation)]() mutable {
+        auto running = std::move(work);
+        reservation.reset();
+        running();
+    };
+}
+
+/// One throwing application callback must not strand later reliable control
+/// callbacks already removed from the queue. Finish the batch, then propagate
+/// the first exception to the host's pump boundary.
+inline void dispatch_posts(std::vector<move_only_function<void()>>& batch) {
+    std::exception_ptr failure;
+    for (auto& work : batch) {
+        auto running = std::move(work);
+        try {
+            running();
+        } catch (...) {
+            if (!failure) failure = std::current_exception();
+        }
+    }
+    batch.clear();
+    if (failure) std::rethrow_exception(failure);
+}
+
 /// Work queued by `post()`, drained on the loop thread.
 class PostQueue {
 public:
-    void push(move_only_function<void()> work) { queued_.push_back(std::move(work)); }
+    void push(move_only_function<void()>&& work) { queued_.push_back(std::move(work)); }
 
     [[nodiscard]] bool empty() const noexcept { return queued_.empty(); }
     [[nodiscard]] std::size_t size() const noexcept { return queued_.size(); }

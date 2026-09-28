@@ -1,3 +1,9 @@
+add_executable(mira_ws_extended_negotiation_tests test_extended_connect_negotiation.cpp)
+target_link_libraries(mira_ws_extended_negotiation_tests PRIVATE Mira::ws Mira::warnings)
+target_include_directories(mira_ws_extended_negotiation_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+add_test(NAME ws.extended_negotiation COMMAND mira_ws_extended_negotiation_tests)
+set_tests_properties(ws.extended_negotiation PROPERTIES TIMEOUT 30)
+
 add_executable(mira_ws_negotiation_tests test_negotiation.cpp)
 target_link_libraries(mira_ws_negotiation_tests PRIVATE Mira::ws Mira::warnings)
 target_include_directories(mira_ws_negotiation_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)

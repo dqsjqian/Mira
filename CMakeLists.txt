@@ -90,6 +90,7 @@ function(mira_install_module target)
     set(export_set miraTargets)
     foreach(entry
             "mira_tls=miraTlsTargets"
+            "mira_client_tls=miraClientTlsTargets"
             "mira_crypto=miraCryptoTargets"
             "mira_ws=miraWsTargets"
             "mira_http2=miraHttp2Targets"
@@ -147,6 +148,17 @@ if(MIRA_ENABLE_HTTP3)
     add_subdirectory(modules/http3)
 endif()
 
+add_subdirectory(modules/client)
+
+if(MIRA_BUILD_TESTS AND MIRA_ENABLE_WEBSOCKET AND MIRA_ENABLE_HTTP2 AND MIRA_ENABLE_HTTP3)
+    add_executable(mira_ws_connect_network modules/ws/tests/test_connect_network.cpp)
+    target_link_libraries(mira_ws_connect_network PRIVATE
+        Mira::ws Mira::http2 Mira::http3 Mira::transport Mira::warnings)
+    add_test(NAME ws.connect_network COMMAND mira_ws_connect_network
+        "${MIRA_QUIC_TEST_CERT}" "${MIRA_QUIC_TEST_KEY}")
+    set_tests_properties(ws.connect_network PROPERTIES TIMEOUT 90)
+endif()
+
 # ── Benchmarks ──────────────────────────────────────────────────────────────
 # The bench gate lives in bench/CMakeLists.txt; it needs the option declared
 # here so `cmake -DMIRA_BUILD_BENCH=ON` is visible before the subdirectory.
@@ -162,6 +174,9 @@ endif()
 # ── Examples ────────────────────────────────────────────────────────────────
 
 if(MIRA_BUILD_EXAMPLES)
+    add_executable(mira_loop_group_server examples/loop_group_server.cpp)
+    target_link_libraries(mira_loop_group_server PRIVATE Mira::core Mira::transport Mira::warnings)
+
     add_executable(mira_echo_server examples/echo_server.cpp)
     target_link_libraries(mira_echo_server PRIVATE Mira::transport Mira::warnings)
 
@@ -185,6 +200,11 @@ if(MIRA_BUILD_EXAMPLES)
             add_executable(mira_${example} examples/${example}.cpp)
             target_link_libraries(mira_${example} PRIVATE Mira::ws Mira::transport Mira::warnings)
         endforeach()
+    endif()
+    if(MIRA_ENABLE_TLS AND MIRA_ENABLE_HTTP2)
+        add_executable(mira_https_managed_server examples/https_managed_server.cpp)
+        target_link_libraries(mira_https_managed_server PRIVATE
+            Mira::tls Mira::http Mira::http2 Mira::transport Mira::warnings)
     endif()
     if(MIRA_ENABLE_HTTP2)
         add_executable(mira_h2_prior_knowledge_server examples/h2_prior_knowledge_server.cpp)
@@ -240,6 +260,12 @@ if(MIRA_BUILD_EXAMPLES)
                     $<TARGET_FILE:mira_tiny_file_server>
             )
             set_tests_properties(mira_tiny_file_server_example PROPERTIES TIMEOUT 120)
+            if(TARGET mira_https_managed_server)
+                add_test(NAME mira_managed_https
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_managed_https.py
+                        $<TARGET_FILE:mira_https_managed_server>)
+                set_tests_properties(mira_managed_https PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+            endif()
             if(TARGET mira_ws_server)
                 add_test(NAME mira_ws_interop
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_ws_interop.py
@@ -304,8 +330,8 @@ if(MIRA_INSTALL)
         DESTINATION ${MIRA_CMAKE_DESTINATION}
     )
 
-    foreach(optional_module IN ITEMS Tls Crypto Ws Http2 Quic Http3)
-        if((optional_module STREQUAL "Tls" AND MIRA_ENABLE_TLS)
+    foreach(optional_module IN ITEMS Tls ClientTls Crypto Ws Http2 Quic Http3)
+        if(((optional_module STREQUAL "Tls" OR optional_module STREQUAL "ClientTls") AND MIRA_ENABLE_TLS)
            OR ((optional_module STREQUAL "Crypto" OR optional_module STREQUAL "Ws") AND MIRA_ENABLE_WEBSOCKET)
            OR (optional_module STREQUAL "Http2" AND MIRA_ENABLE_HTTP2)
            OR ((optional_module STREQUAL "Quic" OR optional_module STREQUAL "Http3") AND MIRA_ENABLE_HTTP3))

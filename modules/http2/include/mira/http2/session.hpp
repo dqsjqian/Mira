@@ -1,6 +1,8 @@
 #pragma once
 
 #include "mira/core/error.hpp"
+#include "mira/core/resource_budget.hpp"
+#include <optional>
 #include "mira/http2/headers.hpp"
 
 #include <cstddef>
@@ -24,6 +26,16 @@ struct Limits {
     std::size_t max_queued_body_bytes = 4 * 1024 * 1024;
     std::size_t max_output_bytes = 64 * 1024;
     std::size_t max_queued_frames = 256;
+    bool enable_connect_protocol = false;
+};
+
+struct ConnectState {
+    std::string protocol;
+    bool accepted = false;
+    bool local_end = false;
+    bool remote_end = false;
+    bool closed = false;
+    Error error;
 };
 
 struct Stream {
@@ -40,11 +52,15 @@ struct Stream {
 
 // Single-threaded, I/O-free HTTP/2 prior-knowledge engine. TLS callers must confirm ALPN=h2 first.
 // Closed streams still count against the quota until release; body flow-control credit is returned
-// only after take_body. Server push, CONNECT, h2c Upgrade, and sending informational/trailers are
-// not supported.
+// only after take_body/read_connect. Extended CONNECT is opt-in; ordinary CONNECT, server push,
+// h2c Upgrade, and sending informational/trailers are not supported.
+// The pinned dependency treats 204 as bodyless; 204 tunnels are explicitly unsupported.
 class Session {
 public:
-    static Result<Session> create(Role role, Limits limits = {});
+    // Conservative lifetime reservation for retained headers/bodies and wire
+    // queues, excluding nghttp2 internals, allocator overhead and returned data.
+    static Result<Session> create(Role role, Limits limits = {},
+                                  std::optional<ResourceBudget> budget = {});
     ~Session();
     Session(Session&&) noexcept;
     Session& operator=(Session&&) noexcept;
@@ -62,6 +78,13 @@ public:
     Result<void> write_body(std::int32_t id, std::span<const std::byte> body, bool end = false);
     Result<void> finish_body(std::int32_t id);
     std::size_t queued_body_bytes() const noexcept;
+    bool peer_connect_protocol_enabled() const noexcept;
+    bool local_connect_protocol_enabled() const noexcept;
+    bool local_connect_protocol_acknowledged() const noexcept;
+    Result<ConnectState> connect_state(std::int32_t id) const;
+    // Nonblocking tunnel I/O: would_block consumes nothing. Only accepted 2xx streams qualify.
+    Result<std::size_t> read_connect(std::int32_t id, std::span<std::byte> destination);
+    Result<std::size_t> write_connect(std::int32_t id, std::span<const std::byte> source);
     Result<void> receive(std::span<const std::byte> bytes);
     Result<std::vector<std::byte>> output();
     Result<std::vector<std::byte>> take_body(std::int32_t id);

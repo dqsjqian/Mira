@@ -2,6 +2,7 @@
 """Verify packages, components, linking and execution from an isolated installed SDK."""
 
 import argparse
+import contextlib
 from pathlib import Path
 import subprocess
 import tempfile
@@ -64,19 +65,27 @@ def main():
     parser.add_argument('--build-dir', type=Path, required=True)
     parser.add_argument('--config', default='Debug')
     parser.add_argument('--expect-http3-only', action='store_true')
+    parser.add_argument('--output-dir', type=Path, help='retain evidence in a new directory instead of temporary cleanup')
     args = parser.parse_args()
     build = args.build_dir.resolve()
     cache = cache_values(build)
-    installed = ['core', 'transport', 'http']
+    installed = ['core', 'transport', 'http', 'client']
     for component, option in [('tls', 'TLS'), ('ws', 'WEBSOCKET'), ('http2', 'HTTP2'), ('http3', 'HTTP3')]:
         if cache.get('MIRA_ENABLE_' + option) == 'ON':
             installed.append(component)
     if 'http3' in installed:
         installed.append('quic')
+    if 'tls' in installed:
+        installed.append('client_tls')
     if args.expect_http3_only and ('http3' not in installed or 'http2' in installed):
         raise RuntimeError('This mode requires HTTP3=ON and HTTP2=OFF')
 
-    with tempfile.TemporaryDirectory(prefix='mira-install-consumer-') as temporary:
+    if args.output_dir:
+        args.output_dir = args.output_dir.resolve()
+        args.output_dir.mkdir(parents=True, exist_ok=False)
+    workspace = (contextlib.nullcontext(str(args.output_dir)) if args.output_dir else
+                 tempfile.TemporaryDirectory(prefix='mira-install-consumer-'))
+    with workspace as temporary:
         root = Path(temporary)
         prefix = root / 'prefix'
         run(['cmake', '--install', str(build), '--prefix', str(prefix),
@@ -174,6 +183,34 @@ int main() {
     auto compressed = codec->encode(frame);
     return compressed && compressed->compressed && compressed->payload.size() < frame.payload.size() ? 0 : 2;
 }
+''')
+        case('client-api', 'COMPONENTS client', links='client', hidden=True, source='''
+#include <mira/client/http.hpp>
+int main() {
+    auto loop = Mira::EventLoop::create();
+    if (!loop) return 1;
+    auto client = Mira::client::HttpClient::create(*loop, {});
+    return client && client->active_and_idle() == 0 ? 0 : 2;
+}
+''')
+        if 'client_tls' in installed:
+            case('client-tls-api', 'COMPONENTS client_tls', links='client_tls', source='''
+#include <mira/client/https.hpp>
+int main() {
+    auto loop = Mira::EventLoop::create();
+    auto factory = Mira::client::HttpsFactory::create();
+    if (!loop || !factory) return 1;
+    auto client = Mira::client::HttpsClient::create(*loop, std::move(*factory));
+    return client && client->active_and_idle() == 0 ? 0 : 2;
+}
+''')
+        case('client-tls-required-hidden', 'COMPONENTS client_tls', hidden=True, success=False,
+             diagnostic="Mira component 'client_tls' is unavailable")
+        case('client-tls-optional-hidden', 'COMPONENTS client OPTIONAL_COMPONENTS client_tls',
+             hidden=True, checks='''
+if(NOT Mira_client_FOUND OR Mira_client_tls_FOUND OR TARGET Mira::client_tls)
+  message(FATAL_ERROR "Client TLS dependency isolation failed")
+endif()
 ''')
         case('unknown-required', 'COMPONENTS unknown', success=False,
              diagnostic="Mira component 'unknown' is unavailable")

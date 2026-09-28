@@ -45,8 +45,8 @@ struct BodyChunk {
 };
 
 /// HTTP/3 over one datagram transport. One connection per socket, mirroring
-/// quic::Connection; a listener that routes many clients by connection ID is
-/// not provided yet. Operations must not overlap; `read_body` pumps until
+/// quic::Connection; use http3::Server for CID-routed multi-client service.
+/// This convenience wrapper uses a fixed peer. Operations must not overlap; `read_body` pumps until
 /// the stream produces.
 ///
 /// Constrained by the same `DatagramTransport` concept as `quic::Connection`,
@@ -64,9 +64,15 @@ public:
     /// control-stream setup to completion.
     [[nodiscard]] static Task<Result<Connection>>
     connect(EventLoop& loop, quic::Options options, Limits limits = {}, OperationOptions io = {}) {
+        if (options.migration != quic::MigrationPolicy::fixed_peer) co_return fail(Errc::not_supported);
         const transport::Endpoint remote = options.remote;
         auto bound = Transport::bind(loop, options.local);
         if (!bound) co_return fail(bound.error());
+        if constexpr (requires { bound->local_endpoint(); }) {
+            auto local = bound->local_endpoint();
+            if (!local) co_return fail(local.error());
+            options.local = *local;
+        }
         auto transport_engine = quic::Engine::client(std::move(options), detail::now_ns());
         if (!transport_engine) co_return fail(transport_engine.error());
         auto engine = Engine::create(std::move(*transport_engine),
@@ -87,6 +93,7 @@ public:
                                                         Limits limits,
                                                         std::span<const std::byte> initial,
                                                         OperationOptions io = {}) {
+        if (options.migration != quic::MigrationPolicy::fixed_peer) co_return fail(Errc::not_supported);
         // The remote is part of the options: whoever sent the Initial.
         const transport::Endpoint remote = options.remote;
         auto transport_engine = quic::Engine::accept(std::move(options), initial, detail::now_ns());

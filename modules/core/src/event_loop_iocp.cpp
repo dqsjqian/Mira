@@ -813,9 +813,7 @@ public:
         for (const auto& [id, outcome] : resolved) {
             finalize(id, outcome);
         }
-        for (auto& work : to_run) {
-            work();
-        }
+        detail::dispatch_posts(to_run);
 
         return Result<void>{};
     }
@@ -1143,6 +1141,14 @@ void EventLoop::detach(NativeHandle handle) {
 
 void EventLoop::post(move_only_function<void()> work) {
     (void)impl_->post(std::move(work));
+}
+
+Result<void> EventLoop::try_post(move_only_function<void()> work,
+                                 const ResourceBudget& budget, std::size_t cost) {
+    if (!impl_ || impl_->shutting_down()) return fail(Errc::cancelled);
+    auto reserved = budget.try_acquire(cost);
+    if (!reserved) return fail(reserved.error());
+    return impl_->post(detail::budgeted_post(std::move(work), std::move(*reserved)));
 }
 void EventLoop::stop() {
     impl_->stop();

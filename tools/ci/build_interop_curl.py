@@ -21,6 +21,37 @@ DIGEST = "40c8cddbcb6cc6251c03dea423a472a6cea4037be654ba5cf5dec6eb2d22ff1d"
 REPO = Path(__file__).resolve().parents[2]
 
 
+def static_dependency(prefix, name, windows):
+    names = (f"{name}_static.lib", f"lib{name}_static.a", f"lib{name}.a") if windows else (f"lib{name}.a",)
+    for filename in names:
+        candidate = prefix / "lib" / filename
+        if candidate.is_file():
+            return candidate
+    raise ValueError(f"static {name} library not found in dependency prefix")
+
+
+def configuration_arguments(args, prefix, openssl, install, windows):
+    options = [f"-DCMAKE_BUILD_TYPE={args.config}", f"-DCMAKE_TRY_COMPILE_CONFIGURATION={args.config}",
+               f"-DCMAKE_PREFIX_PATH={prefix};{openssl}", f"-DOPENSSL_ROOT_DIR={openssl}",
+               f"-DCMAKE_INSTALL_PREFIX={install}"]
+    if args.generator:
+        options += ["-G", args.generator]
+    if args.architecture:
+        options += ["-A", args.architecture]
+    if args.toolchain:
+        options += [f"-DCMAKE_TOOLCHAIN_FILE={args.toolchain.resolve().as_posix()}"]
+    if windows:
+        options += ["-DCURL_USE_PKGCONFIG=OFF", "-DCURL_USE_SCHANNEL=OFF",
+                    "-DCMAKE_C_FLAGS=-DNGTCP2_STATICLIB -DNGHTTP3_STATICLIB -DNGHTTP2_STATICLIB"]
+        for variable, library in (("NGTCP2_LIBRARY", "ngtcp2"),
+                                  ("NGTCP2_CRYPTO_OSSL_LIBRARY", "ngtcp2_crypto_ossl"),
+                                  ("NGHTTP3_LIBRARY", "nghttp3"), ("NGHTTP2_LIBRARY", "nghttp2")):
+            options += [f"-D{variable}={static_dependency(prefix, library, windows).as_posix()}"]
+        for library in ("NGTCP2", "NGHTTP3", "NGHTTP2"):
+            options += [f"-D{library}_INCLUDE_DIR={(prefix / 'include').as_posix()}"]
+    return options
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prefix", type=Path, default=REPO / "build/protocol-deps/prefix")
@@ -28,7 +59,13 @@ def main() -> None:
     parser.add_argument("--path", type=Path, default=REPO / "build/interop-curl")
     parser.add_argument("--jobs", type=positive_jobs, default=4)
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--config", choices=("Debug", "Release", "RelWithDebInfo", "MinSizeRel"), default="Release")
+    parser.add_argument("--generator", "-G")
+    parser.add_argument("--architecture", "-A")
+    parser.add_argument("--toolchain", type=Path)
     args = parser.parse_args()
+    if args.toolchain and not args.toolchain.is_file():
+        parser.error("--toolchain must name an existing file")
     work = output_path(args.path)
     prefix = args.prefix.resolve()
     openssl = args.openssl_root.resolve()
@@ -74,16 +111,15 @@ def main() -> None:
                                 for name in ("libssl.a", "libcrypto.a"))
             extra.append(f"-DCMAKE_C_STANDARD_LIBRARIES={tls_tail} -ldl -pthread")
         run(["cmake", "-S", str(source), "-B", str(build),
-             "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_PREFIX_PATH={prefix}",
-             f"-DOPENSSL_ROOT_DIR={openssl}", f"-DCMAKE_INSTALL_PREFIX={install}",
+             *configuration_arguments(args, prefix, openssl, install, os.name == "nt"),
              "-DCURL_USE_OPENSSL=ON", "-DUSE_NGTCP2=ON", "-DUSE_NGHTTP2=ON",
              "-DBUILD_SHARED_LIBS=OFF", "-DBUILD_STATIC_LIBS=ON", "-DBUILD_STATIC_CURL=ON",
              "-DBUILD_TESTING=OFF", "-DBUILD_LIBCURL_DOCS=OFF", "-DBUILD_MISC_DOCS=OFF",
              "-DCURL_USE_LIBPSL=OFF", "-DCURL_USE_LIBSSH2=OFF",
              "-DCURL_BROTLI=OFF", "-DCURL_ZSTD=OFF", *extra])
-        run(["cmake", "--build", str(build), "--parallel", str(args.jobs)])
-        run(["cmake", "--install", str(build)])
-    binary = install / "bin/curl"
+        run(["cmake", "--build", str(build), "--config", args.config, "--parallel", str(args.jobs)])
+        run(["cmake", "--install", str(build), "--config", args.config])
+    binary = install / "bin" / ("curl.exe" if os.name == "nt" else "curl")
     version = subprocess.check_output([str(binary), "--version"], text=True, timeout=10)
     print(version)
     if "HTTP3" not in version:

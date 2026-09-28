@@ -1,3 +1,11 @@
+if(MIRA_ENABLE_WEBSOCKET)
+    add_executable(test_http3_connect test_connect.cpp)
+    target_link_libraries(test_http3_connect PRIVATE Mira::http3 Mira::ws Mira::transport Mira::warnings mira_nghttp3)
+    target_include_directories(test_http3_connect PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+    add_test(NAME http3_connect COMMAND test_http3_connect "${MIRA_QUIC_TEST_CERT}" "${MIRA_QUIC_TEST_KEY}")
+    set_tests_properties(http3_connect PROPERTIES TIMEOUT 60)
+endif()
+
 add_executable(test_http3_engine test_engine.cpp)
 target_link_libraries(test_http3_engine PRIVATE Mira::http3)
 foreach(mode normal chaos small-budget)

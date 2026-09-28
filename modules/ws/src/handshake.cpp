@@ -1,4 +1,4 @@
-#include "mira/ws/handshake.hpp"
+#include "mira/ws/extended_connect.hpp"
 #include "mira/crypto/crypto.hpp"
 
 #include <algorithm>
@@ -279,6 +279,35 @@ std::optional<Deflate> select_deflate(const std::vector<Extension>& offers, cons
     }
     return {};
 }
+Result<Negotiated> negotiate_selection(const Head& head, const HandshakeOptions& options) {
+    auto selected = protocols(head);
+    if (!selected) return fail(selected.error());
+    Negotiated result;
+    if (selected->size() > 1 || (selected->empty() && options.require_subprotocol))
+        return fail(make_error_code(Errc::invalid_handshake));
+    if (!selected->empty()) {
+        if (std::find(options.subprotocols.begin(), options.subprotocols.end(), selected->front()) == options.subprotocols.end())
+            return fail(make_error_code(Errc::invalid_handshake));
+        result.subprotocol = selected->front();
+    }
+    auto selected_extensions = extensions(head);
+    if (!selected_extensions) return fail(selected_extensions.error());
+    if (selected_extensions->empty()) return result;
+    const auto& offered = options.compression;
+    if (!offered.enabled || selected_extensions->size() != 1 || selected_extensions->front().name != "permessage-deflate")
+        return fail(make_error_code(Errc::invalid_handshake));
+    auto parameters = deflate_parameters(selected_extensions->front(), true);
+    if (!parameters) return fail(parameters.error());
+    if ((offered.server_no_context_takeover && !parameters->server_no_context_takeover) ||
+        (offered.server_max_window_bits && (!parameters->server_max_window_bits ||
+         *parameters->server_max_window_bits > *offered.server_max_window_bits)) ||
+        (parameters->client_window_present && !offered.offer_client_max_window_bits && !offered.client_max_window_bits) ||
+        parameters->client_max_window_bits == 8)
+        return fail(make_error_code(Errc::invalid_handshake));
+    // Client send preferences are not response bounds; the codec honors local commitments.
+    result.compression = agreed(*parameters);
+    return result;
+}
 }
 Result<std::string> accept_key(std::string_view key) {
     if (!key_valid(key)) return fail(make_error_code(Errc::invalid_handshake));
@@ -378,34 +407,198 @@ Result<Negotiated> negotiate_client_handshake(std::string_view response, std::st
         auto c = static_cast<unsigned char>(byte);
         if (c < 32 || c == 127) return fail(make_error_code(Errc::invalid_handshake));
     }
-    auto selected = protocols(h);
-    if (!selected) return fail(selected.error());
-    Negotiated result;
-    if (selected->size() > 1 || (selected->empty() && options.require_subprotocol))
-        return fail(make_error_code(Errc::invalid_handshake));
-    if (!selected->empty()) {
-        if (std::find(options.subprotocols.begin(), options.subprotocols.end(), selected->front()) == options.subprotocols.end())
-            return fail(make_error_code(Errc::invalid_handshake));
-        result.subprotocol = selected->front();
+    return negotiate_selection(h, options);
+}
+namespace {
+bool uri_component(std::string_view value, std::string_view extra) {
+    constexpr std::string_view hex = "0123456789abcdefABCDEF";
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        const char c = value[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            std::string_view("-._~!$&'()*+,;=").find(c) != value.npos || extra.find(c) != extra.npos)
+            continue;
+        if (c != '%' || value.size() - i < 3 || hex.find(value[i + 1]) == hex.npos || hex.find(value[i + 2]) == hex.npos)
+            return false;
+        i += 2;
     }
-    auto selected_extensions = extensions(h);
-    if (!selected_extensions) return fail(selected_extensions.error());
-    if (selected_extensions->empty()) return result;
-    const auto& offered = options.compression;
-    if (!offered.enabled || selected_extensions->size() != 1 || selected_extensions->front().name != "permessage-deflate")
+    return true;
+}
+bool connect_target(std::string_view authority, std::string_view path) {
+    if (authority.empty() || !clean(authority) || authority.find_first_of("/?#@\\") != authority.npos ||
+        path.empty() || path.front() != '/' || !uri_component(path, ":@/?"))
+        return false;
+    std::string_view host = authority;
+    std::string_view port;
+    if (authority.front() == '[') {
+        const auto end = authority.find(']');
+        if (end == authority.npos || end == 1 || authority.substr(1, end - 1).find_first_of("[]") != authority.npos)
+            return false;
+        host = authority.substr(1, end - 1);
+        if (end + 1 != authority.size()) {
+            if (authority[end + 1] != ':') return false;
+            port = authority.substr(end + 2);
+            if (port.empty()) return false;
+        }
+    } else {
+        if (authority.find_first_of("[]") != authority.npos) return false;
+        const auto colon = authority.find(':');
+        if (colon != authority.npos) {
+            host = authority.substr(0, colon);
+            port = authority.substr(colon + 1);
+            if (port.empty()) return false;
+        }
+    }
+    return !host.empty() && uri_component(host, authority.front() == '[' ? ":" : "") &&
+           std::all_of(port.begin(), port.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+Result<Head> connect_fields(std::span<const http::Header> fields, Limits limits, bool response) {
+    Head head{};
+    std::size_t used = 0;
+    bool regular = false, pseudo = false;
+    for (const auto& field : fields) {
+        for (const auto size : {field.name.size(), field.value.size(), std::size_t{32}}) {
+            if (size > limits.max_handshake - used) return fail(Mira::Errc::limit_exceeded);
+            used += size;
+        }
+        if (field.name.empty()) return fail(make_error_code(Errc::invalid_handshake));
+        const bool is_pseudo = field.name.front() == ':';
+        const auto name = is_pseudo ? std::string_view(field.name).substr(1) : std::string_view(field.name);
+        if (!token(name) || lowercase(name) != name || trim(field.value) != field.value)
+            return fail(make_error_code(Errc::invalid_handshake));
+        for (const char byte : field.value) {
+            const auto c = static_cast<unsigned char>(byte);
+            if ((c < 32 && c != '\t') || c == 127) return fail(make_error_code(Errc::invalid_handshake));
+        }
+        if (is_pseudo) {
+            if (regular || field.value.empty() ||
+                (response ? field.name != ":status" :
+                 field.name != ":method" && field.name != ":protocol" && field.name != ":scheme" &&
+                 field.name != ":authority" && field.name != ":path"))
+                return fail(make_error_code(Errc::invalid_handshake));
+            pseudo = true;
+        } else {
+            regular = true;
+            if (field.name == "connection" || field.name == "upgrade" || field.name == "keep-alive" ||
+                field.name == "proxy-connection" || field.name == "transfer-encoding" ||
+                field.name == "content-length" || field.name == "sec-websocket-key" ||
+                field.name == "sec-websocket-accept" ||
+                (field.name == "te" && (response || field.value != "trailers")) ||
+                (response && field.name == "sec-websocket-version"))
+                return fail(make_error_code(Errc::invalid_handshake));
+        }
+        auto [it, inserted] = head.fields.emplace(field.name, field.value);
+        if (!inserted) {
+            if (response || (field.name != "sec-websocket-protocol" && field.name != "sec-websocket-extensions"))
+                return fail(make_error_code(Errc::invalid_handshake));
+            it->second += ',';
+            it->second += field.value;
+        }
+    }
+    if (pseudo) {
+        if (response) {
+            const auto& status = head.fields[":status"];
+            if (status.size() != 3 || status.front() < '1' || status.front() > '5' ||
+                !std::all_of(status.begin(), status.end(), [](char c) { return c >= '0' && c <= '9'; }))
+                return fail(make_error_code(Errc::invalid_handshake));
+        } else if (head.fields[":method"] != "CONNECT" || head.fields[":protocol"] != "websocket" ||
+                   (head.fields[":scheme"] != "https" && head.fields[":scheme"] != "http") ||
+                   !connect_target(head.fields[":authority"], head.fields[":path"]) ||
+                   (head.fields.contains("host") && head.fields["host"] != head.fields[":authority"])) {
+            return fail(make_error_code(Errc::invalid_handshake));
+        }
+    }
+    return head;
+}
+}
+Result<http::Headers> extended_connect_offer(const HandshakeOptions& options, Limits limits) {
+    if (auto valid = validate_options(options, Role::client, limits); !valid) return fail(valid.error());
+    http::Headers fields{{"sec-websocket-version", "13"}};
+    if (!options.subprotocols.empty()) {
+        std::string value;
+        for (const auto& protocol : options.subprotocols) {
+            if ((!value.empty() && !append(value, ", ", limits)) || !append(value, protocol, limits))
+                return fail(Mira::Errc::limit_exceeded);
+        }
+        fields.push_back({"sec-websocket-protocol", std::move(value)});
+    }
+    const auto& c = options.compression;
+    if (c.enabled) fields.push_back({"sec-websocket-extensions", format_deflate(Deflate{
+        c.server_no_context_takeover, c.client_no_context_takeover, c.server_max_window_bits,
+        c.client_max_window_bits, c.offer_client_max_window_bits || c.client_max_window_bits.has_value()})});
+    if (auto checked = connect_fields(fields, limits, false); !checked) return fail(checked.error());
+    return fields;
+}
+Result<ConnectHandshake> negotiate_extended_server(std::span<const http::Header> fields,
+    const HandshakeOptions& options, Limits limits) {
+    if (auto valid = validate_options(options, Role::server, limits); !valid) return fail(valid.error());
+    auto head = connect_fields(fields, limits, false);
+    if (!head) return fail(head.error());
+    if (head->fields["sec-websocket-version"] != "13") return fail(make_error_code(Errc::invalid_handshake));
+    auto offered = protocols(*head);
+    if (!offered) return fail(offered.error());
+    auto offered_extensions = extensions(*head);
+    if (!offered_extensions) return fail(offered_extensions.error());
+    ConnectHandshake result;
+    for (const auto& protocol : options.subprotocols) {
+        if (std::find(offered->begin(), offered->end(), protocol) == offered->end()) continue;
+        result.negotiated.subprotocol = protocol;
+        result.fields.push_back({"sec-websocket-protocol", protocol});
+        break;
+    }
+    if (options.require_subprotocol && result.negotiated.subprotocol.empty())
         return fail(make_error_code(Errc::invalid_handshake));
-    auto parameters = deflate_parameters(selected_extensions->front(), true);
-    if (!parameters) return fail(parameters.error());
-    if ((offered.server_no_context_takeover && !parameters->server_no_context_takeover) ||
-        (offered.server_max_window_bits && (!parameters->server_max_window_bits ||
-         *parameters->server_max_window_bits > *offered.server_max_window_bits)) ||
-        (parameters->client_window_present && !offered.offer_client_max_window_bits && !offered.client_max_window_bits) ||
-        parameters->client_max_window_bits == 8)
-        return fail(make_error_code(Errc::invalid_handshake));
-    // Client offer hints are not response limits. The connection separately
-    // honors stricter local promises when constructing its outbound codec.
-    result.compression = agreed(*parameters);
+    if (auto parameters = select_deflate(*offered_extensions, options.compression)) {
+        result.negotiated.compression = agreed(*parameters);
+        result.fields.push_back({"sec-websocket-extensions", format_deflate(*parameters)});
+    }
+    if (auto checked = connect_fields(result.fields, limits, true); !checked) return fail(checked.error());
     return result;
+}
+Result<Negotiated> negotiate_extended_client(unsigned status, std::span<const http::Header> fields,
+    const HandshakeOptions& offered, Limits limits) {
+    if (status < 200 || status >= 300) return fail(make_error_code(Errc::invalid_handshake));
+    if (status == 204) return fail(Mira::Errc::not_supported);
+    if (auto valid = validate_options(offered, Role::client, limits); !valid) return fail(valid.error());
+    auto head = connect_fields(fields, limits, true);
+    if (!head) return fail(head.error());
+    if (head->fields.contains(":status") && head->fields[":status"] != std::to_string(status))
+        return fail(make_error_code(Errc::invalid_handshake));
+    return negotiate_selection(*head, offered);
+}
+Result<http::Headers> extended_connect_request(std::string_view authority, std::string_view path,
+    const HandshakeOptions& options, Limits limits) {
+    if (authority.size() > limits.max_handshake || path.size() > limits.max_handshake)
+        return fail(Mira::Errc::limit_exceeded);
+    if (!connect_target(authority, path)) return fail(make_error_code(Errc::invalid_handshake));
+    auto offer = extended_connect_offer(options, limits);
+    if (!offer) return fail(offer.error());
+    http::Headers fields{{":method", "CONNECT"}, {":protocol", "websocket"}, {":scheme", "https"},
+                        {":authority", std::string(authority)}, {":path", std::string(path)}};
+    for (auto& field : *offer) fields.push_back(std::move(field));
+    if (auto checked = connect_fields(fields, limits, false); !checked) return fail(checked.error());
+    return fields;
+}
+Result<ExtendedHandshake> accept_extended_connect(std::span<const http::Header> request,
+    const HandshakeOptions& options, Limits limits) {
+    auto head = connect_fields(request, limits, false);
+    if (!head) return fail(head.error());
+    if (!head->fields.contains(":method")) return fail(make_error_code(Errc::invalid_handshake));
+    auto selected = negotiate_extended_server(request, options, limits);
+    if (!selected) return fail(selected.error());
+    ExtendedHandshake result{{{":status", "200"}}, std::move(selected->negotiated)};
+    for (auto& field : selected->fields) result.fields.push_back(std::move(field));
+    if (auto checked = connect_fields(result.fields, limits, true); !checked) return fail(checked.error());
+    return result;
+}
+Result<Negotiated> validate_extended_connect(std::span<const http::Header> response,
+    const HandshakeOptions& offered, Limits limits) {
+    auto head = connect_fields(response, limits, true);
+    if (!head) return fail(head.error());
+    const auto field = head->fields.find(":status");
+    if (field == head->fields.end()) return fail(make_error_code(Errc::invalid_handshake));
+    const auto& value = field->second;
+    const auto status = static_cast<unsigned>((value[0] - '0') * 100 + (value[1] - '0') * 10 + value[2] - '0');
+    return negotiate_extended_client(status, response, offered, limits);
 }
 Result<std::string> server_handshake(std::string_view request, Limits limits) {
     auto result = negotiate_server_handshake(request, HandshakeOptions{}, limits);

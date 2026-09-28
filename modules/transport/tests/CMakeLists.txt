@@ -1,3 +1,15 @@
+add_executable(mira_dial test_dial.cpp)
+target_link_libraries(mira_dial PRIVATE Mira::transport Mira::warnings)
+target_include_directories(mira_dial PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+add_test(NAME dial COMMAND mira_dial)
+set_tests_properties(dial PROPERTIES TIMEOUT 30)
+
+add_executable(mira_server_shutdown_tests test_server_shutdown.cpp)
+target_link_libraries(mira_server_shutdown_tests PRIVATE Mira::transport Mira::warnings)
+target_include_directories(mira_server_shutdown_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+add_test(NAME server_shutdown COMMAND mira_server_shutdown_tests)
+set_tests_properties(server_shutdown PROPERTIES TIMEOUT 30)
+
 add_executable(mira_transport_tests test_tcp.cpp)
 
 target_link_libraries(mira_transport_tests PRIVATE

@@ -32,6 +32,7 @@
 
 #include "mira/core/buffer.hpp"
 #include "mira/core/error.hpp"
+#include "mira/core/resource_budget.hpp"
 #include "mira/core/stream.hpp"
 #include "mira/core/task.hpp"
 #include "mira/http/limits.hpp"
@@ -46,6 +47,7 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <limits>
 #include <span>
 #include <string_view>
 #include <type_traits>
@@ -108,6 +110,12 @@ struct ServerOptions {
     /// Zero disables it, which leaves a slow peer bounded only by `limits` —
     /// a bound on one message's size, not on the time it may take to arrive.
     Clock::duration request_timeout = Clock::duration::zero();
+
+    /// Hard input-buffer ceiling, including an incomplete framing line.
+    std::size_t max_buffer_size = 64 * 1024;
+    /// Optional shared reservation for input and retained request-body bytes.
+    /// Parser/header metadata, output and application allocations are excluded.
+    std::optional<ResourceBudget> buffer_budget{};
 };
 
 /// Writes one response, and refuses to write two.
@@ -320,7 +328,13 @@ public:
                     last_error_.reset();
                     co_return std::size_t{0};
                 }
-                const std::span<std::byte> space = input_.prepare(read_chunk_);
+                if (input_.size() >= max_buffer_size_) {
+                    finished_ = true;
+                    last_error_ = make_error_code(Errc::limit_exceeded);
+                    co_return fail(*last_error_);
+                }
+                const std::span<std::byte> space = input_.prepare(
+                    std::min(read_chunk_, max_buffer_size_ - input_.size()));
                 Result<std::size_t> read = co_await stream_.read_some(space, io_);
                 if (!read) {
                     input_.commit(0);
@@ -384,9 +398,10 @@ public:
 
 public:
     RequestBodyReader(Stream& stream, Buffer& input, RequestParser& parser,
-                      OperationOptions io, std::size_t read_chunk)
+                      OperationOptions io, std::size_t read_chunk,
+                      std::size_t max_buffer_size = 64 * 1024)
         : stream_(stream), input_(input), parser_(parser), io_(std::move(io)),
-          read_chunk_(read_chunk) {}
+          read_chunk_(read_chunk), max_buffer_size_(max_buffer_size) {}
 
     /// Drain whatever the handler left unread.
     ///
@@ -425,6 +440,7 @@ public:
     RequestParser& parser_;
     OperationOptions io_;
     std::size_t read_chunk_;
+    std::size_t max_buffer_size_;
     /// Remainder of a body slice that did not fit the caller's buffer, plus
     /// a read cursor: `pending_.size() - pending_pos_` bytes are owed.
     std::vector<std::byte> pending_{};
@@ -488,10 +504,26 @@ Task<Result<void>> send_error(Stream& stream, unsigned status, OperationOptions 
 /// doubt is how one bad request becomes several.
 template<BoundedStream Stream, typename Handler>
 Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptions options = {}) {
-    if (options.read_chunk == 0) {
+    if (options.read_chunk == 0 || options.max_buffer_size == 0 ||
+        options.idle_timeout < Clock::duration::zero() || options.request_timeout < Clock::duration::zero()) {
         co_return fail(Errc::invalid_argument);
     }
-    Buffer input;
+    constexpr bool buffered_handler = detail::kHandlerWantsBuffer<Handler, Stream>;
+    ResourceBudget::Reservation buffer_charge;
+    if (options.buffer_budget) {
+        // Reserve potential retained bytes before accepting request data. A
+        // streaming reader can retain a partial slice in addition to input.
+        std::size_t reservation = options.max_buffer_size;
+        const auto retained = buffered_handler ? options.limits.max_body_size
+                                               : static_cast<std::uint64_t>(options.max_buffer_size);
+        if (retained > std::numeric_limits<std::size_t>::max() - reservation)
+            co_return fail(Errc::limit_exceeded);
+        reservation += static_cast<std::size_t>(retained);
+        auto acquired = options.buffer_budget->try_acquire(reservation);
+        if (!acquired) co_return fail(acquired.error());
+        buffer_charge = std::move(*acquired);
+    }
+    Buffer input{options.max_buffer_size};
     RequestParser parser{options.limits};
 
     // Turn a configured window into an absolute deadline, or nothing when the
@@ -502,7 +534,8 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         if (window == Clock::duration::zero()) {
             return std::nullopt;
         }
-        return Clock::now() + window;
+        const auto now = Clock::now();
+        return window > Clock::time_point::max() - now ? Clock::time_point::max() : now + window;
     };
 
     for (std::uint32_t served = 0; served < options.max_requests_per_connection; ++served) {
@@ -583,7 +616,10 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
                     break;
                 }
                 {
-                    const std::span<std::byte> space = input.prepare(options.read_chunk);
+                    if (input.size() >= options.max_buffer_size)
+                        co_return fail(Errc::limit_exceeded);
+                    const std::span<std::byte> space = input.prepare(
+                        std::min(options.read_chunk, options.max_buffer_size - input.size()));
                     Result<std::size_t> read = co_await stream.read_some(space, io);
                     if (!read) {
                         input.commit(0);
@@ -647,7 +683,7 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         if constexpr (detail::kHandlerWantsBuffer<Handler, Stream>) {
             handled = co_await run_handler(body.readable());
         } else {
-            RequestBodyReader<Stream> reader{stream, input, parser, io, options.read_chunk};
+            RequestBodyReader<Stream> reader{stream, input, parser, io, options.read_chunk, options.max_buffer_size};
             handled = co_await run_handler(reader);
             // The streaming contract's other half: whatever the handler left
             // unread is drained here (bounded by `limits`, failures included)

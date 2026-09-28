@@ -1,3 +1,11 @@
+if(MIRA_ENABLE_WEBSOCKET)
+    add_executable(mira_test_http2_connect test_connect.cpp)
+    target_link_libraries(mira_test_http2_connect PRIVATE Mira::http2 Mira::ws Mira::transport Mira::warnings NGHTTP2::NGHTTP2)
+    target_include_directories(mira_test_http2_connect PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+    add_test(NAME http2_connect COMMAND mira_test_http2_connect)
+    set_tests_properties(http2_connect PROPERTIES TIMEOUT 30)
+endif()
+
 add_executable(mira_test_http2 test_session.cpp)
 target_link_libraries(mira_test_http2 PRIVATE Mira::http2 Mira::warnings NGHTTP2::NGHTTP2)
 target_include_directories(mira_test_http2 PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)

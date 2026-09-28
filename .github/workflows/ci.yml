@@ -105,12 +105,28 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "CMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/build/protocol-deps/prefix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "MIRA_PLATFORM_PROTOCOL_FLAGS=-DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build independent HTTP3 curl on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python tools/ci/build_interop_curl.py --openssl-root "$env:OPENSSL_ROOT_DIR" --config Debug --architecture x64 --toolchain "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$env:GITHUB_WORKSPACE/build/interop-curl/prefix/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Configure TLS
         run: cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=${{ matrix.std }} -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON ${{ env.MIRA_PLATFORM_PROTOCOL_FLAGS }}
       - name: Build TLS
         run: cmake --build build/tls --parallel --config Debug
       - name: Test TLS and HTTPS
         run: ctest --test-dir build/tls --output-on-failure --build-config Debug
+      - name: Require independent Windows HTTP3 and Retry interoperability
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $curl = "$env:GITHUB_WORKSPACE/build/interop-curl/prefix/bin/curl.exe"
+          python tools/ci/check_h3_interop.py build/tls/Debug/mira_h3_server.exe --strict --curl "$curl"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/ci/check_h3_interop.py build/tls/Debug/mira_h3_multi_server.exe --multi-retry --strict --curl "$curl"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Installed TLS package and dependency isolation
         run: python tools/ci/check_install_consumer.py --build-dir build/tls --config Debug
 
@@ -140,8 +156,11 @@ jobs:
             mingw-w64-ucrt-x86_64-openssl
             mingw-w64-ucrt-x86_64-nghttp2
             mingw-w64-ucrt-x86_64-zlib
-      - name: Configure with TLS
-        run: cmake -S . -B build/mingw -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_HTTP2=ON
+            mingw-w64-ucrt-x86_64-python
+      - name: Build pinned MinGW QUIC and HTTP3 dependencies
+        run: python tools/ci/build_protocol_deps.py --path build/mingw-protocol-deps --openssl-root "$MINGW_PREFIX" --generator Ninja --config Debug
+      - name: Configure with TLS and HTTP3
+        run: cmake -S . -B build/mingw -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON -DOPENSSL_ROOT_DIR="$MINGW_PREFIX" -DCMAKE_PREFIX_PATH="$PWD/build/mingw-protocol-deps/prefix"
       - name: Build
         run: cmake --build build/mingw --parallel
       - name: Test

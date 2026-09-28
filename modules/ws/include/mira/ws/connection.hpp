@@ -40,6 +40,29 @@ public:
     std::string_view subprotocol() const noexcept { return negotiated_.subprotocol; }
     const CompressionParameters& compression_parameters() const noexcept { return negotiated_.compression; }
 
+    // Trusted handoff from an HTTP/2 or HTTP/3 Extended CONNECT driver. That
+    // driver must already have validated SETTINGS, :protocol, version and
+    // extension response parameters for this exact stream. This performs no
+    // HTTP I/O and is not a generic bypass for the HTTP/1 upgrade handshake.
+    Result<void> adopt_extended_connect(std::string_view protocol, unsigned status,
+                                       Negotiated negotiated = {}) {
+        if (busy_ || ready_ || failed_ || reading_ || writing_ ||
+            protocol != "websocket" || status < 200 || status >= 300)
+            return fail(Mira::Errc::invalid_argument);
+        const auto& selected = negotiated.subprotocol;
+        if ((selected.empty() && handshake_options_.require_subprotocol) ||
+            (!selected.empty() && std::find(handshake_options_.subprotocols.begin(),
+                handshake_options_.subprotocols.end(), selected) == handshake_options_.subprotocols.end()) ||
+            (negotiated.compression.enabled && !handshake_options_.compression.enabled))
+            return fail(make_error_code(Errc::invalid_handshake));
+        Guard guard{*this};
+        auto configured = configure_extensions(negotiated);
+        if (!configured) return terminate(configured.error());
+        negotiated_ = std::move(negotiated);
+        ready_ = true;
+        return {};
+    }
+
     Task<Result<void>> handshake(std::string host = {}, std::string target = "/",
                                   OperationOptions options = {}) {
         if (busy_ || ready_ || failed_) co_return fail(Mira::Errc::invalid_argument);

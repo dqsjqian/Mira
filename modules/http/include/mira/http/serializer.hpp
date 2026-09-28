@@ -73,6 +73,9 @@ enum class SerializeError {
 [[nodiscard]] Result<void> write_request_head(Buffer& out, const Request& request,
                                               std::uint64_t body_size = 0,
                                               Limits limits = {});
+[[nodiscard]] Result<void> write_request_head(Buffer& out, const Request& request,
+                                              Framing framing, std::uint64_t body_size = 0,
+                                              Limits limits = {});
 
 /// Write one chunk of a chunked body, including its size line and trailing CRLF.
 ///

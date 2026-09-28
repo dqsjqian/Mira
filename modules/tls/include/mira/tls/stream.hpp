@@ -43,12 +43,21 @@ namespace Mira::tls {
 template<BoundedStream Underlying>
 class Stream {
 public:
+    // A conservative reservation for the two BIOs and wire input/output buffers.
+    // OpenSSL internals, caller spans and allocator overhead are not included.
+    static constexpr std::size_t reserved_buffer_bytes = Engine::reserved_buffer_bytes + 32 * 1024;
     [[nodiscard]] static Result<Stream>
     create(EventLoop& loop, Underlying& underlying, const Context& context,
-           std::string_view peer_name = {}) {
-        auto engine = Engine::create(context, peer_name);
+           std::string_view peer_name = {}, std::optional<ResourceBudget> budget = {}) {
+        ResourceBudget::Reservation reservation;
+        if (budget) {
+            auto acquired = budget->try_acquire(32 * 1024);
+            if (!acquired) return fail(acquired.error());
+            reservation = std::move(*acquired);
+        }
+        auto engine = Engine::create(context, peer_name, std::move(budget));
         if (!engine) return fail(engine.error());
-        return Stream(std::make_shared<State>(loop, underlying, std::move(*engine)));
+        return Stream(std::make_shared<State>(loop, underlying, std::move(*engine), std::move(reservation)));
     }
 
     Stream(Stream&& other) noexcept {
@@ -138,6 +147,7 @@ private:
     };
 
     struct State {
+        ResourceBudget::Reservation reservation;
         EventLoop* loop;
         Underlying* underlying;
         Engine engine;
@@ -157,8 +167,8 @@ private:
         bool alert = false;
         Request* retry = nullptr;
 
-        State(EventLoop& executor, Underlying& stream, Engine value)
-            : loop(&executor), underlying(&stream), engine(std::move(value)) {}
+        State(EventLoop& executor, Underlying& stream, Engine value, ResourceBudget::Reservation charge)
+            : reservation(std::move(charge)), loop(&executor), underlying(&stream), engine(std::move(value)) {}
     };
 
     struct ForwardStop {

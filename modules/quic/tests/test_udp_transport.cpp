@@ -5,6 +5,7 @@
 
 #include "mira/core/task_scope.hpp"
 #include "mira/quic/connection.hpp"
+#include "mira/quic/listener.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -329,6 +330,120 @@ Task<void> fixed_peer(EventLoop& loop, const char* certificate, const char* key,
           "stranger must not receive QUIC output after a forged source datagram");
 }
 
+Task<void> migration_udp(EventLoop& loop, const char* certificate, const char* key, bool active) {
+    auto server_socket = require(transport::udp::Socket::bind(loop, Endpoint::loopback(0)));
+    auto old_socket = require(transport::udp::Socket::bind(loop, Endpoint::loopback(0)));
+    auto new_socket = require(transport::udp::Socket::bind(loop, Endpoint::loopback(0)));
+    auto attacker = require(transport::udp::Socket::bind(loop, Endpoint::loopback(0)));
+    const auto server_address = require(server_socket.local_endpoint());
+    const auto old_address = require(old_socket.local_endpoint());
+    const auto new_address = require(new_socket.local_endpoint());
+    const auto attacker_address = require(attacker.local_endpoint());
+    quic::Options co;
+    co.local = old_address;
+    co.remote = server_address;
+    co.ca_file = certificate;
+    co.peer_name = "localhost";
+    co.migration = quic::MigrationPolicy::validated;
+    auto so = co;
+    so.local = server_address;
+    so.certificate_file = certificate;
+    so.private_key_file = key;
+    auto listener = require(quic::Listener::create(so));
+    auto client = require(quic::Engine::client(co, quic::detail::now_ns()));
+    std::array<std::byte, 65536> buffer{};
+    bool rebound = false;
+    quic::Listener::Id id = 0;
+    const auto deadline = Clock::now() + 10s;
+    auto round = [&]() -> Task<void> {
+        auto now = quic::detail::now_ns();
+        if (client.expiry() <= now) require(client.handle_expiry(now));
+        require(listener.handle_expiry(now));
+        for (int n = 0; n < 32; ++n) {
+            auto packet = require(client.poll_datagram(quic::detail::now_ns()));
+            if (packet.data.empty()) break;
+            auto& socket = (rebound || packet.path.local == new_address) ? new_socket : old_socket;
+            require(co_await socket.send_to(packet.data, packet.path.remote, {.deadline = deadline}));
+            const auto incoming = require(co_await server_socket.receive_from(buffer, {.deadline = deadline}));
+            auto ingested = require(listener.ingest(incoming.peer,
+                {buffer.data(), incoming.size}, quic::detail::now_ns()));
+            if (!id) id = ingested.connection_id;
+        }
+        for (int n = 0; n < 32; ++n) {
+            auto packet = require(listener.poll(quic::detail::now_ns()));
+            if (!packet) break;
+            check(packet->connection_id == id && packet->local == server_address,
+                  "migration output changed CID/local route");
+            check(packet->peer == old_address || packet->peer == new_address,
+                  "migration output reflected to wrong source");
+            require(co_await server_socket.send_to(packet->data, packet->peer, {.deadline = deadline}));
+            auto& socket = packet->peer == new_address ? new_socket : old_socket;
+            const auto incoming = require(co_await socket.receive_from(buffer, {.deadline = deadline}));
+            const auto local = active ? packet->peer : old_address;
+            require(client.receive({local, incoming.peer}, {buffer.data(), incoming.size},
+                                   quic::detail::now_ns()));
+        }
+        require(co_await loop.sleep_for(1ms, {.deadline = deadline}));
+    };
+    for (int n = 0; n < 100; ++n) co_await round();
+    check(client.handshake_complete() && listener.connection(id)->handshake_complete(),
+          "migration handshake did not complete");
+    check(!client.poll(quic::detail::now_ns()), "migration accepted pathless output");
+    if (active) require(client.initiate_migration({new_address, server_address}, quic::detail::now_ns()));
+    else rebound = true;
+    const auto stream = require(client.open_stream());
+    quic::Bytes payload(12000, std::byte{0x73});
+    require(client.write(stream, payload, true));
+    std::size_t total = 0;
+    bool fin = false;
+    for (int n = 0; n < 5000; ++n) {
+        co_await round();
+        auto* server = listener.connection(id);
+        check(server, "migration lost CID association");
+        for (auto& event : server->take_events()) {
+            if (event.kind != quic::Event::Kind::data) continue;
+            total += event.data.size();
+            fin |= event.fin;
+            require(server->consume(event.stream_id, event.data.size()));
+        }
+        if (fin && server->validated_path().remote == new_address &&
+            (!active || client.validated_path().local == new_address)) break;
+    }
+    auto* server = listener.connection(id);
+    check(total == payload.size() && fin && server->validated_path().remote == new_address,
+          "real UDP path validation/NAT rebinding failed");
+    require(server->write(stream, payload, true));
+    total = 0;
+    fin = false;
+    for (int n = 0; n < 5000 && !fin; ++n) {
+        co_await round();
+        for (auto& event : client.take_events()) {
+            if (event.kind != quic::Event::Kind::data) continue;
+            total += event.data.size();
+            fin |= event.fin;
+            require(client.consume(event.stream_id, event.data.size()));
+        }
+    }
+    check(total == payload.size() && fin, "migrated response did not reach validated endpoint");
+    auto ids = server->local_connection_ids();
+    quic::Bytes forged(1200, std::byte{0x42});
+    std::copy(ids.front().begin(), ids.front().end(), forged.begin() + 1);
+    require(co_await attacker.send_to(forged, server_address, {.deadline = deadline}));
+    auto bad = require(co_await server_socket.receive_from(buffer, {.deadline = deadline}));
+    require(listener.ingest(bad.peer, {buffer.data(), bad.size}, quic::detail::now_ns()));
+    check(server->validated_path().remote == new_address && !server->closed(),
+          "forged CID source poisoned validated connection");
+    auto close = require(listener.close(id, 0, quic::detail::now_ns()));
+    check(close.peer == new_address && listener.tombstone_count() == 1,
+          "migrated closing lost validated peer or tombstone");
+    auto discarded = require(listener.ingest(attacker_address, forged, quic::detail::now_ns()));
+    check(discarded.kind == quic::Listener::Ingest::Kind::dropped,
+          "closing accepted spoofed source");
+    std::array<std::byte, 2048> junk{};
+    auto leaked = co_await attacker.receive_from(junk, {.deadline = Clock::now() + 20ms});
+    check(!leaked && leaked.error() == Errc::timed_out, "attacker received migrated payload");
+}
+
 }  // namespace
 
 // Checkpoint: see test/timeout-expectations.md (review report C1 regression)
@@ -337,6 +452,8 @@ int main(int argc, char** argv) {
     auto loop = EventLoop::create();
     if (!loop) return 2;
     try {
+        static_cast<void>(loop->run_until_complete(migration_udp(*loop, argv[1], argv[2], true)));
+        static_cast<void>(loop->run_until_complete(migration_udp(*loop, argv[1], argv[2], false)));
         static_cast<void>(loop->run_until_complete(run(*loop, argv[1], argv[2])));
         static_cast<void>(loop->run_until_complete(silent_peer_budget(*loop, argv[1])));
         static_cast<void>(loop->run_until_complete(expired_engine_timer(*loop, argv[1])));

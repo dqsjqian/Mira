@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -406,7 +407,30 @@ Task<void> adapter_case() {
     CHECK(connection.session().state() == State::closed);
 }
 
+void shared_budget() {
+    Limits limits;
+    limits.max_streams = 2;
+    limits.max_body_bytes = 1024;
+    limits.max_header_bytes = 1024;
+    const auto charge = limits.max_streams * (limits.max_body_bytes + 3 * limits.max_header_bytes) +
+                        limits.max_output_bytes + limits.max_queued_body_bytes;
+    ResourceBudget budget{charge};
+    {
+        auto session = Session::create(Role::client, limits, budget);
+        CHECK(session.has_value());
+        CHECK(budget.used() == charge);
+        auto full = Session::create(Role::server, limits, budget);
+        CHECK(!full && full.error() == Errc::would_block);
+        CHECK(budget.used() == charge);
+    }
+    CHECK(budget.used() == 0);
+    limits.max_body_bytes = std::numeric_limits<std::size_t>::max();
+    auto overflow = Session::create(Role::client, limits, budget);
+    CHECK(!overflow && overflow.error() == Errc::limit_exceeded);
+    CHECK(budget.used() == 0);
+}
 int main() {
+    shared_budget();
     streaming_bodies();
     multiplex_and_cancel();
     flow_control_and_bounds();

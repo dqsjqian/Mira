@@ -63,13 +63,18 @@ public:
     /// completion (or the first failure). `options.remote` is the server.
     [[nodiscard]] static Task<Result<Connection>>
     connect(EventLoop& loop, Options options, OperationOptions io = {}) {
-        const transport::Endpoint remote = options.remote;
         auto bound = Transport::bind(loop, options.local);
         if (!bound) co_return fail(bound.error());
+        if constexpr (requires { bound->local_endpoint(); }) {
+            auto local = bound->local_endpoint();
+            if (!local) co_return fail(local.error());
+            options.local = *local;
+        }
+        const auto local = options.local;
         auto engine = Engine::client(std::move(options), detail::now_ns());
         if (!engine) co_return fail(engine.error());
         Connection connection{std::move(*bound), std::move(*engine)};
-        connection.remote_ = remote;
+        connection.local_ = local;
         auto handshake = co_await connection.pump_until(
             [&](const Connection& self) { return self.engine_->handshake_complete(); }, io);
         if (!handshake) co_return fail(handshake.error());
@@ -82,12 +87,11 @@ public:
                                                         Options options,
                                                         std::span<const std::byte> initial,
                                                         OperationOptions io = {}) {
-        // The remote is part of the options: whoever sent the Initial.
-        const transport::Endpoint remote = options.remote;
+        const auto local = options.local;
         auto engine = Engine::accept(std::move(options), initial, detail::now_ns());
         if (!engine) co_return fail(engine.error());
         Connection connection{std::move(transport), std::move(*engine)};
-        connection.remote_ = remote;
+        connection.local_ = local;
         auto handshake = co_await connection.pump_until(
             [&](const Connection& self) { return self.engine_->handshake_complete(); }, io);
         if (!handshake) co_return fail(handshake.error());
@@ -163,14 +167,12 @@ public:
     [[nodiscard]] Task<Result<void>>
     close(std::uint64_t application_error, OperationOptions io = {}) {
         if (!engine_ || !transport_) co_return fail(Errc::invalid_argument);
-        auto last = engine_->close(application_error, detail::now_ns());
+        auto last = engine_->close_datagram(application_error, detail::now_ns());
         if (!last) co_return fail(last.error());
-        if (!last->empty()) {
-            auto sent = co_await transport_->send_to(std::span<const std::byte>{last->data(),
-                                                                                 last->size()},
-                                                     remote_, io);
+        if (!last->data.empty()) {
+            auto sent = co_await transport_->send_to(last->data, last->path.remote, io);
             if (!sent) co_return fail(sent.error());
-            if (*sent != last->size()) {
+            if (*sent != last->data.size()) {
                 co_return fail(std::make_error_code(std::errc::io_error));
             }
         }
@@ -228,13 +230,13 @@ private:
     /// Send everything the engine currently wants to send.
     Task<Result<void>> flush(OperationOptions io) {
         for (std::size_t round = 0; round < 64; ++round) {
-            auto packet = engine_->poll(detail::now_ns());
+            auto packet = engine_->poll_datagram(detail::now_ns());
             if (!packet) co_return fail(packet.error());
-            if (packet->empty()) break;
-            auto sent = co_await transport_->send_to(
-                std::span<const std::byte>{packet->data(), packet->size()}, remote_, io);
+            if (packet->data.empty()) break;
+            if (packet->path.local != local_) co_return fail(Errc::invalid_argument);
+            auto sent = co_await transport_->send_to(packet->data, packet->path.remote, io);
             if (!sent) co_return fail(sent.error());
-            if (*sent != packet->size()) {
+            if (*sent != packet->data.size()) {
                 co_return fail(std::make_error_code(std::errc::io_error));
             }
         }
@@ -298,10 +300,7 @@ private:
             co_return fail(received.error());
         }
 
-        if (!(received->peer == remote_)) {
-            co_return Result<void>{};
-        }
-        if (auto fed = engine_->receive(
+        if (auto fed = engine_->receive(Path{local_, received->peer},
                 std::span<const std::byte>{buffer.data(), received->size},
                 detail::now_ns());
             !fed) {
@@ -332,7 +331,7 @@ private:
 
     std::unique_ptr<Transport> transport_;
     std::unique_ptr<Engine> engine_;
-    transport::Endpoint remote_{};
+    transport::Endpoint local_{};
     std::map<std::int64_t, std::deque<Event>> buffers_;
     bool pumping_ = false;
 };

@@ -49,7 +49,7 @@ struct ListenerLimits {
 /// Required Retry returns at most one small reply directly from ingest; send it
 /// immediately or discard it. Replies never enter poll or reserve a connection.
 /// Disabled Retry admits unvalidated peers; select required for public endpoints.
-/// Stateless reset, migration, 0-RTT and replay prevention are not implemented.
+/// Migration is opt-in; ngtcp2 validates candidate paths and owns each output route.
 template<class Protocol = Engine>
 class Dispatcher {
 public:
@@ -59,6 +59,7 @@ public:
         Id connection_id;
         transport::Endpoint peer;
         Bytes data;
+        transport::Endpoint local;
     };
     struct Ingest {
         enum class Kind { dropped, admitted, delivered, removed, retry } kind;
@@ -95,6 +96,14 @@ public:
             if constexpr (std::is_same_v<Protocol, Engine>) factory = Engine::accept;
             else return std::unexpected(quic_error(-100000));
         }
+        if constexpr (!requires(Protocol& protocol, const Path& path, std::span<const std::byte> data) {
+            protocol.receive(path, data, std::uint64_t{});
+            protocol.poll_datagram(std::uint64_t{});
+            protocol.close_datagram(std::uint64_t{}, std::uint64_t{});
+        }) {
+            if (options.migration != MigrationPolicy::fixed_peer)
+                return std::unexpected(quic_error(-100000));
+        }
         options.server = true;
         options.max_connection_ids = limits.max_connection_ids;
         auto gate = detail::RetryGate::create(options, std::move(retry));
@@ -114,7 +123,9 @@ public:
         if (found != routes_.end()) {
             auto id = found->second;
             auto& entry = entries_.at(id);
-            if (entry.peer != peer) return Ingest{Ingest::Kind::dropped};
+            if (entry.peer != peer && (!entry.engine ||
+                options_.migration == MigrationPolicy::fixed_peer))
+                return Ingest{Ingest::Kind::dropped};
             if (!entry.engine) {
                 auto& closed = entry.closed;
                 if (!closed.packet.empty() && closed.transmissions < 3 &&
@@ -123,7 +134,7 @@ public:
                     closed.pending = true;
                 return Ingest{Ingest::Kind::dropped, id};
             }
-            auto result = entry.engine->receive(packet, now);
+            auto result = receive(*entry.engine, Path{options_.local, peer}, packet, now);
             if (!result || entry.engine->closed()) {
                 finish(id);
                 if (!result) return std::unexpected(result.error());
@@ -144,7 +155,7 @@ public:
         auto decision = retry_.inspect(peer, packet, now);
         if (!decision) return std::unexpected(decision.error());
         if (!decision->reply.empty())
-            return Ingest{Ingest::Kind::retry, 0, Datagram{0, peer, std::move(decision->reply)}};
+            return Ingest{Ingest::Kind::retry, 0, Datagram{0, peer, std::move(decision->reply), options_.local}};
         if (!decision->admitted) return Ingest{Ingest::Kind::dropped};
         auto reservation = shared_payload_.try_acquire(payload_per_connection_);
         if (!reservation) return Ingest{Ingest::Kind::dropped};
@@ -187,9 +198,9 @@ public:
                 ++closed.transmissions;
                 const auto maximum = std::numeric_limits<std::uint64_t>::max();
                 closed.next_send = now > maximum - closed.pto ? maximum : now + closed.pto;
-                return std::optional<Datagram>{Datagram{id, entry.peer, closed.packet}};
+                return std::optional<Datagram>{Datagram{id, entry.peer, closed.packet, options_.local}};
             }
-            auto packet = entry.engine->poll(now);
+            auto packet = produce(*entry.engine, now);
             if (!packet) {
                 auto error = packet.error();
                 finish(id);
@@ -199,8 +210,9 @@ public:
                 finish(id);
                 return std::unexpected(quic_error(-100001));
             }
-            if (!packet->empty())
-                return std::optional<Datagram>{Datagram{id, entry.peer, std::move(*packet)}};
+            if (!packet->data.empty())
+                return std::optional<Datagram>{Datagram{id, packet->path.remote,
+                    std::move(packet->data), packet->path.local}};
         }
         return std::optional<Datagram>{};
     }
@@ -238,14 +250,14 @@ public:
         if (it == entries_.end() || !it->second.engine) return std::unexpected(quic_error(-100000));
         auto& entry = it->second;
         const auto pto = transport_engine(*entry.engine).pto();
-        auto packet = entry.engine->close(code, now);
+        auto packet = terminate(*entry.engine, code, now);
         if (!packet) {
             auto error = packet.error();
             finish(id);
             return std::unexpected(error);
         }
-        Datagram result{id, entry.peer, *packet};
-        protect(id, pto, std::move(*packet), false);
+        Datagram result{id, packet->path.remote, packet->data, packet->path.local};
+        protect(id, pto, std::move(packet->data), false);
         return result;
     }
     /// Explicit purge releases tombstones, budgets and routes, allowing Initial replay.
@@ -309,13 +321,39 @@ private:
         if constexpr (std::is_same_v<Protocol, Engine>) return engine;
         else return engine.transport();
     }
+    static Result<void> receive(Protocol& protocol, const Path& path,
+                                std::span<const std::byte> data, std::uint64_t now) {
+        if constexpr (requires { protocol.receive(path, data, now); })
+            return protocol.receive(path, data, now);
+        else return protocol.receive(data, now);
+    }
+    static Result<Packet> produce(Protocol& protocol, std::uint64_t now) {
+        if constexpr (requires { protocol.poll_datagram(now); }) return protocol.poll_datagram(now);
+        else {
+            auto bytes = protocol.poll(now);
+            if (!bytes) return std::unexpected(bytes.error());
+            return Packet{transport_engine(protocol).validated_path(), std::move(*bytes)};
+        }
+    }
+    static Result<Packet> terminate(Protocol& protocol, std::uint64_t code, std::uint64_t now) {
+        if constexpr (requires { protocol.close_datagram(code, now); })
+            return protocol.close_datagram(code, now);
+        else {
+            auto bytes = protocol.close(code, now);
+            if (!bytes) return std::unexpected(bytes.error());
+            return Packet{transport_engine(protocol).validated_path(), std::move(*bytes)};
+        }
+    }
     bool time(std::uint64_t now) {
         if (now < clock_) return false;
         clock_ = now;
         return true;
     }
     bool refresh(Id id) {
-        auto ids = transport_engine(*entries_.at(id).engine).retained_connection_ids();
+        auto& entry = entries_.at(id);
+        const auto& transport = transport_engine(*entry.engine);
+        entry.peer = transport.validated_path().remote;
+        auto ids = transport.retained_connection_ids();
         if (ids.size() > limits_.max_connection_ids) return false;
         bool valid = true;
         for (auto& cid : ids) {
@@ -350,8 +388,8 @@ private:
         const auto pto = transport.pto();
         Bytes packet;
         if (!transport.draining()) {
-            auto result = entry.engine->close(1, clock_);
-            if (result) packet = std::move(*result);
+            auto result = terminate(*entry.engine, 1, clock_);
+            if (result) packet = std::move(result->data);
         }
         protect(id, pto, std::move(packet), true);
     }

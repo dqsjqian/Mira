@@ -43,7 +43,9 @@ struct PostedResumption {
 /// An executor accepts any callable Mira needs to post, including the
 /// stateful resumption closure above. Probing with `PostedResumption` itself
 /// means a type satisfying the concept actually works with `schedule_on`,
-/// rather than failing later inside the template body.
+/// rather than failing later inside the template body. post() is a reliable
+/// control channel: a bounded application queue must expose a separate
+/// try_post() API, never silently discard PostedResumption on saturation.
 template<typename E>
 concept Executor = requires(E& executor, detail::PostedResumption&& work) {
     { executor.post(std::move(work)) } -> std::same_as<void>;

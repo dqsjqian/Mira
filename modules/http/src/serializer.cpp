@@ -185,6 +185,17 @@ Result<void> write_response_head(Buffer& out,
 
 Result<void> write_request_head(Buffer& out, const Request& request,
                                 std::uint64_t body_size, Limits limits) {
+    return write_request_head(out, request, Framing::content_length, body_size, limits);
+}
+
+Result<void> write_request_head(Buffer& out, const Request& request,
+                                Framing framing, std::uint64_t body_size, Limits limits) {
+    if (framing != Framing::content_length && framing != Framing::chunked)
+        return fail(Errc::invalid_argument);
+    if (framing == Framing::chunked) {
+        if (request.version != Version::http_1_1) return fail(Errc::not_supported);
+        if (body_size != 0) return fail(Errc::invalid_argument);
+    }
     if (request.method == Method::connect || request.method == Method::other ||
         request.headers.contains("Upgrade") || request.headers.contains("Expect")) {
         return fail(Errc::not_supported);
@@ -284,20 +295,22 @@ Result<void> write_request_head(Buffer& out, const Request& request,
         if (size > limits.max_headers_total - total) return fail(Errc::limit_exceeded);
         total += size;
     }
-    const auto framing = "Content-Length: " + std::to_string(body_size);
-    if (framing.size() > limits.max_header_line || framing.size() > limits.max_headers_total - total) {
+    const auto framing_line = framing == Framing::chunked
+                                  ? std::string{"Transfer-Encoding: chunked"}
+                                  : "Content-Length: " + std::to_string(body_size);
+    if (framing_line.size() > limits.max_header_line || framing_line.size() > limits.max_headers_total - total) {
         return fail(Errc::limit_exceeded);
     }
     // One reserve up front: method + target + version line, every header
     // line (name + ": " + value + CRLF), plus framing and the final CRLF.
     out.reserve(out.size() + method.size() + request.target.size() + 32 +
-                total + request.headers.size() * 4 + framing.size() + 4);
+                total + request.headers.size() * 4 + framing_line.size() + 4);
     append(out, method); append(out, " "); append(out, request.target);
     append(out, " "); append(out, to_string(request.version)); append(out, "\r\n");
     for (const auto& [name, value] : request.headers) {
         append(out, name); append(out, ": "); append(out, value); append(out, "\r\n");
     }
-    append(out, framing); append(out, "\r\n\r\n");
+    append(out, framing_line); append(out, "\r\n\r\n");
     return {};
 }
 

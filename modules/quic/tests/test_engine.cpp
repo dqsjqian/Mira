@@ -3,6 +3,7 @@
 #include <ngtcp2/ngtcp2.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 using namespace Mira;
@@ -25,12 +26,157 @@ std::span<const std::byte> wire(const quic::Bytes& bytes) {
 void check(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
 }
+void sessions(const char* certificate, const char* key) {
+    quic::Options co, so;
+    co.local = transport::Endpoint::loopback(44120);
+    co.remote = transport::Endpoint::loopback(44121);
+    co.peer_name = "localhost";
+    co.ca_file = certificate;
+    co.service_scope = "session-test";
+    co.session_cache = require(quic::SessionCache::create({.max_entries = 1, .max_bytes = 8192}));
+    so.local = co.remote;
+    so.remote = co.local;
+    so.certificate_file = certificate;
+    so.private_key_file = key;
+    so.service_scope = co.service_scope;
+    so.early_data = quic::EarlyDataPolicy::replay_safe;
+    so.server_context = require(quic::ServerContext::create(so));
+    std::uint64_t now = 1'000'000'000;
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        co.early_data = attempt >= 2 ? quic::EarlyDataPolicy::replay_safe : quic::EarlyDataPolicy::disabled;
+        if (attempt == 3) so.early_data = quic::EarlyDataPolicy::disabled;
+        if (attempt == 4) co.service_scope = "other-service";
+        if (attempt == 5) now += 3'600'000'000'000;
+        auto client = require(Engine::client(co, now));
+        const bool early = attempt == 2 || attempt == 3;
+        check((client.early_data_status() == quic::EarlyDataStatus::pending) == early,
+              "early data gate ignored cache/policy/scope/expiry");
+        const quic::Bytes payload(1024, std::byte{0x61});
+        if (early) {
+            const auto stream = require(client.open_early_stream());
+            check(!client.write(stream, payload, true), "ordinary write sent early data");
+            require(client.write_early(stream, payload, true));
+        } else check(!client.open_early_stream(), "default-off early stream accepted");
+        auto initial = require(client.poll(now));
+        auto server = require(Engine::accept(so, initial, now));
+        std::size_t delivered = 0;
+        bool before_handshake = false;
+        for (int n = 0; n < 400; ++n) {
+            now += 1'000'000;
+            for (auto* sender : {&client, &server}) {
+                auto& receiver = sender == &client ? server : client;
+                if (sender->expiry() <= now) require(sender->handle_expiry(now));
+                for (int burst = 0; burst < 32; ++burst) {
+                    auto packet = require(sender->poll(now));
+                    if (packet.empty()) break;
+                    require(receiver.receive(packet, now));
+                    for (auto& event : server.take_events()) {
+                        if (event.kind != quic::Event::Kind::data) continue;
+                        delivered += event.data.size();
+                        before_handshake |= event.early_data;
+                        require(server.consume(event.stream_id, event.data.size()));
+                    }
+                }
+            }
+        }
+        check(client.handshake_complete() && server.handshake_complete(), "resumption handshake failed");
+        check(client.session_reused() == (attempt == 1 || early), "TLS session reuse mismatch");
+        if (attempt == 2) check(delivered == payload.size() && before_handshake &&
+            client.early_data_status() == quic::EarlyDataStatus::accepted, "real 0RTT was not accepted");
+        else check(delivered == 0, "rejected/default-off early data was delivered or replayed");
+        if (attempt == 3) check(client.early_data_status() == quic::EarlyDataStatus::rejected &&
+            client.write_capacity() == co.max_buffered_bytes, "early rejection retained retry payload");
+        check(co.session_cache->size() == 1 && co.session_cache->bytes() <= 8192,
+              "session ticket cache exceeded bound or failed to retain ticket");
+    }
+    co.session_cache->clear();
+    check(co.session_cache->bytes() == 0 && co.session_cache->size() == 0, "ticket clear leaked budget");
+}
+void trust_rotation(const char* certificate, const char* key, const char* other_ca,
+                    const std::string& mode) {
+    const bool system_trust = mode == "system-cache";
+    const bool allow_early = mode != "ca-rotation";
+    const auto trust_file = std::filesystem::path(certificate).parent_path() / (mode + "-trust.pem");
+    std::filesystem::copy_file(certificate, trust_file, std::filesystem::copy_options::overwrite_existing);
+    quic::Options co, so;
+    co.local = transport::Endpoint::loopback(44122);
+    co.remote = transport::Endpoint::loopback(44123);
+    co.peer_name = "localhost";
+    if (!system_trust) co.ca_file = trust_file.string();
+    co.service_scope = "trust-rotation";
+    co.session_cache = require(quic::SessionCache::create());
+    co.early_data = allow_early ? quic::EarlyDataPolicy::replay_safe : quic::EarlyDataPolicy::disabled;
+    so.local = co.remote;
+    so.remote = co.local;
+    so.certificate_file = certificate;
+    so.private_key_file = key;
+    so.service_scope = co.service_scope;
+    so.early_data = quic::EarlyDataPolicy::replay_safe;
+    so.server_context = require(quic::ServerContext::create(so));
+    std::uint64_t now = 1'000'000'000;
+    for (int attempt = 0; attempt < (system_trust ? 2 : 3); ++attempt) {
+        const bool changed = attempt == 2;
+        if (changed) std::filesystem::copy_file(other_ca, trust_file,
+            std::filesystem::copy_options::overwrite_existing);
+        auto client = require(Engine::client(co, now));
+        const bool early = client.early_data_status() == quic::EarlyDataStatus::pending;
+        if (early) require(client.write_early(require(client.open_early_stream()),
+            quic::Bytes(32, std::byte{0x61}), true));
+        auto server = require(Engine::accept(so, require(client.poll(now)), now));
+        bool rejected = false;
+        std::size_t delivered = 0;
+        for (int n = 0; n < 400 && !rejected; ++n) {
+            now += 1'000'000;
+            for (auto* sender : {&client, &server}) {
+                auto& receiver = sender == &client ? server : client;
+                if (sender->expiry() <= now) require(sender->handle_expiry(now));
+                for (int burst = 0; burst < 32; ++burst) {
+                    auto packet = require(sender->poll(now));
+                    if (packet.empty()) break;
+                    if (!receiver.receive(packet, now)) { rejected = true; break; }
+                    for (auto& event : server.take_events()) {
+                        if (event.kind != quic::Event::Kind::data) continue;
+                        delivered += event.data.size();
+                        require(server.consume(event.stream_id, event.data.size()));
+                    }
+                }
+                if (rejected) break;
+            }
+        }
+        if (changed) {
+            std::cout << "changed CA: rejected=" << rejected << " reused=" << client.session_reused()
+                      << " early=" << early << " delivered=" << delivered << '\n';
+            check(rejected && !client.handshake_complete() && !client.session_reused(),
+                  "changed CA at the same path resumed the old trust domain");
+            check(!early && delivered == 0, "changed trust enabled or delivered 0RTT");
+        } else {
+            check(!rejected && client.handshake_complete() && server.handshake_complete(),
+                  "trusted session setup failed");
+            check(client.session_reused() == (!system_trust && attempt == 1),
+                  "unchanged explicit trust did not resume, or default trust resumed");
+            check(co.session_cache->size() == (system_trust ? 0U : 1U),
+                  "unfingerprinted default trust retained a ticket or explicit trust lost one");
+            if (system_trust) check(!early && delivered == 0,
+                "default trust enabled or delivered early data without a snapshot");
+        }
+    }
+    co.session_cache->clear();
+    check(co.session_cache->bytes() == 0, "trust cache clear leaked budget");
+    std::cout << mode << " passed\n";
+}
 int main(int argc, char** argv) {
     std::string mode = argc > 3 ? argv[3] : "normal";
     bool negative = mode == "bad-host" || mode == "untrusted" || mode == "bad-alpn";
     bool handshake_phase = true;
     try {
         if (argc < 3) return 2;
+        if (mode == "ca-rotation" || mode == "ca-rotation-early" ||
+            mode == "ca-aux" || mode == "system-cache") {
+            if (argc < 5) return 2;
+            trust_rotation(argv[1], argv[2], argv[4], mode);
+            return 0;
+        }
+        if (mode == "normal") sessions(argv[1], argv[2]);
         quic::Options co, so;
         co.local = transport::Endpoint::loopback(44330);
         co.remote = transport::Endpoint::loopback(44331);

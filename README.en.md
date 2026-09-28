@@ -2,7 +2,7 @@
 
 # 🌐 Mira
 
-**Coroutine-native C++23 networking · transport first, protocols on top** · TCP / UDP / TLS / HTTP/1.1 / HTTP/2 / QUIC / HTTP/3
+**Coroutine-native C++23 networking · transport first, protocols on top** · TCP / UDP / TLS / WebSocket / HTTP/1.1 / HTTP/2 / QUIC / HTTP/3
 
 One completion-shaped I/O API across kqueue, epoll, and IOCP — so protocols never have to know about sockets.
 
@@ -19,9 +19,11 @@ One completion-shaped I/O API across kqueue, epoll, and IOCP — so protocols ne
 
 > *Mira* — the foundation layer for network software, carrying every protocol and every business above it; not another HTTP framework that does everything.
 
-**One completion-shaped I/O API across kqueue / epoll / IOCP; the full stack from TCP to HTTP/3, proven. C++23 is the baseline, not the selling point — coroutines, `std::expected`, and `stop_token` are first-class citizens.**
+**One completion-shaped I/O API across kqueue / epoll / IOCP; TCP-to-HTTP/3 evidence recorded by revision and configuration. C++23 is the baseline, not the selling point — coroutines, `std::expected`, and `stop_token` are first-class citizens.**
 
-## 🚀 Mira30 seconds
+This page describes the current `main` development tree, not the published v0.4.0 feature set. Historical CI, targeted tests and full-matrix acceptance of the current source are separate evidence.
+
+## 🚀 Mira in 30 seconds
 
 A TCP echo is the whole worldview: **you await a completion, the library owns the platform differences.**
 
@@ -83,6 +85,17 @@ flowchart TB
     App -.-> TCP[transport · TCP / UDP / Resolver]
     App -.-> H2[http2 · optional nghttp2]
     App -.-> H3[http3 · nghttp3]
+    App -.-> WS[ws · WebSocket / WSS / RFC7692]
+    App -.-> Client[client · pooled HTTP/1 composition]
+    App -.-> ClientTLS[client_tls · HTTPS composition]
+    Client --> HTTP
+    Client --> TCP
+    ClientTLS --> Client
+    ClientTLS --> TLS
+    WS --> Crypto[crypto · OpenSSL Crypto]
+    WS --> Zlib[zlib · raw DEFLATE]
+    Crypto --> Core
+    WS --> Core
     HTTP --> Core[core · Task / TaskScope / Result / AsyncStream / Executor / Buffer / EventLoop]
     H2 --> Core
     H3 --> QUIC[quic · ngtcp2 / QUIC TLS]
@@ -96,13 +109,14 @@ Solid arrows are dependency directions; dashed arrows are application-level comp
 
 | Module | Responsibility |
 |---|---|
-| `Mira::core` | Coroutines and task scopes, errors, stream and executor interfaces, buffers, event loop and timers |
-| `Mira::transport` | IP endpoints, TCP (exclusive bind by default), message-boundary UDP, bounded background system resolver |
+| `Mira::core` | Coroutines/scopes, stream/executor contracts, bounded posting, independent-thread `LoopGroup`, shared resource budgets |
+| `Mira::transport` | TCP/UDP, local streams, bounded system resolver, interleaved-candidate `tcp::dial`, managed serving |
 | `Mira::tls` | Same-loop duplex TLS streams, per-request deadlines, certificate/hostname verification, mTLS and ALPN |
-| `Mira::ws` / `Mira::crypto` | RFC6455 WebSocket and WSS composition, secure nonce/masking and handshake digest |
-| `Mira::http` | HTTP/1 request/response parsing, serialization, per-connection serving (incl. chunked streaming) and client |
-| `Mira::http2` | Optional nghttp2 session, multi-stream state, generic stream adaptation |
-| `Mira::quic` / `Mira::http3` | QUIC v1 and nghttp3 / QPACK engines |
+| `Mira::ws` / `Mira::crypto` | WebSocket/WSS, subprotocols, bounded RFC7692 compression, secure nonce/masking, Extended CONNECT field negotiation |
+| `Mira::http` | HTTP/1 parsing, serialization, per-connection serving, streaming requests/responses; depends only on stream contracts |
+| `Mira::client` / `Mira::client_tls` | Separate pooled HTTP/1 / HTTPS composition owning DNS/TCP/optional TLS and session lifetimes |
+| `Mira::http2` | Optional nghttp2 session, multi-stream, Extended CONNECT and `ConnectStream` |
+| `Mira::quic` / `Mira::http3` | QUIC v1, explicit migration/resumption, nghttp3/QPACK, Extended CONNECT; no H3 0-RTT |
 
 Layering is enforced by `tools/ci/check_layering.py`: no reverse dependencies, no host-framework headers, platform detection centralized in `platform.hpp`, and no OS headers inside protocol modules.
 
@@ -142,7 +156,7 @@ co_return co_await loop.read(handle, into,
 | Both hit at once | `cancelled` — an explicit request outranks an elapsed budget |
 | Real completion and cancellation in the same batch | The real completion wins |
 
-**Absolute time points, not durations**: a `{.deadline = T}` handed to `tls::Stream` is forwarded to every underlying read/write, so "the whole handshake must finish by T" requires no subtraction in any layer. Cancellation never rolls back I/O that already happened; on IOCP a cancelled read may discard bytes the kernel already moved — that connection must be closed, not reused.
+**Absolute time points, not durations**: `tls::Stream` manages `{.deadline = T}` with an independent event-loop timer for each request. The entire handshake or individual read/write shares that absolute deadline. Underlying ciphertext I/O carries no request deadline and is never cancelled and replayed merely to update a deadline. Expiry or cancellation invalidates the TLS session, wakes the other direction and drains associated operations before returning. Cancellation never rolls back I/O; an IOCP cancelled read can discard bytes already moved by the kernel, so that connection cannot be reused.
 </details>
 
 <details>
@@ -187,30 +201,35 @@ No 408 is sent: announcing it would require a second budget the caller never gra
 | macOS | kqueue | Desktop test runs, incl. TLS / HTTPS |
 | Linux | epoll | Desktop CI, dedicated TLS matrix |
 | Windows | IOCP | Desktop loopback CI, dedicated TLS matrix |
-| iOS / Android | kqueue / epoll | Cross-compile core / transport / HTTP1; Android requires **NDK 29+** |
+| iOS | kqueue | Host smoke and unsigned cross-build passed; no device run without a signing profile |
+| Android | epoll | Core / transport / HTTP1 cross-build, **NDK 29+**; no device-runtime evidence |
 
-CI covers desktop base/TLS/WSS, MinGW H2, sanitizers, HTTP/WebSocket fuzzing, both Autobahn roles and Linux/macOS H2/H3 runs. Windows MSVC executes QUIC/H3, multi-client and duplex TLS tests. Mobile jobs still cross-compile base non-TLS modules, not protocols on real devices. Linux builds a pinned HTTP/3 curl for mandatory independent interoperability; other platforms explicitly skip external H3 interoperability when curl lacks HTTP3, never count it as passed. See the CI link above for the current run.
+Historical CI covers desktop base/TLS/WSS, MinGW H2, sanitizers, HTTP/WebSocket fuzzing, both Autobahn roles and Linux/macOS H2/H3. Windows MSVC has run QUIC/H3, multi-client and duplex TLS tests. Linux builds a pinned HTTP/3 curl for independent interoperability; elsewhere missing HTTP3 curl is explicitly skipped, not passed. New Windows independent-H3 / MinGW entry points have only 3/3 parameter unit tests; the entry points themselves have not been executed.
+
+Evidence is snapshot-specific: the final 2026-09-28 source, including trust-bound ticket caching, passed **85/85** locally in each of AppleClang Release / GCC / ASan+UBSan, plus installed-consumer and dependency-isolation checks. LeakSanitizer was not run on macOS. Completed remote CI for `d3424f0` passed 17/17; consult the CI link above for this new revision rather than borrowing the older result.
 
 ## ✨ Capability overview
 
 | Area | Capabilities |
 |---|---|
-| Execution & lifecycle | Lazy, move-only `Task`; single-threaded `TaskScope` spawn/join with cooperative stop tokens; `EventLoop`, timers, posting |
+| Execution & lifecycle | Lazy `Task`, `TaskScope` join, reliable continuation posting, bounded application posting, independent-thread `LoopGroup` |
 | Cancellation & deadlines | `OperationOptions` flows through `EventLoop` → TCP → TLS → HTTP |
-| TCP | IPv4/IPv6, listen, connect, short I/O, exclusive bind by default |
-| UDP | IPv4/IPv6, zero-length datagrams, truncation errors, per-direction exclusivity |
+| TCP | IPv4/IPv6, interleaved-candidate `dial`, short I/O, exclusive bind, grace drain / cancel / join |
+| UDP | IPv4/IPv6, zero-length datagrams, truncation errors consuming the whole datagram, cancellation/deadlines |
 | DNS | Bounded worker pool, system getaddrinfo, dedup, total deadline |
 | TLS | OpenSSL 3, chain and DNS/IP verification, mTLS, multi-protocol ALPN, close_notify |
-| HTTP/1 | Incremental parsing, keep-alive, HEAD, chunked, streaming responses, external cancellation |
-| HTTP/2 | nghttp2 client/server, HPACK, multi-stream, consumption-driven windows |
-| QUIC/H3 | ngtcp2 + nghttp3 + OpenSSL ossl; encrypted datagrams, QPACK, two-phase GOAWAY |
-| Safety & resources | Protocol-level limits, malformed-input negative tests, bounded TLS BIO |
+| WebSocket/WSS | Subprotocols, fragmented/control frames, UTF-8, optional permessage-deflate, same-loop TCP/TLS duplex |
+| Local transport / SSE | POSIX Unix-domain sockets; HTTP/1 chunked SSE and Last-Event-ID example |
+| HTTP/1 | Incremental parsing, keep-alive, HEAD, chunked, streaming uploads/responses, separate HTTP/HTTPS pool composition |
+| HTTP/2 | nghttp2, HPACK, multi-stream, consumption-driven windows, explicit Extended CONNECT |
+| QUIC/H3 | ngtcp2 + nghttp3 + OpenSSL ossl; validated migration, QUIC resumption/explicit 0-RTT, QPACK, Extended CONNECT, two-phase GOAWAY; no H3 0-RTT |
+| Safety & resources | Protocol limits, bounded TLS BIO, cross-loop shared budgets; not a process-RSS cap |
 
 `stop()` only asks `run()` to return; per-operation cancellation is `OperationOptions`' job — every layer owns exactly one responsibility.
 
 ## 🚀 Quick start
 
-Requires **CMake 3.20+ and a C++23 compiler**. Tested baseline: **GCC 14+ / Clang 19+ (Linux) / AppleClang / MSVC v143**, proven end to end:
+Requires **CMake 3.20+ and a C++23 compiler**. Verified configurations use **GCC 14+ / Clang 19+ (Linux) / AppleClang / MSVC v143**; this does not claim every current working-tree combination passes:
 
 - **GCC 14+**: GCC 13's coroutine optimizer has a known internal compiler error; fixed in GCC 14.
 - **Clang 19+ on Linux**: clang-18 keeps `__cpp_concepts` outdated, so libstdc++ hides `std::expected` behind its feature-test.
@@ -262,6 +281,8 @@ The final command creates a local demonstration certificate only. The client ver
 
 ### 📦 Using it in your project
 
+**Version boundary: this page describes the `main` development branch; the archive example below pins v0.4.0 and does not include later unreleased capabilities.** Pin a verified full commit when consuming main-only APIs. Main-branch verification is not a feature list for an older release archive.
+
 The recommended pattern — the one Aria and AriaAgent use — is a **hash-pinned release archive**: every version ships a source tarball on GitHub Releases; download it, verify its SHA256, then `add_subdirectory` it. No submodules, no vendored trees, no configure-time network beyond the pinned fetch:
 
 ```cmake
@@ -281,15 +302,17 @@ target_link_libraries(my_app PRIVATE Mira::transport Mira::http)
 
 For local development, pointing at a source tree works too: `add_subdirectory(vendor/Mira)` (`MIRA_BUILD_TESTS` defaults off in subdirectory mode). Installed consumption uses `find_package(Mira REQUIRED COMPONENTS core transport http)`, add the `tls` component when needed.
 
+Main-only owning-client composition uses `find_package(Mira REQUIRED COMPONENTS client)` / `Mira::client`; HTTPS uses `client_tls` / `Mira::client_tls` and requires `MIRA_ENABLE_TLS=ON` when building. The base `client` target does not introduce OpenSSL; `http` itself still does not depend on transport. These targets do not apply to the v0.4.0 archive above.
+
 Android requires **NDK 29 or newer**: NDK 27/28's libc++ gates `std::stop_token` off; NDK 29 (clang 21) builds on API 24 as tested.
 
 ## Production composition now available
 
-- **Single-port multi-client QUIC/H3**: `quic::Dispatcher` routes actual DCIDs, including newly issued IDs; `http3::make_server` composes H3. Admission, payload and queue reservations are bounded, and dispatchers can share `ResourceBudget`. Termination releases application budgets while retaining all issued CIDs for at least three PTOs. Local closes retransmit on matching input with bounded pacing; peer draining is silent. Closing slots are reserved at admission, never evicted early; explicit `remove()` purges protection. These are accounting limits, not a hard RSS cap or complete replay/flood protection; peers remain fixed.
+- **Single-port multi-client QUIC/H3**: `quic::Dispatcher` routes actual DCIDs, including newly issued IDs; `http3::make_server` composes H3. Admission, payload and queue reservations are bounded. Default `fixed_peer` rejects changed sources; explicit `MigrationPolicy::validated` permits migration/NAT rebinding only through path validation. Dispatchers can share `ResourceBudget`. Termination releases application budgets while retaining all issued CIDs for at least three PTOs. Local closes retransmit on matching input with bounded pacing; peer draining is silent. Closing slots are reserved at admission, never evicted early; explicit `remove()` purges protection. These are accounting limits, not a hard RSS cap or complete replay/flood protection.
 - **QUIC Retry / source-address validation**: pass `RetryOptions{.policy = RetryPolicy::required}` to `http3::make_server` / `quic::Listener::create`. No connection or admission budget is allocated before token verification. Tokens use ngtcp2's AEAD, binding peer address/port, version, Retry CID, service scope and local endpoint. Expired, future, tampered or changed-source tokens are dropped silently. Keys default to instance-random and can be rotated with one previous key retained. Send or discard `ingest().reply` immediately; there is no internal Retry queue. The default limit is 128 replies per listener per fixed one-second window; adjacent windows can permit a burst of 256. This is not a sliding-second bound, full DDoS protection or one-time/replay protection. The policy defaults to disabled; public endpoints must explicitly select required. Shared keys require matching scope, local endpoint, ALPN and monotonic clock epoch.
 - **Streaming H2/H3 output**: `request_stream` / `respond_stream` → `write_body` → `finish_body`. Exhaustion returns `would_block` without failing the connection. H3 chunks survive until ACK; QUIC bidirectional streams rotate to prevent starvation.
-- **Connection lifecycle**: `ConnectionPool<T>` provides bounded per-origin leases and idle eviction; leases discard by default and recycle only drained connections. `tcp::connect_with_retry` retries connection establishment, never application requests. `tcp::serve` bounds admission and cooperatively stops, cancels and joins handlers.
-- **WebSocket/WSS**: `MIRA_ENABLE_WEBSOCKET=ON` builds `Mira::ws` with OpenSSL Crypto-backed nonce/masking/RFC6455 handshake support and zlib. Fragmentation, incremental UTF-8, ping/pong/close, limits and independent peers are tested. TCP and TLS/WSS support one concurrent read and write on the same event loop; handshake/shutdown remain exclusive. Each TLS request owns its deadline timer. Cancellation/timeouts permanently invalidate the session and wake its companion, never replay ciphertext after cancellation. `Stream::create` takes the event loop explicitly; `close()` stops the wrapper without owning the transport. Optional subprotocol negotiation and permessage-deflate are supported; H2/H3 Extended CONNECT remains absent.
+- **Connection lifecycle**: `client::HttpClient` / `HttpsClient` compose resolution, `tcp::dial` and bounded per-origin pools; client instances and fixed TLS configurations remain isolated. `Session::recycle()` requires a fully drained reusable response and no retained session tasks, otherwise it fails. Destruction discards by default; business requests are never replayed automatically, and `tcp::connect_with_retry` retries establishment only. `tcp::serve(loop, ...)` stops admission and closes the listener, allows a `grace_period` drain, then cooperatively cancels and joins. Grace bounds when cancellation is requested, not when an uncooperative handler returns.
+- **WebSocket/WSS**: `MIRA_ENABLE_WEBSOCKET=ON` builds `Mira::ws` with OpenSSL Crypto-backed nonce/masking/RFC6455 handshake support and zlib. Fragmentation, incremental UTF-8, ping/pong/close, limits and independent peers are tested. TCP and TLS/WSS support one concurrent read and write on the same event loop; handshake/shutdown remain exclusive. Each TLS request owns its deadline timer. Cancellation/timeouts permanently invalidate the session and wake its companion, never replay ciphertext after cancellation. `Stream::create` takes the event loop explicitly; `close()` stops the wrapper without owning the transport. Optional subprotocol negotiation and permessage-deflate also compose over explicitly negotiated H2/H3 Extended CONNECT. Tunnel adapters have a different concurrency contract from TCP/TLS duplex, detailed below.
 - **SSE / local streams**: `mira_sse_server` demonstrates chunked SSE, IDs and Last-Event-ID resume. `transport::local` provides POSIX filesystem Unix-domain streams; Windows explicitly returns `not_supported`. Caller-owned paths are never automatically removed.
 
 ```bash
@@ -303,6 +326,23 @@ ctest --test-dir build/ws --output-on-failure
 
 Real network benchmark: `python3 tools/bench/network_bench.py --server build/release/mira_managed_echo_server --clients 8 --requests 1000 --slow-clients 4` emits throughput, p50/p99, sampled peak RSS and environment JSON. The independent Python socket load generator uses loopback; these are neither cross-library rankings nor WAN measurements.
 
+### Main-branch API boundaries
+
+- **QUIC paths and early data**: validated mode requires path-aware `receive` plus `poll_datagram` / `close_datagram`. Clients call `initiate_migration()`; applications retain both paths during validation and send on the returned path. A CID match is not address validation. The bounded in-memory `SessionCache` limits entries, bytes, ticket size and lifetime; `ServerContext` explicitly shares the server ticket domain. Ordinary `open_stream` / `write` never send early data. Only `EarlyDataPolicy::replay_safe` plus `open_early_stream` / `write_early` attempt raw QUIC 0-RTT. Callers must make operations replay-safe; there is no anti-replay guarantee and rejected data is never replayed automatically. **This is not HTTP/3 0-RTT**; the H3 engine rejects that opt-in.
+- **Dialing and uploads**: `tcp::dial` deduplicates resolved endpoints, interleaves IPv4/IPv6 and staggers bounded concurrent attempts within one deadline; losers are cancelled and joined before return. System `getaddrinfo` still runs in bounded workers, not independent asynchronous A/AAAA queries. HTTP/1 `begin` → `send_body` → `finish` supports content-length/chunked uploads, per-chunk backpressure and one budget covering upload, producer pauses and response. It is **send-first**: no `Expect: 100-continue` or concurrent early-response reads. A peer refusing an upload may need the total deadline to end writes.
+- **Execution and budgets**: `EventLoop::post` remains the reliable continuation channel. Application admission uses `try_post` / `BoundedExecutor`, returning `would_block` on saturation; the latter deliberately does not satisfy `Executor`. Posting quotas end before invocation and do not bound asynchronous work created by callbacks. `LoopGroup` owns an independent thread-affine loop per worker, bounding queued and unfinished root tasks. Create/use sockets on their worker; do not transfer attached sockets. Shared `ResourceBudget` is accounting, not a bound on all allocator/third-party state or process RSS.
+- **Managed TLS example**: enable TLS/H2 and run `build/protocols/mira_https_managed_server cert.pem key.pem 8444 64 16 5000 1000 1000`. It separately bounds connections/handshakes, sets handshake deadlines, dispatches negotiated ALPN to H1/H2, rejects missing/unknown ALPN and demonstrates grace drain / cancel / join. Each connection serves one H1 request or one H2 batch, not a general production server.
+
+QUIC resumption and 0-RTT require an explicit `ca_file`. Cache keys bind the trust material actually loaded by OpenSSL (certificates, AUX trusted/rejected purposes and CRLs), so replacing a CA or its trust attributes at the same path cannot reuse an old ticket. The fingerprint comes from the loaded store, not a second path read. With an empty `ca_file`, default system trust may include lazy sources: no tickets are stored or resumed, and each connection performs a full authenticated handshake. File changes do not retroactively revoke existing connections.
+
+### H2/H3 Extended CONNECT
+
+Explicitly set `enable_connect_protocol = true` in `http2::Limits` / `http3::Limits`. Clients wait for actual peer `SETTINGS_ENABLE_CONNECT_PROTOCOL`, then use `request_stream` with `:method = CONNECT`, `:protocol`, `:scheme`, `:authority` and `:path`. Servers accept through `respond_stream`; only successful 2xx responses establish tunnels. **204 returns `not_supported`** because the pinned engines treat it as bodyless. Ordinary CONNECT proxying is outside this capability.
+
+`http2::ConnectStream<Driver>` / `http3::ConnectStream<Driver>` borrow accepted streams. Driver `progress(OperationOptions)` / `flush(OperationOptions)` must serialize connection driving and honor cancellation/deadlines. **Each adapter permits one operation at a time**. Callers own cross-stream scheduling and stable object/buffer lifetimes; never mix direct body operations. `finish()` half-closes local output; `close()`/cancellation resets only that stream, without promising driver-level connection failures stay stream-local.
+
+WebSocket uses `extended_connect_request` / `accept_extended_connect` / `validate_extended_connect` to validate fields and negotiate subprotocols/PMD, then passes `Negotiated` to `Connection::adopt_extended_connect`. No HTTP/1 Upgrade or nonce handshake runs. The latest `ws.connect_network` run passed four scenarios: TCP H2 / UDP H3 × compression off/on. This is same-library real-network evidence, not independent Extended CONNECT interoperability. The first-Initial-flight drop setting was removed, so this test is not PTO recovery evidence.
+
 ### WebSocket subprotocols and compression
 
 Pass `HandshakeOptions` as the fourth `ws::Connection` constructor argument. `subprotocols` is an ordered protocol list; the server chooses a shared value in server preference order. `require_subprotocol` requires agreement. Read `subprotocol()` after the handshake. Names are case-sensitive; clients reject unoffered protocols, multiple selections and duplicate response headers.
@@ -311,7 +351,7 @@ Only `compression.enabled = true` offers/accepts RFC7692 permessage-deflate; it 
 
 `compression_parameters()` returns the wire agreement; clients still locally honor stricter window and no-context hints promised in their offer. Compression introduces size side channels: do not mix secrets and attacker-controlled content in one compression context; leave compression off for sensitive data. Building ws requires zlib, but base-module and Crypto-only installed consumers do not discover it.
 
-Independent Python socket/zlib interoperability: `python3 tools/ci/check_ws_interop.py --extensions-peer build/ws/mira_ws_extensions_peer`. Run the official complete compression mode with `run_autobahn.py --compression`; reports retain actual execution, informational, failure and missing-case counts. A configured entry point is not a completed conformance result.
+Independent Python socket/zlib interoperability: `python3 tools/ci/check_ws_interop.py --extensions-peer build/ws/mira_ws_extensions_peer`. Commit `d3424f0` passed official Autobahn 25.10.1 full coverage including compression: 517 cases per role, 514 OK + 3 INFORMATIONAL; 1,034 total = 1,028 OK + 6 INFORMATIONAL, zero failures, NON-STRICT results, missing or excluded cases. Informational cases are not strict OK verdicts; later revisions need their own verification. Run complete compression coverage with `run_autobahn.py --compression`.
 
 ### Real UDP Retry fault validation
 
@@ -319,17 +359,19 @@ Enable `MIRA_ENABLE_HTTP3=ON` and `MIRA_BUILD_BENCH=ON` to reproduce bounded los
 
 ```bash
 python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak \
-  --duration-seconds 300 --seed 20260928 --output build/h3-soak.json
+  --duration-seconds 600 --seed 20260929 --output build/h3-soak.json
 ```
 
 Each round verifies binary contents, newly submitted short streams progressing during slow responses, closing-slot admission and final budget drain; timeouts or mismatches fail with a nonzero exit. Defaults are 3 clients with 4 streams each, streaming 128 KiB large bodies through 16 KiB protocol buffers. A fixed seed selects fault decisions, not bit-identical timing or random CIDs. This is single-machine loopback sustained validation, not multi-host or long-term stability certification. Initial normal-close packets bypass fault injection; RSS is sampled, not capped. Keep the machine awake; sleep-induced timeouts still fail.
 
+Recorded 600-second report `build/all-main/sustained-600.json`: 13,548/13,548 requests passed and 10,161/10,161 short streams completed during slow-response overlap; final connections, routes, tombstones, queued_bytes and reserved_payload_bytes were all zero. This is single-machine real-UDP loopback evidence, not multi-host/WAN coverage, certification of later source or a hard process-RSS cap.
+
 ## Next: remaining verification boundaries
 
-1. iOS/Android TLS/protocol device runs still require connected devices; mobile currently cross-compiles only. Windows MSVC H3, WSS duplex and concurrent TLS 1.3 KeyUpdate regressions have run. Independent third-party HTTP/3 interoperability on Windows and MinGW H3 remain uncovered.
-2. Longer fault injection, multi-machine load and process-memory governance. Official Autobahn 25.10.1 non-compression RFC6455 coverage is complete for both roles: 301 cases each, 298 OK + 3 INFORMATIONAL, zero failures, NON-STRICT results or missing cases. That confirmed baseline excluded 216 compression cases per role. Compression implementation and independent interoperability are now present; the new `--compression` gate still requires its actual reports, and the old counts must not be presented as compression certification. Reproduce on Linux with `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker`; CI preserves the complete reports.
-3. QUIC migration/NAT rebinding, 0-RTT and HTTP/3 Extended CONNECT remain unsupported. Retry source-address validation and closing/draining are implemented, but tokens are not single-use or fully replay-proof; the listener is not an Internet flood-protection system.
-4. MQTT, SOCKS5 and DNS/DoH are demand-driven independent extensions. Keep gRPC/Redis/WebRTC in the ecosystem layer, not bundled into the network core.
+1. iOS host smoke and unsigned cross-compilation passed, but device execution lacks a signing profile; Android has no device evidence. Windows MSVC H3, WSS duplex and TLS 1.3 KeyUpdate regressions have run. New Windows independent-H3 / MinGW entry points have only 3/3 parameter unit tests and still await execution.
+2. Cross-platform CI for this revision, longer fault injection, multi-host/WAN load and process-memory governance remain unverified; the final local full matrix passed 85/85 in all three configurations. Full official Autobahn coverage including compression has only the complete `d3424f0` report above. Reproduce on Linux with `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker --compression`; CI preserves the complete reports.
+3. Validated QUIC migration/NAT rebinding, explicit raw-QUIC 0-RTT and H2/H3 Extended CONNECT are implemented on main. HTTP/3 0-RTT, comprehensive anti-replay guarantees and independent Extended CONNECT interoperability remain undelivered/unverified. Retry tokens are not guaranteed single-use; the listener is not an Internet flood-protection system.
+4. **Next-phase goals**: HTTP/3 0-RTT, HTTP/1 `Expect: 100-continue` / concurrent early-response reads, and independent MQTT, SOCKS5 and DoH modules. These are not implemented in this round. Keep gRPC/Redis/WebRTC in the ecosystem layer, not bundled into the network core.
 
 See the [architecture document](docs/ARCHITECTURE.md) for design rationale and acceptance criteria.
 

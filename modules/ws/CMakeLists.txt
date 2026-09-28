@@ -5,7 +5,7 @@ target_include_directories(mira_ws PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 target_compile_features(mira_ws PUBLIC cxx_std_23)
-target_link_libraries(mira_ws PUBLIC Mira::core Mira::crypto ZLIB::ZLIB
+target_link_libraries(mira_ws PUBLIC Mira::core Mira::crypto Mira::http_common ZLIB::ZLIB
     PRIVATE $<BUILD_INTERFACE:Mira::warnings>)
 set_target_properties(mira_ws PROPERTIES OUTPUT_NAME Mira-ws
     VERSION ${PROJECT_VERSION} EXPORT_NAME ws)

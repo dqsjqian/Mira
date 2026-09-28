@@ -23,6 +23,15 @@ struct Limits {
     std::size_t max_buffered_body = 4 * 1024 * 1024;
     std::size_t max_events = 4096;
     std::size_t max_streams = 64;
+    bool enable_connect_protocol = false;
+};
+struct ConnectState {
+    std::string protocol;
+    bool accepted = false;
+    bool local_end = false;
+    bool remote_end = false;
+    bool closed = false;
+    Error error;
 };
 struct Event {
     enum class Kind { headers, body, end, reset, goaway } kind;
@@ -31,7 +40,9 @@ struct Event {
     quic::Bytes data;
     std::uint64_t error_code = 0;
 };
-/// HTTP/3 state machine owning a QUIC engine; h3 ALPN only, no 0-RTT/server push/extended CONNECT.
+/// HTTP/3 state machine owning a QUIC engine; h3 ALPN only, no server push.
+/// Extended CONNECT is opt-in and waits for the server's actual SETTINGS.
+/// The pinned dependency treats 204 as bodyless; 204 tunnels are explicitly unsupported.
 /// Incoming body is delivered in chunks and the window is restored via consume. Outgoing chunks
 /// remain stable until acknowledged; max_buffered_body bounds the connection-wide retained body.
 class Engine {
@@ -41,7 +52,9 @@ public:
     Engine& operator=(Engine&&) noexcept;
     ~Engine();
     Result<void> receive(std::span<const std::byte> datagram, std::uint64_t now);
+    Result<void> receive(const quic::Path& path, std::span<const std::byte> datagram, std::uint64_t now);
     Result<quic::Bytes> poll(std::uint64_t now);
+    Result<quic::Packet> poll_datagram(std::uint64_t now);
     Result<void> handle_expiry(std::uint64_t now);
     std::uint64_t expiry() const noexcept;
     bool ready() const noexcept;
@@ -60,6 +73,13 @@ public:
     Result<void> write_body(std::int64_t stream, std::span<const std::byte> body, bool end = false);
     Result<void> finish_body(std::int64_t stream);
     std::size_t queued_body_bytes() const noexcept;
+    bool peer_connect_protocol_enabled() const noexcept;
+    bool local_connect_protocol_enabled() const noexcept;
+    Result<ConnectState> connect_state(std::int64_t stream) const;
+    Result<std::size_t> read_connect(std::int64_t stream, std::span<std::byte> destination);
+    Result<std::size_t> write_connect(std::int64_t stream, std::span<const std::byte> source);
+    // Accepted CONNECT records are retained until release_connect, including after RESET/FIN.
+    Result<void> release_connect(std::int64_t stream);
     std::vector<Event> take_events();
     Result<void> consume(std::int64_t stream, std::size_t bytes);
     Result<void> cancel(std::int64_t stream);
@@ -67,6 +87,7 @@ public:
     Result<void> shutdown_notice();
     Result<void> shutdown();
     Result<quic::Bytes> close(std::uint64_t code, std::uint64_t now);
+    Result<quic::Packet> close_datagram(std::uint64_t code, std::uint64_t now);
 
 private:
     Result<std::int64_t> request_impl(const Headers&, std::span<const std::byte>, bool streaming);

@@ -416,7 +416,48 @@ void limits_and_header_integrity() {
     invalid_handshake(negotiate_server_handshake(request("Sec-WebSocket-Extensions : permessage-deflate\r\n"), options));
 }
 }
+void extended_fields() {
+    HandshakeOptions options;
+    options.subprotocols = {"chat.v2", "chat.v1"};
+    options.require_subprotocol = true;
+    options.compression.enabled = true;
+    auto offer = extended_connect_offer(options);
+    CHECK(offer.has_value());
+    if (!offer) return;
+    auto server = negotiate_extended_server(*offer, options);
+    CHECK(server.has_value());
+    if (!server) return;
+    auto accepted = negotiate_extended_client(200, server->fields, options);
+    CHECK(accepted && accepted->subprotocol == "chat.v2" && accepted->compression.enabled);
+    for (unsigned status : {101U, 199U, 300U, 403U})
+        CHECK(!negotiate_extended_client(status, server->fields, options));
+    auto invalid = *offer;
+    invalid[0].value = "12";
+    CHECK(!negotiate_extended_server(invalid, options));
+    for (const auto& name : {"connection", "upgrade", "sec-websocket-key", "sec-websocket-accept"}) {
+        invalid = *offer;
+        invalid.push_back({name, "invalid"});
+        CHECK(!negotiate_extended_server(invalid, options));
+    }
+    auto reply = server->fields;
+    reply.push_back({"sec-websocket-protocol", "chat.v2"});
+    CHECK(!negotiate_extended_client(200, reply, options));
+    CHECK(!negotiate_extended_client(200, server->fields, {}));
+    reply = {{"sec-websocket-protocol", "unoffered"}};
+    CHECK(!negotiate_extended_client(200, reply, options));
+    invalid = *offer;
+    invalid.push_back({"sec-websocket-version", "13"});
+    CHECK(!negotiate_extended_server(invalid, options));
+    invalid = {{"sec-websocket-version", "13\r\nInjected: value"}};
+    CHECK(!negotiate_extended_server(invalid, options));
+    Limits tiny;
+    tiny.max_handshake = 8;
+    CHECK(!extended_connect_offer(options, tiny));
+    CHECK(!negotiate_extended_server(*offer, options, tiny));
+    CHECK(!negotiate_extended_client(200, server->fields, options, tiny));
+}
 int main() {
+    extended_fields();
     defaults_and_compatibility();
     subprotocols();
     compression_roundtrips();

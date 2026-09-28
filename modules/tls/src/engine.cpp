@@ -10,6 +10,7 @@
 namespace Mira::tls {
 
 struct Engine::Impl {
+    ResourceBudget::Reservation reservation;
     SSL* ssl = nullptr;
     BIO* wire = nullptr;
     bool ready = false;
@@ -50,12 +51,20 @@ Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
 Engine::~Engine() = default;
 
-Result<Engine> Engine::create(const Context& context, std::string_view peer_name) {
+Result<Engine> Engine::create(const Context& context, std::string_view peer_name,
+                              std::optional<ResourceBudget> budget) {
     if (!context.impl_) return fail(make_error_code(Errc::invalid_state));
     if (context.impl_->client &&
         (peer_name.empty() || peer_name.find('\0') != std::string_view::npos))
         return fail(Mira::Errc::invalid_argument);
+    ResourceBudget::Reservation reservation;
+    if (budget) {
+        auto acquired = budget->try_acquire(reserved_buffer_bytes);
+        if (!acquired) return fail(acquired.error());
+        reservation = std::move(*acquired);
+    }
     auto impl = std::make_unique<Impl>();
+    impl->reservation = std::move(reservation);
     ERR_clear_error();
     impl->ssl = SSL_new(context.impl_->handle);
     if (!impl->ssl) return fail(make_error_code(Errc::configuration_error));

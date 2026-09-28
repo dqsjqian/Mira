@@ -7,8 +7,47 @@ version is 0, the minor version is where breaking changes land: a request for
 
 ## [Unreleased]
 
+These entries describe the `main` development tree, not the published v0.4.0
+archive used by the consumption examples. The existing 0.5.0 entry below is
+retained development history, not a release announcement for this work.
+
 ### Added
 
+- Opt-in validated QUIC migration/NAT rebinding with path-aware input/output;
+  fixed-peer behavior remains the default. Client-initiated migration and
+  dispatcher peer updates use ngtcp2 path validation, not CID possession alone.
+- Bounded, in-memory QUIC `SessionCache` and explicitly shared `ServerContext`
+  ticket domains. Raw QUIC 0-RTT requires `EarlyDataPolicy::replay_safe` plus
+  `open_early_stream` / `write_early`; it provides no anti-replay guarantee and
+  rejected early data is never automatically replayed. HTTP/3 0-RTT remains
+  unsupported; its engine rejects the early-data opt-in.
+- Opt-in H2/H3 Extended CONNECT with actual peer SETTINGS gating, `:protocol`
+  validation and bounded tunnel I/O. `ConnectStream` borrows a driver that
+  serializes connection progress/flush and honors cancellation/deadlines; each
+  adapter permits only one operation at a time. WebSocket field negotiation,
+  subprotocols and permessage-deflate compose over accepted tunnels without an
+  HTTP/1 upgrade. Status 204 tunnels explicitly return `not_supported` because
+  the pinned engines treat 204 as bodyless.
+- `tcp::dial` races deduplicated, family-interleaved candidates with bounded
+  attempts/parallelism, staggered starts, one deadline and loser cancellation/join.
+  System resolution still completes through bounded getaddrinfo workers; this
+  is not independent asynchronous A/AAAA resolution.
+- HTTP/1 `begin` / `send_body` / `finish` streaming uploads with content-length
+  or chunked framing and one exchange budget. Uploads are send-first: no
+  `Expect: 100-continue` handshake or concurrent early-response reads.
+- Separate `Mira::client` and optional `Mira::client_tls` composition targets for
+  owned HTTP/1 and HTTPS pools. Normalized origins and client/TLS configuration
+  instances stay isolated; recycling requires a drained reusable response and
+  no retained session tasks. No automatic business-request replay is added.
+- Thread-safe shared `ResourceBudget`, bounded application `try_post` /
+  `BoundedExecutor` admission and `LoopGroup` with bounded queued/unfinished root
+  tasks on independent thread-affine loops. Reliable continuation `post` remains
+  separate; accounting quotas are not allocator or process-RSS limits.
+- TCP server admission-stop, grace drain, cooperative cancel and join, with
+  separate handler deadlines. The TLS/ALPN managed server example bounds
+  handshakes, dispatches H1/H2 explicitly and rejects missing/unknown ALPN.
+- Windows independent-H3/MinGW validation entry points and an iOS device-smoke
+  scaffold; their validation limits are recorded separately below.
 - Case-sensitive WebSocket subprotocol negotiation, required-selection policy,
   and negotiated-protocol accessors.
 - Opt-in RFC7692 permessage-deflate with bounded raw zlib codecs, directional
@@ -30,10 +69,11 @@ version is 0, the minor version is where breaking changes land: a request for
   TLS `Stream::create` now requires its `EventLoop&` as the first argument.
 - Bounded QUIC closing/draining tombstones retaining all issued CIDs for three
   PTOs, paced input-triggered close retransmission and shared cache accounting.
-- Official Autobahn 25.10.1 client/server coverage: 301 non-compression cases per
-  role (298 OK, 3 informational, zero failures/non-strict/missing cases).
-  That verified baseline excluded 216 compression cases per role; the new
-  compression mode includes them and requires a separate conformance result.
+- Official Autobahn 25.10.1 client/server coverage, including compression:
+  `d3424f0` passed 517 cases per role (514 OK + 3 INFORMATIONAL), 1,034 total
+  (1,028 OK + 6 INFORMATIONAL), with zero failures, NON-STRICT, missing or
+  excluded cases. This supersedes the earlier non-compression baseline only
+  for that tested revision; later changes require fresh reports.
 - WebSocket framing and handshake libFuzzer harnesses, plus regression-tested
   conformance report checking and cross-platform pinned dependency extraction.
 - CID-routed single-port QUIC/H3 dispatchers, bounded admission and resource
@@ -49,6 +89,12 @@ version is 0, the minor version is where breaking changes land: a request for
 
 ### Fixed
 
+- QUIC session tickets now bind the actually loaded CA trust material, including
+  X509 AUX trusted/rejected purposes and CRLs, instead of relying on a file path.
+  Same-path CA replacement no longer restores an old session or enables 0-RTT.
+  Fingerprinting the loaded store avoids a separate hash/load path race. Default
+  system trust may load sources lazily, so it conservatively neither stores nor
+  resumes tickets; full certificate verification remains enabled.
 - Incremental UTF-8 validation rejects impossible text prefixes without waiting
   for the remainder of a frame or fragmented message.
 - Event-loop timer/deadline registration rolls back every partially registered
@@ -59,6 +105,24 @@ version is 0, the minor version is where breaking changes land: a request for
 - Installed consumer verification restricts multi-config generators to the
   configuration actually installed, including vcpkg's configuration mappings.
 
+### Verification boundaries
+
+- Final 2026-09-28 source including trust-bound ticket caching: local AppleClang
+  Release, GCC and ASan+UBSan each passed 85/85; installed-consumer and dependency
+  isolation checks passed. macOS LeakSanitizer was not run. Remote `d3424f0` CI
+  passed 17/17; this new revision still requires its own cross-platform results.
+- Latest `ws.connect_network` passed four same-library real-network scenarios:
+  H2 over TCP and H3 over UDP, each with compression disabled/enabled. The
+  first-Initial-flight drop setting was removed; this test is not PTO recovery
+  evidence or independent Extended CONNECT interoperability.
+- `build/all-main/sustained-600.json`: 600-second H3 real-UDP loopback soak,
+  13,548/13,548 requests, 10,161 short streams completing during slow-response
+  overlap, and zero final connections/routes/tombstones/queued bytes/reserved
+  payload bytes. This is one-machine evidence, not multi-host/WAN or an RSS cap.
+- Windows independent-H3/MinGW entry points have 3/3 parameter unit tests only,
+  not execution evidence. iOS host smoke and unsigned cross-compilation passed;
+  device execution lacks a signing profile. Android device runs and multi-host
+  validation have no evidence.
 
 ## [0.5.0] — 2026-09-28
 

@@ -602,6 +602,49 @@ DetachedTask start_handshake(tls::Stream<ControlledTransport>& stream, Error& er
     }
 }
 
+void test_shared_buffer_budget(const Certificates& certificates) {
+    test::section("TLS shared BIO and stream buffer reservations");
+    auto context = tls::Context::client(certificates.ca);
+    auto loop = EventLoop::create();
+    CHECK(context && loop);
+    if (!context || !loop) return;
+    ResourceBudget budget{tls::Engine::reserved_buffer_bytes};
+    {
+        auto engine = tls::Engine::create(*context, "localhost", budget);
+        CHECK(engine.has_value());
+        CHECK(budget.used() == tls::Engine::reserved_buffer_bytes);
+        auto rejected = tls::Engine::create(*context, "localhost", budget);
+        CHECK(!rejected && rejected.error() == Errc::would_block);
+        CHECK(budget.used() == tls::Engine::reserved_buffer_bytes);
+        if (engine) {
+            auto moved = std::move(*engine);
+            moved.invalidate();
+            CHECK(budget.used() == tls::Engine::reserved_buffer_bytes);
+        }
+    }
+    CHECK(budget.used() == 0);
+    ControlledTransport transport;
+    using Secure = tls::Stream<ControlledTransport>;
+    ResourceBudget buffers{Secure::reserved_buffer_bytes};
+    {
+        auto stream = Secure::create(*loop, transport, *context, "localhost", buffers);
+        CHECK(stream.has_value());
+        CHECK(buffers.used() == Secure::reserved_buffer_bytes);
+        auto second = Secure::create(*loop, transport, *context, "localhost", buffers);
+        CHECK(!second && second.error() == Errc::would_block);
+        if (stream) stream->close();
+        CHECK(buffers.used() == Secure::reserved_buffer_bytes);
+    }
+    CHECK(buffers.used() == 0);
+    ResourceBudget too_small{Secure::reserved_buffer_bytes - 1};
+    auto failed = Secure::create(*loop, transport, *context, "localhost", too_small);
+    CHECK(!failed && failed.error() == Errc::would_block);
+    CHECK(too_small.used() == 0);
+    auto bad_name = Secure::create(*loop, transport, *context, "", buffers);
+    CHECK(!bad_name && bad_name.error() == Errc::invalid_argument);
+    CHECK(buffers.used() == 0);
+}
+
 void test_concurrent_operations(const Certificates& certificates) {
     test::section("TLS overlapping operations and zero-progress ciphertext writes");
     auto loop = EventLoop::create();
@@ -1806,6 +1849,7 @@ int main(int argc, char** argv) {
         test_faults(certificates);
         test_mtls(certificates);
         test_alpn(certificates);
+        test_shared_buffer_budget(certificates);
         test_concurrent_operations(certificates);
         test_options_reach_the_underlying_stream(certificates);
         run_exchange(certificates, "HTTPS DNS identity verification and close_notify", "localhost");

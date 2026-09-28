@@ -23,6 +23,15 @@ execute_process(COMMAND "${MIRA_QUIC_OPENSSL_TOOL}" req -x509 -newkey rsa:2048 -
 if(NOT cert_result EQUAL 0)
     message(FATAL_ERROR "Failed to generate the local QUIC test certificate")
 endif()
+set(MIRA_QUIC_OTHER_CERT "${CMAKE_CURRENT_BINARY_DIR}/other-ca.pem")
+execute_process(COMMAND "${MIRA_QUIC_OPENSSL_TOOL}" req -x509 -newkey rsa:2048 -nodes
+    -config "${CMAKE_CURRENT_BINARY_DIR}/openssl.cnf"
+    -keyout "${CMAKE_CURRENT_BINARY_DIR}/other-ca-key.pem" -out "${MIRA_QUIC_OTHER_CERT}" -days 2
+    -subj /CN=unrelated-ca -addext basicConstraints=critical,CA:TRUE
+    RESULT_VARIABLE other_cert_result OUTPUT_QUIET ERROR_QUIET)
+if(NOT other_cert_result EQUAL 0)
+    message(FATAL_ERROR "Failed to generate the unrelated QUIC test CA")
+endif()
 add_executable(test_quic_retry test_retry.cpp)
 target_link_libraries(test_quic_retry PRIVATE Mira::quic mira_ngtcp2_ossl Mira::warnings)
 add_test(NAME quic_retry COMMAND test_quic_retry "${MIRA_QUIC_TEST_CERT}" "${MIRA_QUIC_TEST_KEY}")
@@ -39,6 +48,24 @@ foreach(mode normal chaos bad-host untrusted bad-alpn stream-limit)
     add_test(NAME quic_${mode} COMMAND test_quic_engine "${MIRA_QUIC_TEST_CERT}" "${MIRA_QUIC_TEST_KEY}" ${mode})
     set_tests_properties(quic_${mode} PROPERTIES TIMEOUT 30)
 endforeach()
+
+set(MIRA_QUIC_REJECTED_CERT "${CMAKE_CURRENT_BINARY_DIR}/rejected-ca.pem")
+execute_process(COMMAND "${MIRA_QUIC_OPENSSL_TOOL}" x509 -in "${MIRA_QUIC_TEST_CERT}"
+    -addreject serverAuth -trustout -out "${MIRA_QUIC_REJECTED_CERT}"
+    RESULT_VARIABLE rejected_cert_result OUTPUT_QUIET ERROR_QUIET)
+if(NOT rejected_cert_result EQUAL 0)
+    message(FATAL_ERROR "Failed to generate the rejected-purpose QUIC test CA")
+endif()
+add_test(NAME quic_ca-aux COMMAND test_quic_engine
+    "${MIRA_QUIC_TEST_CERT}" "${MIRA_QUIC_TEST_KEY}" ca-aux "${MIRA_QUIC_REJECTED_CERT}")
+set_tests_properties(quic_ca-aux PROPERTIES TIMEOUT 30)
+foreach(mode ca-rotation ca-rotation-early system-cache)
+    add_test(NAME quic_${mode} COMMAND test_quic_engine
+        "${MIRA_QUIC_TEST_CERT}" "${MIRA_QUIC_TEST_KEY}" ${mode} "${MIRA_QUIC_OTHER_CERT}")
+    set_tests_properties(quic_${mode} PROPERTIES TIMEOUT 30)
+endforeach()
+set_tests_properties(quic_system-cache PROPERTIES
+    ENVIRONMENT "SSL_CERT_FILE=${MIRA_QUIC_TEST_CERT};SSL_CERT_DIR=${CMAKE_CURRENT_BINARY_DIR}/empty-ca-dir")
 
 # The engine's in-memory datagram tests prove the protocol state machine;
 # this one proves the whole stack over the kernel's UDP.

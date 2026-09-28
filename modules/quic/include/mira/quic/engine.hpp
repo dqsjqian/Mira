@@ -93,6 +93,21 @@ class RetryValidation {
     std::uint64_t verified_at_ = 0;
 };
 
+enum class MigrationPolicy { fixed_peer, validated };
+enum class EarlyDataPolicy { disabled, replay_safe };
+enum class EarlyDataStatus { not_attempted, pending, accepted, rejected };
+class SessionCache;
+class ServerContext;
+struct Path {
+    transport::Endpoint local;
+    transport::Endpoint remote;
+    friend bool operator==(const Path&, const Path&) = default;
+};
+struct Packet {
+    Path path;
+    Bytes data;
+};
+
 struct Options {
     bool server = false;
     transport::Endpoint local;
@@ -108,6 +123,50 @@ struct Options {
     // Lifetime CID limit including original DCID and Retry SCID; never evict retired IDs.
     std::size_t max_connection_ids = 64;
     std::shared_ptr<const RetryValidation> retry_validation;
+    // Fixed peer by default; opt-in requires the path-aware receive/output APIs.
+    MigrationPolicy migration = MigrationPolicy::fixed_peer;
+    // Resumption/0RTT requires an explicit CA file. Keys include the loaded trust
+    // material (including AUX/CRLs), not only its path. Empty ca_file uses system
+    // trust with a fresh handshake; no tickets are stored or resumed.
+    std::shared_ptr<SessionCache> session_cache;
+    std::shared_ptr<ServerContext> server_context;
+    std::string service_scope;
+    // Caller declares all early operations replay-safe; rejected data is never replayed automatically.
+    EarlyDataPolicy early_data = EarlyDataPolicy::disabled;
+};
+
+struct SessionCacheLimits {
+    std::size_t max_entries = 16;
+    std::size_t max_bytes = 256 * 1024;
+    std::size_t max_ticket_bytes = 16 * 1024;
+    std::uint64_t lifetime_ns = 3'600'000'000'000;
+};
+// Single-threaded bounded in-memory ticket cache. No concurrent use or disk export;
+// removal cleanses serialized secret bytes.
+class SessionCache {
+public:
+    static Result<std::shared_ptr<SessionCache>> create(SessionCacheLimits limits = {});
+    ~SessionCache();
+    void clear() noexcept;
+    std::size_t size() const noexcept;
+    std::size_t bytes() const noexcept;
+private:
+    friend class Engine;
+    struct Impl;
+    explicit SessionCache(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+};
+// Explicitly shared server ticket domain with immutable certificate, ALPN, scope and limits.
+class ServerContext {
+public:
+    static Result<std::shared_ptr<ServerContext>> create(Options options,
+                                                        std::uint64_t lifetime_seconds = 3600);
+    ~ServerContext();
+private:
+    friend class Engine;
+    struct Impl;
+    explicit ServerContext(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
 };
 
 namespace detail {
@@ -139,10 +198,11 @@ struct Event {
     Bytes data;
     std::uint64_t value = 0;
     bool fin = false;
+    bool early_data = false;
 };
 /// Single-threaded, socket-free QUIC v1 state machine. Time is monotonic nanoseconds; the caller
-/// owns sending packets and waking on expiry. The path is fixed: migration and 0-RTT are not
-/// supported. Retry address validation is provided by Listener; clients process Retry automatically.
+/// owns sending packets and waking on expiry. Migration is opt-in and uses ngtcp2 path validation.
+/// Retry address validation is provided by Listener; clients process Retry automatically.
 /// The OpenSSL ossl backend is experimental upstream support.
 class Engine {
 public:
@@ -155,12 +215,27 @@ public:
     Engine(Engine&&) noexcept;
     Engine& operator=(Engine&&) noexcept;
     ~Engine();
+    // Pathless compatibility operations require fixed_peer policy.
     Result<void> receive(std::span<const std::byte> packet, std::uint64_t now);
+    Result<void> receive(const Path& path, std::span<const std::byte> packet, std::uint64_t now);
     /// Returns an owning-buffer datagram; empty means no packet for now. Call in a loop until empty or the scheduling budget is reached.
     Result<Bytes> poll(std::uint64_t now);
+    Result<Packet> poll_datagram(std::uint64_t now);
+    // Validate before client migration; retain both endpoints until path validation completes.
+    Result<void> initiate_migration(const Path& path, std::uint64_t now);
+    Path active_path() const;
+    Path validated_path() const;
+    bool path_validation_pending() const noexcept;
     Result<void> handle_expiry(std::uint64_t now);
     std::uint64_t expiry() const noexcept;
     bool handshake_complete() const noexcept;
+    bool session_reused() const noexcept;
+    MigrationPolicy migration_policy() const noexcept;
+    EarlyDataPolicy early_data_policy() const noexcept;
+    EarlyDataStatus early_data_status() const noexcept;
+    // Requires replay_safe and a compatible ticket; normal open_stream/write never send early data.
+    Result<std::int64_t> open_early_stream(bool unidirectional = false);
+    Result<void> write_early(std::int64_t stream, std::span<const std::byte> bytes, bool fin);
     bool is_server() const noexcept;
     std::size_t write_capacity() const noexcept;
     std::uint64_t remote_bidi_stream_limit() const noexcept;
@@ -186,8 +261,10 @@ public:
     /// Normal close sends an application error; existing failures retain their transport/TLS code.
     /// Idle/drop/retry emit no packet. Standalone Engine users schedule the closing period.
     Result<Bytes> close(std::uint64_t application_error, std::uint64_t now);
+    Result<Packet> close_datagram(std::uint64_t application_error, std::uint64_t now);
 
 private:
+    friend class ServerContext;
     struct Impl;
     explicit Engine(std::unique_ptr<Impl> impl);
     static Result<Engine> create(Options, std::span<const std::byte>, std::uint64_t);

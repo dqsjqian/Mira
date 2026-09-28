@@ -54,6 +54,7 @@ SOURCE_SUFFIXES = {".hpp", ".h", ".cpp", ".cc", ".ipp"}
 LAYERS: dict[str, tuple[str, ...]] = {
     "core": ("core",),
     "transport": ("transport",),
+    "composition": ("client",),
     "tls": ("tls",),
     "crypto": ("crypto",),
     "quic": ("quic",),
@@ -62,18 +63,19 @@ LAYERS: dict[str, tuple[str, ...]] = {
 
 # Layer -> include path prefixes it is not allowed to reach for.
 FORBIDDEN_INCLUDES: dict[str, tuple[str, ...]] = {
-    "core": ("mira/crypto/", "mira/tls/", "openssl/", "mira/transport/", "mira/http/", "mira/ws/",
+    "core": ("mira/client/", "mira/crypto/", "mira/tls/", "openssl/", "mira/transport/", "mira/http/", "mira/ws/",
              "mira/h2/", "mira/h3/", "mira/dns/", "mira/http2/", "mira/http3/",
              "mira/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
-    "transport": ("mira/tls/", "openssl/", "mira/http/", "mira/ws/", "mira/h2/",
+    "transport": ("mira/client/", "mira/tls/", "openssl/", "mira/http/", "mira/ws/", "mira/h2/",
                   "mira/h3/", "mira/dns/", "mira/http2/", "mira/http3/",
                   "mira/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
-    "crypto": ("mira/transport/", "mira/tls/", "mira/http/", "mira/ws/", "mira/quic/"),
-    "tls": ("mira/transport/", "mira/http/", "mira/ws/", "mira/h2/",
+    "crypto": ("mira/client/", "mira/transport/", "mira/tls/", "mira/http/", "mira/ws/", "mira/quic/"),
+    "tls": ("mira/client/", "mira/transport/", "mira/http/", "mira/ws/", "mira/h2/",
             "mira/h3/", "mira/dns/", "mira/http2/", "mira/http3/", "mira/quic/"),
-    "quic": ("mira/http/", "mira/http2/", "mira/http3/", "mira/h2/",
+    "quic": ("mira/client/", "mira/http/", "mira/http2/", "mira/http3/", "mira/h2/",
              "mira/h3/", "nghttp2/", "nghttp3/"),
-    "protocol": ("openssl/", "mira/tls/", "mira/transport/"),
+    "protocol": ("openssl/", "mira/tls/", "mira/transport/", "mira/client/"),
+    "composition": ("openssl/", "ngtcp2/", "nghttp3/", "nghttp2/"),
 }
 
 # Include prefixes no layer may use, with the reason reported to the user.
@@ -176,7 +178,7 @@ def check(repo_root: Path) -> list[str]:
                     )
 
             # Rule 4 — protocols are platform-agnostic.
-            if layer in ("protocol", "tls") and not is_test:
+            if layer in ("protocol", "tls", "composition") and not is_test:
                 for prefix in PLATFORM_HEADER_PREFIXES:
                     if included.startswith(prefix):
                         violations.append(

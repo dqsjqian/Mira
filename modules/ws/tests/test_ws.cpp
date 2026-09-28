@@ -162,7 +162,46 @@ struct ClientMemoryStream : MemoryStream {
         co_return co_await MemoryStream::read_some(out, options);
     }
 };
+Task<void> extended_handoff() {
+    HandshakeOptions options;
+    options.subprotocols = {"chat"};
+    options.require_subprotocol = true;
+    options.compression.enabled = true;
+    Negotiated negotiated;
+    negotiated.subprotocol = "chat";
+    negotiated.compression.enabled = true;
+    MemoryStream transport;
+    Connection connection(transport, Role::client, {}, options);
+    CHECK(!connection.adopt_extended_connect("other", 200, negotiated));
+    CHECK(!connection.adopt_extended_connect("websocket", 101, negotiated));
+    CHECK(!connection.adopt_extended_connect("websocket", 300, negotiated));
+    CHECK(!connection.adopt_extended_connect("websocket", 200));
+    auto invalid = negotiated;
+    invalid.subprotocol = "unoffered";
+    CHECK(!connection.adopt_extended_connect("websocket", 200, invalid));
+    CHECK(connection.adopt_extended_connect("websocket", 200, negotiated).has_value());
+    CHECK(!connection.adopt_extended_connect("websocket", 200, negotiated));
+    CHECK(transport.reads == 0 && transport.writes == 0);
+    CHECK(connection.subprotocol() == "chat" && connection.compression_parameters().enabled);
+    auto plain = Frame{Opcode::text, true, bytes("over extended connect")};
+    CHECK((co_await connection.send(plain)).has_value());
+    FrameParser parser(Role::server, {}, true);
+    auto parsed = parser.feed(transport.output);
+    CHECK(parsed && parsed->frame && parsed->frame->compressed);
+    auto decoder = DeflateDecoder::create(Role::server, negotiated.compression);
+    CHECK(decoder.has_value());
+    if (parsed && parsed->frame && decoder) {
+        auto decoded = decoder->decode(std::move(*parsed->frame));
+        CHECK(decoded && decoded->payload == plain.payload);
+    }
+    MemoryStream default_transport;
+    Connection disabled(default_transport, Role::client);
+    CHECK(!disabled.adopt_extended_connect("websocket", 200, negotiated));
+    negotiated = {};
+    CHECK(disabled.adopt_extended_connect("websocket", 204, negotiated).has_value());
+}
 Task<void> connection_tests() {
+    co_await extended_handoff();
     auto request = client_handshake("localhost");
     MemoryStream stream;
     stream.input = bytes(request->request);
