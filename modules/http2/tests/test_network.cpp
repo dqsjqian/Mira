@@ -179,6 +179,21 @@ struct CertificateFiles {
 };
 #endif
 
+Task<void> drain_peer(tcp::Socket& socket, OperationOptions options) {
+    // A TCP close with unread WINDOW_UPDATE/ACK records can send RST on Windows.
+    // Half-close after the final H2 output, then drain until the client (which
+    // verifies GOAWAY before returning) closes its transport.
+    CHECK(socket.shutdown_send().has_value());
+    std::array<std::byte, 4096> discard{};
+    for (;;) {
+        auto read = co_await socket.read_some(discard, options);
+        if (!read) {
+            CHECK(read.error() == Errc::eof);
+            break;
+        }
+    }
+}
+
 Task<void> server_task(tcp::Listener& listener, Results& results, OperationOptions options
 #ifdef MIRA_HTTP2_TEST_TLS
     , const tls::Context* context
@@ -197,10 +212,14 @@ Task<void> server_task(tcp::Listener& listener, Results& results, OperationOptio
         if (!result) co_return;
         CHECK(secured->negotiated_protocol() == "h2");
         co_await serve(*secured, results, options);
+        auto shutdown = co_await secured->shutdown(options);
+        CHECK(shutdown.has_value());
+        co_await drain_peer(*socket, options);
         co_return;
     }
 #endif
     co_await serve(fragmented, results, options);
+    co_await drain_peer(*socket, options);
 }
 Task<void> client_task(EventLoop& loop, Endpoint endpoint, Results& results, OperationOptions options
 #ifdef MIRA_HTTP2_TEST_TLS
