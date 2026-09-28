@@ -246,7 +246,7 @@ Task<void> expired_engine_timer(EventLoop& loop, const char* certificate) {
 }
 
 Task<void> accept_only(transport::udp::Socket socket, quic::Options options,
-                       std::unique_ptr<UdpConnection>& connection) {
+                       std::unique_ptr<UdpConnection>& connection, bool& client_ready) {
     std::array<std::byte, 65536> initial{};
     auto datagram = require(co_await socket.receive_from(initial, {.deadline = Clock::now() + 5s}));
     options.local = require(socket.local_endpoint());
@@ -256,13 +256,22 @@ Task<void> accept_only(transport::udp::Socket socket, quic::Options options,
         std::span<const std::byte>{initial.data(), datagram.size},
         {.deadline = Clock::now() + 5s}));
     connection = std::make_unique<UdpConnection>(std::move(accepted));
+    // Server handshake completion can precede the peer receiving the final
+    // handshake flight. Keep its retransmission timer alive until both finish.
+    const auto deadline = Clock::now() + 5s;
+    while (!client_ready) {
+        auto round = co_await connection->pump({.deadline = std::min(deadline, Clock::now() + 10ms)});
+        if (!round && round.error() != Errc::timed_out) require(std::move(round));
+        check(Clock::now() < deadline, "client did not confirm handshake completion");
+    }
 }
 
 Task<void> connect_only(EventLoop& loop, quic::Options options,
-                        std::unique_ptr<UdpConnection>& connection) {
+                        std::unique_ptr<UdpConnection>& connection, bool& client_ready) {
     auto connected = require(co_await UdpConnection::connect(
         loop, std::move(options), {.deadline = Clock::now() + 5s}));
     connection = std::make_unique<UdpConnection>(std::move(connected));
+    client_ready = true;
 }
 
 Task<void> drain_input(UdpConnection& connection) {
@@ -292,8 +301,9 @@ Task<void> fixed_peer(EventLoop& loop, const char* certificate, const char* key,
     std::unique_ptr<UdpConnection> client;
     std::unique_ptr<UdpConnection> server;
     TaskScope scope;
-    scope.spawn(accept_only(std::move(server_socket), server_options, server));
-    scope.spawn(connect_only(loop, client_options, client));
+    bool client_ready = false;
+    scope.spawn(accept_only(std::move(server_socket), server_options, server, client_ready));
+    scope.spawn(connect_only(loop, client_options, client, client_ready));
     co_await scope.join();
     TaskScope drain;
     drain.spawn(drain_input(*client));
