@@ -86,8 +86,8 @@ def context(cert, protocols=("http/1.1",)):
     return result
 
 
-def h1(server, cert):
-    with context(cert).wrap_socket(server.connect(), server_hostname="localhost",
+def h1(server, tls):
+    with tls.wrap_socket(server.connect(), server_hostname="localhost",
                                    suppress_ragged_eofs=False) as client:
         assert client.selected_alpn_protocol() == "http/1.1"
         client.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -119,27 +119,32 @@ def h2(server, cert, curl):
     assert stats == "2 200", f"ALPN did not dispatch HTTP/2: {stats!r}"
 
 
-def invalid_clients(server, cert):
-    for tls, hostname in ((context(cert), "wrong.invalid"),
-                          (ssl.create_default_context(), "localhost")):
-        tls.set_alpn_protocols(["http/1.1"])
+def invalid_clients(server, trusted, untrusted, unsupported, no_alpn):
+    for tls, hostname in ((trusted, "wrong.invalid"), (untrusted, "localhost")):
         try:
             with tls.wrap_socket(server.connect(), server_hostname=hostname):
                 raise AssertionError("untrusted certificate or hostname was accepted")
         except ssl.SSLCertVerificationError:
             pass
     try:
-        with context(cert, ("unsupported-protocol",)).wrap_socket(
-                server.connect(), server_hostname="localhost"):
+        with unsupported.wrap_socket(server.connect(), server_hostname="localhost"):
             raise AssertionError("unsupported ALPN was accepted")
     except ssl.SSLError:
         pass
-    with context(cert, ()).wrap_socket(server.connect(), server_hostname="localhost") as client:
+    with no_alpn.wrap_socket(server.connect(), server_hostname="localhost") as client:
         assert client.selected_alpn_protocol() is None
         rejected_socket(client)
 
 
-def verify_handshake_limit(executable, cert, key):
+def verify_handshake_limit(executable, cert, key, tls):
+    outgoing = ssl.MemoryBIO()
+    engine = tls.wrap_bio(ssl.MemoryBIO(), outgoing, server_side=False, server_hostname="localhost")
+    try:
+        engine.do_handshake()
+    except ssl.SSLWantReadError:
+        pass
+    hello = outgoing.read()
+    assert len(hello) > 32
     with Server(executable, cert, key, connections=4, handshakes=1,
                 lifetime=1500, handshake_timeout=200) as server:
         with server.connect() as stalled:
@@ -149,15 +154,6 @@ def verify_handshake_limit(executable, cert, key):
                 rejected_socket(rejected)
             # Dribble a ClientHello across many reads. A per-read timeout would
             # keep resetting; only the absolute handshake budget closes it.
-            outgoing = ssl.MemoryBIO()
-            engine = context(cert).wrap_bio(ssl.MemoryBIO(), outgoing,
-                                             server_side=False, server_hostname="localhost")
-            try:
-                engine.do_handshake()
-            except ssl.SSLWantReadError:
-                pass
-            hello = outgoing.read()
-            assert len(hello) > 32
             start = time.monotonic()
             sent = 0
             for byte in hello:
@@ -174,17 +170,17 @@ def verify_handshake_limit(executable, cert, key):
             assert time.monotonic() - start < 3, "absolute handshake budget did not expire"
             server.event("HANDSHAKE_TIMEOUT")
             rejected_socket(stalled)
-        h1(server, cert)
+        h1(server, tls)
         stats = server.finish()
         assert stats["handshake_rejected"] == 1 and stats["handshake_timeouts"] == 1, stats
         assert stats["peak_handshakes"] == 1 and stats["h1"] == 1, stats
         assert stats["rejected"] == 0 and stats["completed"] == 3, stats
 
 
-def verify_connection_limit(executable, cert, key):
+def verify_connection_limit(executable, cert, key, tls):
     with Server(executable, cert, key, connections=1, handshakes=1,
                 lifetime=600, grace=30) as server:
-        with context(cert).wrap_socket(server.connect(), server_hostname="localhost") as idle:
+        with tls.wrap_socket(server.connect(), server_hostname="localhost") as idle:
             server.event("HANDSHAKE_READY")
             with server.connect() as rejected:
                 rejected_socket(rejected)
@@ -241,16 +237,24 @@ def main():
         invalid = subprocess.run([str(args.executable), str(cert), str(wrong_key)],
                                  capture_output=True, text=True, timeout=5)
         assert invalid.returncode != 0 and "PORT=" not in invalid.stdout, invalid
+        # Initialize OpenSSL and load trust stores before starting any timed
+        # server. Cold Windows initialization must not consume its lifetime or
+        # the deliberately short handshake/admission regression deadlines.
+        trusted = context(cert)
+        untrusted = ssl.create_default_context()
+        untrusted.set_alpn_protocols(["http/1.1"])
+        unsupported = context(cert, ("unsupported-protocol",))
+        no_alpn = context(cert, ())
         with Server(args.executable, cert, key) as server:
-            h1(server, cert)
+            h1(server, trusted)
             if curl:
                 h2(server, cert, curl)
-            invalid_clients(server, cert)
+            invalid_clients(server, trusted, untrusted, unsupported, no_alpn)
             stats = server.finish()
             assert stats["h1"] == 1 and stats["h2"] == (1 if curl else 0), stats
             assert stats["alpn_rejected"] == 1 and stats["failed"] >= 3, stats
-        verify_handshake_limit(args.executable, cert, key)
-        verify_connection_limit(args.executable, cert, key)
+        verify_handshake_limit(args.executable, cert, key, trusted)
+        verify_connection_limit(args.executable, cert, key, trusted)
         verify_pending_handshake_shutdown(args.executable, cert, key)
     if not curl:
         print("managed HTTPS: H1/certificates/ALPN rejection/admission verified; H2 SKIPPED (no HTTP/2 curl)")
