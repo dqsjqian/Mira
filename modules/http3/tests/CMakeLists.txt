@@ -13,6 +13,10 @@ set_tests_properties(http3_priority PROPERTIES TIMEOUT 30)
 # stack over the kernel's UDP through the event loop.
 # GCC 13 internal compiler error on these coroutine tests — see quic/tests.
 if(NOT (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14))
+    add_executable(test_http3_multi_server test_multi_server.cpp)
+    target_link_libraries(test_http3_multi_server PRIVATE Mira::http3 Mira::warnings)
+    add_test(NAME http3_multi_server COMMAND test_http3_multi_server "${MIRA_QUIC_TEST_CERT}" "${MIRA_QUIC_TEST_KEY}")
+    set_tests_properties(http3_multi_server PROPERTIES TIMEOUT 60)
     add_executable(test_http3_udp test_udp_transport.cpp)
     target_link_libraries(test_http3_udp PRIVATE Mira::http3 Mira::warnings)
     target_include_directories(test_http3_udp PRIVATE ${CMAKE_SOURCE_DIR}/modules/core/tests)

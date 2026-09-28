@@ -55,18 +55,20 @@ LAYERS: dict[str, tuple[str, ...]] = {
     "core": ("core",),
     "transport": ("transport",),
     "tls": ("tls",),
+    "crypto": ("crypto",),
     "quic": ("quic",),
     "protocol": ("http_common", "http", "http2", "http3", "ws", "h2", "h3", "dns"),
 }
 
 # Layer -> include path prefixes it is not allowed to reach for.
 FORBIDDEN_INCLUDES: dict[str, tuple[str, ...]] = {
-    "core": ("mira/tls/", "openssl/", "mira/transport/", "mira/http/", "mira/ws/",
+    "core": ("mira/crypto/", "mira/tls/", "openssl/", "mira/transport/", "mira/http/", "mira/ws/",
              "mira/h2/", "mira/h3/", "mira/dns/", "mira/http2/", "mira/http3/",
              "mira/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
     "transport": ("mira/tls/", "openssl/", "mira/http/", "mira/ws/", "mira/h2/",
                   "mira/h3/", "mira/dns/", "mira/http2/", "mira/http3/",
                   "mira/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
+    "crypto": ("mira/transport/", "mira/tls/", "mira/http/", "mira/ws/", "mira/quic/"),
     "tls": ("mira/transport/", "mira/http/", "mira/ws/", "mira/h2/",
             "mira/h3/", "mira/dns/", "mira/http2/", "mira/http3/", "mira/quic/"),
     "quic": ("mira/http/", "mira/http2/", "mira/http3/", "mira/h2/",

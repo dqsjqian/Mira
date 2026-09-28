@@ -282,13 +282,31 @@ For local development, pointing at a source tree works too: `add_subdirectory(ve
 
 Android requires **NDK 29 or newer**: NDK 27/28's libc++ gates `std::stop_token` off; NDK 29 (clang 21) builds on API 24 as tested.
 
-## 🗺 What's next
+## Production composition now available
 
-1. **Complete production composition**: multi-client QUIC/H3 CID listener, admission/process budgets, streaming outbound H2/H3 bodies, connection pools, reconnection and graceful shutdown composition.
-2. **Evidence before rankings**: reproducible real-network throughput, p50/p99 latency, peak memory and slow-consumer overload; Windows H2/H3 and mobile runtime coverage. In-process microbenchmarks do not establish a performance ranking.
-3. **Selective protocol growth**: WebSocket (RFC 6455) is the next independent protocol, with H2/H3 extended CONNECT evaluated afterward. SSE belongs first in streaming HTTP examples; Unix-domain sockets in transport. Add MQTT, SOCKS5 or DNS/DoH for concrete requirements; keep gRPC/Redis/WebRTC outside the general-purpose core.
+- **Single-port multi-client QUIC/H3**: `quic::Dispatcher` routes actual DCIDs, including newly issued IDs; `http3::make_server` composes H3. Admission, payload and queue reservations are bounded and returned on close. Dispatchers can share `ResourceBudget`. Accounting limits do not claim a hard process-RSS bound; peers remain fixed.
+- **Streaming H2/H3 output**: `request_stream` / `respond_stream` → `write_body` → `finish_body`. Exhaustion returns `would_block` without failing the connection. H3 chunks survive until ACK; QUIC bidirectional streams rotate to prevent starvation.
+- **Connection lifecycle**: `ConnectionPool<T>` provides bounded per-origin leases and idle eviction; leases discard by default and recycle only drained connections. `tcp::connect_with_retry` retries connection establishment, never application requests. `tcp::serve` bounds admission and cooperatively stops, cancels and joins handlers.
+- **WebSocket/WSS**: `MIRA_ENABLE_WEBSOCKET=ON` builds `Mira::ws` and OpenSSL Crypto-backed nonce/masking/RFC6455 handshake support. Fragmentation, UTF-8, ping/pong/close, limits, independent Python peers and TLS composition are tested. One read and one write can overlap on TCP; the current TLS Stream still requires serial operations, so concurrent WSS I/O is not yet supported. No compression, subprotocol negotiation or H2/H3 Extended CONNECT.
+- **SSE / local streams**: `mira_sse_server` demonstrates chunked SSE, IDs and Last-Event-ID resume. `transport::local` provides POSIX filesystem Unix-domain streams; Windows explicitly returns `not_supported`. Caller-owned paths are never automatically removed.
 
-QUIC migration/NAT rebinding, 0-RTT, Retry policies and HTTP/3 extended CONNECT remain unsupported. Protocol count is not a substitute for correctness and end-to-end verification.
+```bash
+cmake -S . -B build/ws -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_TLS=ON
+cmake --build build/ws -j
+ctest --test-dir build/ws --output-on-failure
+# Two terminals: mira_ws_server 8080 / mira_ws_client 8080
+# SSE: mira_sse_server 8081; client GET /events
+# Multi-client H3: mira_h3_multi_server cert.pem key.pem 8443
+```
+
+Real network benchmark: `python3 tools/bench/network_bench.py --server build/release/mira_managed_echo_server --clients 8 --requests 1000 --slow-clients 4` emits throughput, p50/p99, sampled peak RSS and environment JSON. The independent Python socket load generator uses loopback; these are neither cross-library rankings nor WAN measurements.
+
+## Next: remaining verification boundaries
+
+1. Full-duplex TLS scheduling for WSS, Windows H3 runtime and iOS/Android TLS/protocol device runs; mobile currently cross-compiles only.
+2. Full Autobahn conformance, longer fault injection, multi-machine load and process-memory governance. Independent Python interoperability is not full conformance certification.
+3. QUIC migration/NAT rebinding, 0-RTT, Retry/address validation, draining tombstones and HTTP/3 Extended CONNECT remain unsupported; the listener is not an Internet flood-protection system.
+4. MQTT, SOCKS5 and DNS/DoH are demand-driven independent extensions. Keep gRPC/Redis/WebRTC in the ecosystem layer, not bundled into the network core.
 
 See the [architecture document](docs/ARCHITECTURE.md) for design rationale and acceptance criteria.
 

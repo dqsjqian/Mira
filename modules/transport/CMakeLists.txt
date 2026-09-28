@@ -8,6 +8,7 @@ add_library(mira_transport
     src/endpoint.cpp
     src/tcp.cpp
     src/udp.cpp
+    src/local.cpp
     src/resolver.cpp
 )
 

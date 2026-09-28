@@ -44,6 +44,25 @@ bool fill_random(std::uint8_t* destination, std::size_t length) noexcept {
     if (length > static_cast<std::size_t>(std::numeric_limits<int>::max())) return false;
     return RAND_bytes(destination, static_cast<int>(length)) == 1;
 }
+Result<PacketRoute> packet_route(std::span<const std::byte> packet) {
+    if (packet.empty() || packet.size() > detail::kMaxDatagram)
+        return std::unexpected(quic_error(invalid));
+    ngtcp2_version_cid ids{};
+    auto* data = reinterpret_cast<const std::uint8_t*>(packet.data());
+    int rv = ngtcp2_pkt_decode_version_cid(&ids, data, packet.size(), 16);
+    if (rv || !ids.dcidlen || ids.dcidlen > NGTCP2_MAX_CIDLEN)
+        return std::unexpected(quic_error(rv ? rv : invalid));
+    bool initial = false;
+    if ((data[0] & 0x80) != 0) {
+        if (ids.version != NGTCP2_PROTO_VER_V1)
+            return std::unexpected(quic_error(invalid));
+        ngtcp2_pkt_hd hd{};
+        initial = packet.size() >= 1200 && ngtcp2_accept(&hd, data, packet.size()) == 0;
+    }
+    auto* cid = reinterpret_cast<const std::byte*>(ids.dcid);
+    return PacketRoute{Bytes(cid, cid + ids.dcidlen), initial};
+}
+
 struct Engine::Impl {
     Options options;
     ngtcp2_conn* conn = nullptr;
@@ -56,6 +75,7 @@ struct Engine::Impl {
     bool ended = false;
     std::uint64_t clock = 0;
     std::size_t buffered = 0;
+    std::size_t queued_chunks = 0;
     std::size_t received = 0;
     std::uint64_t remote_bidi_limit = 0;
     std::vector<Event> events;
@@ -75,6 +95,7 @@ struct Engine::Impl {
         bool closed = false;
     };
     std::map<std::int64_t, Stream> streams;
+    std::int64_t last_application_stream = -1;
     ~Impl() {
         if (ssl) {
             SSL_set_app_data(ssl, nullptr);
@@ -136,6 +157,7 @@ struct Engine::Impl {
                 while (!q.empty() && q.front().submitted &&
                        q.front().start + q.front().bytes.size() <= offset + size) {
                     s.buffered -= q.front().bytes.size();
+                    --s.queued_chunks;
                     q.pop_front();
                 }
             }
@@ -153,6 +175,7 @@ struct Engine::Impl {
                 for (auto& c : it->second.chunks)
                     s.buffered -= c.bytes.size();
                 // Delivered-but-unconsumed data still counts against the total window, letting the application consume it later.
+                s.queued_chunks -= it->second.chunks.size();
                 it->second.chunks.clear();
                 it->second.closed = true;
                 if (!it->second.unread) s.streams.erase(it);
@@ -426,7 +449,10 @@ Result<Bytes> Engine::poll(std::uint64_t now) {
     ngtcp2_path_storage_zero(&path);
     // Unidirectional control streams come before bidirectional application streams, so an exhausted application window cannot stall control/QPACK progress.
     for (bool unidirectional : {true, false}) {
-    for (auto& [id, stream] : s.streams) {
+    auto it = unidirectional ? s.streams.begin() : s.streams.upper_bound(s.last_application_stream);
+    for (std::size_t visited = 0; visited < s.streams.size(); ++visited) {
+        if (it == s.streams.end()) it = s.streams.begin();
+        auto& [id, stream] = *it++;
         if (stream.cancelled || bool(id & 2) != unidirectional) continue;
         for (auto& chunk : stream.chunks) {
             if (chunk.submitted) continue;
@@ -465,6 +491,7 @@ Result<Bytes> Engine::poll(std::uint64_t now) {
                 chunk.submitted = chunk.sent == chunk.bytes.size();
             }
             if (n > 0) {
+                if (!unidirectional) s.last_application_stream = id;
                 ngtcp2_conn_update_pkt_tx_time(s.conn, now);
                 // `out` is the C-API scratch; convert at the boundary.
                 return Bytes(reinterpret_cast<const std::byte*>(out.data()),
@@ -512,6 +539,22 @@ std::uint64_t Engine::remote_bidi_stream_limit() const noexcept {
 bool Engine::closed() const noexcept {
     return impl_->ended || impl_->failed;
 }
+std::vector<Bytes> Engine::local_connection_ids() const {
+    std::vector<ngtcp2_cid> ids(ngtcp2_conn_get_scid(impl_->conn, nullptr));
+    ngtcp2_conn_get_scid(impl_->conn, ids.data());
+    std::vector<Bytes> result;
+    result.reserve(ids.size());
+    for (const auto& id : ids) {
+        auto* first = reinterpret_cast<const std::byte*>(id.data);
+        result.emplace_back(first, first + id.datalen);
+    }
+    return result;
+}
+Bytes Engine::initial_destination_cid() const {
+    const auto* id = ngtcp2_conn_get_client_initial_dcid(impl_->conn);
+    auto* first = reinterpret_cast<const std::byte*>(id->data);
+    return Bytes(first, first + id->datalen);
+}
 std::string Engine::negotiated_protocol() const {
     const unsigned char* data = nullptr;
     unsigned int size = 0;
@@ -536,7 +579,7 @@ Result<void> Engine::write(std::int64_t id, std::span<const std::byte> bytes, bo
     if (s.failed || s.ended || it == s.streams.end() || it->second.fin || it->second.cancelled)
         return std::unexpected(quic_error(invalid));
     if (bytes.size() > s.options.max_buffered_bytes - s.buffered ||
-        it->second.chunks.size() >= 4096)
+        s.queued_chunks >= 4096)
         return std::unexpected(quic_error(budget));
     if (bytes.empty() && !fin) return {};
     auto& stream = it->second;
@@ -550,6 +593,7 @@ Result<void> Engine::write(std::int64_t id, std::span<const std::byte> bytes, bo
     stream.end += bytes.size();
     stream.fin = fin;
     s.buffered += bytes.size();
+    ++s.queued_chunks;
     return {};
 }
 std::vector<Event> Engine::take_events() {

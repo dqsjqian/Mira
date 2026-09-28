@@ -111,6 +111,33 @@ public:
         co_return engine_->request(fields, body);
     }
 
+    /// Start an incremental request. Empty output pauses until write_body/finish_body.
+    [[nodiscard]] Result<std::int64_t> request_stream(const Headers& fields) {
+        if (!engine_ || pumping_) return fail(Errc::invalid_argument);
+        if (buffer_error_) return fail(buffer_error_);
+        return engine_->request_stream(fields);
+    }
+    [[nodiscard]] Result<void> respond_stream(std::int64_t stream, const Headers& fields) {
+        if (!engine_ || pumping_) return fail(Errc::invalid_argument);
+        if (buffer_error_) return fail(buffer_error_);
+        return engine_->respond_stream(stream, fields);
+    }
+    /// Enqueue a bounded chunk. would_block accepts no bytes; pump ACKs then retry.
+    [[nodiscard]] Result<void> write_body(std::int64_t stream,
+        std::span<const std::byte> body, bool end = false) {
+        if (!engine_ || pumping_) return fail(Errc::invalid_argument);
+        if (buffer_error_) return fail(buffer_error_);
+        return engine_->write_body(stream, body, end);
+    }
+    [[nodiscard]] Result<void> finish_body(std::int64_t stream) {
+        if (!engine_ || pumping_) return fail(Errc::invalid_argument);
+        if (buffer_error_) return fail(buffer_error_);
+        return engine_->finish_body(stream);
+    }
+    [[nodiscard]] std::size_t queued_body_bytes() const noexcept {
+        return engine_ ? engine_->queued_body_bytes() : 0;
+    }
+
     /// Server: answer a request stream.
     [[nodiscard]] Task<Result<void>> respond(std::int64_t stream,
                                              const Headers& fields,

@@ -20,6 +20,7 @@ struct Limits {
     std::size_t max_header_bytes = 32 * 1024;
     std::size_t max_headers = 100;
     std::size_t max_body_bytes = 1024 * 1024;
+    // Connection-wide retained output chunks; serialized wire has its separate output budget.
     std::size_t max_queued_body_bytes = 4 * 1024 * 1024;
     std::size_t max_output_bytes = 64 * 1024;
     std::size_t max_queued_frames = 256;
@@ -53,6 +54,14 @@ public:
     Result<std::int32_t> request(const Headers& headers, std::span<const std::byte> body = {});
     Result<void> respond(std::int32_t id, const Headers& headers,
                          std::span<const std::byte> body = {});
+    // Streaming bodies are copied chunk-by-chunk into a connection-wide bounded queue.
+    // would_block accepts no bytes; pump output and retry with chunks no larger than the budget.
+    // finish_body is single-use; max_body_bytes still bounds the total body per stream.
+    Result<std::int32_t> request_stream(const Headers& headers);
+    Result<void> respond_stream(std::int32_t id, const Headers& headers);
+    Result<void> write_body(std::int32_t id, std::span<const std::byte> body, bool end = false);
+    Result<void> finish_body(std::int32_t id);
+    std::size_t queued_body_bytes() const noexcept;
     Result<void> receive(std::span<const std::byte> bytes);
     Result<std::vector<std::byte>> output();
     Result<std::vector<std::byte>> take_body(std::int32_t id);
@@ -70,6 +79,8 @@ public:
     bool wants_write() const noexcept;
 
 private:
+    Result<std::int32_t> request_impl(const Headers&, std::span<const std::byte>, bool streaming);
+    Result<void> respond_impl(std::int32_t, const Headers&, std::span<const std::byte>, bool streaming);
     struct Impl;
     explicit Session(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;

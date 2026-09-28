@@ -68,7 +68,7 @@ def main():
     build = args.build_dir.resolve()
     cache = cache_values(build)
     installed = ['core', 'transport', 'http']
-    for component, option in [('tls', 'TLS'), ('http2', 'HTTP2'), ('http3', 'HTTP3')]:
+    for component, option in [('tls', 'TLS'), ('ws', 'WEBSOCKET'), ('http2', 'HTTP2'), ('http3', 'HTTP3')]:
         if cache.get('MIRA_ENABLE_' + option) == 'ON':
             installed.append(component)
     if 'http3' in installed:
@@ -82,7 +82,8 @@ def main():
         run(['cmake', '--install', str(build), '--prefix', str(prefix),
              '--config', args.config])
         common = ['-G', cache['CMAKE_GENERATOR'],
-                  '-DCMAKE_BUILD_TYPE=' + args.config]
+                  '-DCMAKE_BUILD_TYPE=' + args.config,
+                  '-DCMAKE_CONFIGURATION_TYPES=' + args.config]
         for key in ('CMAKE_CXX_COMPILER', 'CMAKE_TOOLCHAIN_FILE', 'CMAKE_CXX_FLAGS',
                     'CMAKE_OSX_ARCHITECTURES', 'CMAKE_OSX_DEPLOYMENT_TARGET',
                     'OPENSSL_ROOT_DIR'):
@@ -132,7 +133,7 @@ foreach(component IN ITEMS core transport http)
     message(FATAL_ERROR "Missing standard component status ${component}")
   endif()
 endforeach()
-foreach(component IN ITEMS tls http2 quic http3)
+foreach(component IN ITEMS tls crypto ws http2 quic http3)
   if(TARGET Mira::${component})
     message(FATAL_ERROR "Unexpected optional component loaded ${component}")
   endif()
@@ -145,17 +146,17 @@ endforeach()
         case('all', '', source=BASE_SOURCE, checks=checks)
         case('optional-unknown', 'COMPONENTS core OPTIONAL_COMPONENTS unknown',
              checks='if(Mira_unknown_FOUND)\n  message(FATAL_ERROR "Unknown component unexpectedly found")\nendif()')
-        for component in ('tls', 'http2'):
+        for component in ('tls', 'ws', 'http2'):
             if component in installed:
                 case('explicit-' + component, 'COMPONENTS ' + component,
                      checks=f'if(NOT Mira_{component}_FOUND OR NOT TARGET Mira::{component})\n'
                             f'  message(FATAL_ERROR "Explicit component not loaded {component}")\nendif()')
         case('unknown-required', 'COMPONENTS unknown', success=False,
              diagnostic="Mira component 'unknown' is unavailable")
-        optional = 'tls http2 quic http3 unknown'
+        optional = 'tls crypto ws http2 quic http3 unknown'
         case('optional-hidden', 'COMPONENTS core OPTIONAL_COMPONENTS ' + optional,
              hidden=True, checks='''
-foreach(component IN ITEMS tls http2 quic http3 unknown)
+foreach(component IN ITEMS tls crypto ws http2 quic http3 unknown)
   if(Mira_${component}_FOUND)
     message(FATAL_ERROR "Missing optional component unexpectedly found ${component}")
   endif()

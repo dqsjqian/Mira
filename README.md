@@ -282,13 +282,31 @@ target_link_libraries(my_app PRIVATE Mira::transport Mira::http)
 
 Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` 门控关闭了；NDK 29（clang 21）在 API 24 上实测可构建。
 
-## 🗺 接下来
+## 已落地的生产组合能力
 
-1. **先把生产闭环补齐**：QUIC/H3 多客户端 CID listener、连接准入与进程级预算、H2/H3 出站流式 body、连接池/重连/优雅关闭组合层。
-2. **证据先于排名**：可复现真实网络吞吐、p50/p99 延迟、峰值内存、慢消费者过载，以及 Windows H2/H3 和移动真机运行。现有进程内基准不能支撑“性能第一”的结论。
-3. **扩协议有取舍**：下一独立协议优先 WebSocket（RFC 6455，后续评估 H2/H3 extended CONNECT）；SSE 先作为现有 HTTP 流式响应示例，Unix-domain socket 作为 transport 扩展。MQTT、SOCKS5、DNS/DoH 按具体使用需求增加；gRPC/Redis/WebRTC 不进入通用网络核心。
+- **单端口多客户端 QUIC/H3**：`quic::Dispatcher` 按实际 DCID 路由（含新 CID），`http3::make_server` 组合 H3；准入、payload 与队列预留有界，连接关闭归还额度，陌生 peer 不得迁移连接。多个 dispatcher 可共享 `ResourceBudget`。这是可核算资源上限，不冒充进程 RSS 的硬限制。
+- **H2/H3 出站流式 body**：`request_stream` / `respond_stream` → `write_body` → `finish_body`；预算满返回 `would_block` 且不污染连接。H3 chunk 保留到 ACK，QUIC 双向流轮转避免长流饿死短流。
+- **连接生命周期**：`ConnectionPool<T>` 提供每源有界租约池与 idle 淘汰，默认丢弃、显式归还已排空连接；`tcp::connect_with_retry` 只重试建连，绝不暗中重放业务请求；`tcp::serve` 提供准入和停止接入、取消、join 的协作关闭。
+- **WebSocket/WSS**：`MIRA_ENABLE_WEBSOCKET=ON`，独立 `Mira::ws` + OpenSSL Crypto（安全 nonce/mask、RFC6455 SHA-1 握手）；分片、UTF-8、ping/pong/close、消息限额、双向独立 Python 互操作及 TLS 组合测试。TCP 上允许一读一写并行；当前 TLS Stream 仍要求串行操作，因此 WSS 并行读写尚未支持。无压缩/子协议/H2/H3 Extended CONNECT。
+- **SSE / 本地流**：`mira_sse_server` 演示 chunked SSE、事件 ID 与 Last-Event-ID 恢复；`transport::local` 提供 POSIX filesystem Unix-domain socket，Windows 显式 `not_supported`，不自动删除调用方路径。
 
-当前不支持 QUIC migration/NAT rebinding、0-RTT、Retry 策略与 HTTP/3 extended CONNECT。高层协议完善前不以堆协议数量替代正确性与端到端验证。
+```bash
+cmake -S . -B build/ws -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_TLS=ON
+cmake --build build/ws -j
+ctest --test-dir build/ws --output-on-failure
+# 两个终端分别运行：mira_ws_server 8080 / mira_ws_client 8080
+# SSE：mira_sse_server 8081；客户端 GET /events
+# 多客户端 H3：mira_h3_multi_server cert.pem key.pem 8443
+```
+
+真实网络基准：`python3 tools/bench/network_bench.py --server build/release/mira_managed_echo_server --clients 8 --requests 1000 --slow-clients 4`，输出吞吐、p50/p99、峰值 RSS 采样和环境 JSON。负载发生器使用独立进程 Python sockets；loopback 数字不是跨库性能排名，也不是公网性能。
+
+## 接下来：仍需验证的边界
+
+1. WSS 全双工 TLS 调度、Windows H3 运行、iOS/Android TLS 与协议真机运行；当前移动仅交叉编译。
+2. WebSocket Autobahn 全量一致性套件、更长时故障注入、真实多机负载与进程内存治理；当前独立 Python 互操作不等于全套认证。
+3. QUIC migration/NAT rebinding、0-RTT、Retry/地址验证、draining tombstone 与 HTTP/3 Extended CONNECT 尚未实现；listener 不是互联网抗洪泛防护系统。
+4. MQTT、SOCKS5、DNS/DoH 依具体需求独立扩展；gRPC/Redis/WebRTC 保持生态层边界，不将专业子系统全部塞进网络内核。
 
 设计依据与验收要求见[架构文档](docs/ARCHITECTURE.md)。
 

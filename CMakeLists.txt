@@ -32,6 +32,7 @@ option(MIRA_BUILD_EXAMPLES "Build Mira examples" ${MIRA_BUILD_EXAMPLES_DEFAULT})
 
 option(MIRA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(MIRA_ENABLE_TLS "Build the optional OpenSSL 3 TLS stream module" OFF)
+option(MIRA_ENABLE_WEBSOCKET "Build RFC6455 WebSocket (OpenSSL Crypto for handshake and masking)" OFF)
 option(MIRA_ENABLE_HTTP2 "Build the optional nghttp2 HTTP/2 module" OFF)
 option(MIRA_ENABLE_HTTP3 "Build the optional QUIC and HTTP/3 modules (experimental)" OFF)
 
@@ -89,6 +90,8 @@ function(mira_install_module target)
     set(export_set miraTargets)
     foreach(entry
             "mira_tls=miraTlsTargets"
+            "mira_crypto=miraCryptoTargets"
+            "mira_ws=miraWsTargets"
             "mira_http2=miraHttp2Targets"
             "mira_quic=miraQuicTargets"
             "mira_http3=miraHttp3Targets")
@@ -132,6 +135,10 @@ add_subdirectory(modules/http)
 if(MIRA_ENABLE_TLS)
     add_subdirectory(modules/tls)
 endif()
+if(MIRA_ENABLE_WEBSOCKET)
+    add_subdirectory(modules/crypto)
+    add_subdirectory(modules/ws)
+endif()
 if(MIRA_ENABLE_HTTP2)
     add_subdirectory(modules/http2)
 endif()
@@ -164,13 +171,21 @@ if(MIRA_BUILD_EXAMPLES)
     add_executable(mira_tiny_file_server examples/tiny_file_server.cpp)
     target_link_libraries(mira_tiny_file_server PRIVATE Mira::http Mira::transport Mira::warnings)
 
-    foreach(example IN ITEMS tcp_client udp_server udp_client)
+    foreach(example IN ITEMS tcp_client udp_server udp_client managed_echo_server)
         add_executable(mira_${example} examples/${example}.cpp)
         target_link_libraries(mira_${example} PRIVATE Mira::transport Mira::warnings)
     endforeach()
     add_executable(mira_http1_client examples/http1_client.cpp)
     target_link_libraries(mira_http1_client PRIVATE Mira::http Mira::transport Mira::warnings)
+    add_executable(mira_sse_server examples/sse_server.cpp)
+    target_link_libraries(mira_sse_server PRIVATE Mira::http Mira::transport Mira::warnings)
 
+    if(MIRA_ENABLE_WEBSOCKET)
+        foreach(example IN ITEMS ws_server ws_client)
+            add_executable(mira_${example} examples/${example}.cpp)
+            target_link_libraries(mira_${example} PRIVATE Mira::ws Mira::transport Mira::warnings)
+        endforeach()
+    endif()
     if(MIRA_ENABLE_HTTP2)
         add_executable(mira_h2_prior_knowledge_server examples/h2_prior_knowledge_server.cpp)
         target_link_libraries(mira_h2_prior_knowledge_server PRIVATE Mira::http2 Mira::transport Mira::warnings)
@@ -182,11 +197,21 @@ if(MIRA_BUILD_EXAMPLES)
         target_link_libraries(mira_h3_server PRIVATE Mira::http3 Mira::transport Mira::warnings)
         add_executable(mira_h3_client examples/h3_client.cpp)
         target_link_libraries(mira_h3_client PRIVATE Mira::http3 Mira::transport Mira::warnings)
+        add_executable(mira_h3_multi_server examples/h3_multi_server.cpp)
+        target_link_libraries(mira_h3_multi_server PRIVATE Mira::http3 Mira::transport Mira::warnings)
     endif()
 
     if(MIRA_BUILD_TESTS)
         find_package(Python3 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
+            add_test(NAME mira_managed_server
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_managed_server.py
+                    $<TARGET_FILE:mira_managed_echo_server>)
+            set_tests_properties(mira_managed_server PROPERTIES TIMEOUT 30)
+            add_test(NAME mira_sse_example
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_sse_example.py
+                    $<TARGET_FILE:mira_sse_server>)
+            set_tests_properties(mira_sse_example PROPERTIES TIMEOUT 30)
             add_test(NAME mira_client_server_examples
                 COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_client_server_examples.py
@@ -215,6 +240,12 @@ if(MIRA_BUILD_EXAMPLES)
                     $<TARGET_FILE:mira_tiny_file_server>
             )
             set_tests_properties(mira_tiny_file_server_example PROPERTIES TIMEOUT 120)
+            if(TARGET mira_ws_server)
+                add_test(NAME mira_ws_interop
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_ws_interop.py
+                        --server $<TARGET_FILE:mira_ws_server> --client $<TARGET_FILE:mira_ws_client>)
+                set_tests_properties(mira_ws_interop PROPERTIES TIMEOUT 60)
+            endif()
             if(TARGET mira_h2_prior_knowledge_server)
                 add_test(NAME mira_h2_pair
                     COMMAND ${Python3_EXECUTABLE}
@@ -263,8 +294,9 @@ if(MIRA_INSTALL)
         DESTINATION ${MIRA_CMAKE_DESTINATION}
     )
 
-    foreach(optional_module IN ITEMS Tls Http2 Quic Http3)
+    foreach(optional_module IN ITEMS Tls Crypto Ws Http2 Quic Http3)
         if((optional_module STREQUAL "Tls" AND MIRA_ENABLE_TLS)
+           OR ((optional_module STREQUAL "Crypto" OR optional_module STREQUAL "Ws") AND MIRA_ENABLE_WEBSOCKET)
            OR (optional_module STREQUAL "Http2" AND MIRA_ENABLE_HTTP2)
            OR ((optional_module STREQUAL "Quic" OR optional_module STREQUAL "Http3") AND MIRA_ENABLE_HTTP3))
             install(EXPORT mira${optional_module}Targets

@@ -139,6 +139,93 @@ void flow_control_and_bounds() {
     CHECK(!bounded.request(request_headers("POST"), bytes(std::string(11, 'b'))));
 }
 
+void streaming_bodies() {
+    Limits limits;
+    limits.max_queued_body_bytes = 1024;
+    auto client = make_session(Role::client, limits);
+    auto server = make_session(Role::server, limits);
+    auto headers = request_headers("POST");
+    headers.push_back({"content-length", "131072"});
+    auto id = client.request_stream(headers);
+    auto other = client.request_stream(request_headers("POST"));
+    CHECK(id && other);
+    exchange(client, server);
+    CHECK(!server.stream(*id)->remote_end && !server.stream(*other)->remote_end);
+    CHECK(!client.wants_write());
+    const std::string chunk(1024, 's');
+    auto oversized = client.write_body(*id, bytes(std::string(1025, 's')));
+    CHECK(!oversized && oversized.error() == Errc::would_block);
+    CHECK(client.queued_body_bytes() == 0);
+    std::size_t received = 0;
+    for (int i = 0; i < 128; ++i) {
+        CHECK(client.write_body(*id, bytes(chunk)).has_value());
+        CHECK(client.queued_body_bytes() == 1024);
+        auto blocked = client.write_body(*other, bytes("x"));
+        CHECK(!blocked && blocked.error() == Errc::would_block);
+        CHECK(client.state() == State::open);
+        exchange(client, server, 4096);
+        auto piece = server.take_body(*id);
+        CHECK(piece && piece->size() == chunk.size());
+        CHECK(std::equal(piece->begin(), piece->end(), bytes(chunk).begin()));
+        received += piece->size();
+        CHECK(client.queued_body_bytes() == 0);
+        CHECK(client.write_body(*other, bytes("x")).has_value());
+        exchange(client, server);
+        auto small = server.take_body(*other);
+        CHECK(small && small->size() == 1);
+        CHECK(!server.stream(*id)->remote_end);
+    }
+    CHECK(received == 131072);
+    CHECK(!client.write_body(*id, bytes("extra")));
+    CHECK(client.finish_body(*id).has_value());
+    CHECK(!client.finish_body(*id));
+    CHECK(!client.write_body(*id, bytes("late")));
+    CHECK(client.finish_body(*other).has_value());
+    exchange(client, server);
+    CHECK(server.stream(*id)->remote_end && server.stream(*other)->remote_end);
+    CHECK(server.respond_stream(*id, {{":status", "200"}}).has_value());
+    CHECK(server.respond(*other, {{":status", "204"}}).has_value());
+    exchange(client, server);
+    CHECK(!client.stream(*id)->remote_end && client.stream(*other)->remote_end);
+    for (int i = 0; i < 128; ++i) {
+        CHECK(server.write_body(*id, bytes(chunk), i == 127).has_value());
+        exchange(client, server, 4096);
+        auto piece = client.take_body(*id);
+        CHECK(piece && piece->size() == chunk.size());
+        CHECK(server.queued_body_bytes() == 0);
+    }
+    CHECK(client.stream(*id)->remote_end);
+    auto empty = client.request_stream(request_headers("POST"));
+    CHECK(empty && client.finish_body(*empty));
+    auto cancelled = client.request_stream(request_headers("POST"));
+    CHECK(cancelled && client.write_body(*cancelled, bytes(chunk)));
+    CHECK(client.cancel(*cancelled).has_value());
+    CHECK(client.queued_body_bytes() == 0);
+    CHECK(!client.write_body(*cancelled, bytes("late")));
+    exchange(client, server);
+    CHECK(server.stream(*empty)->remote_end);
+    CHECK(server.respond_stream(*empty, {{":status", "200"}}).has_value());
+    exchange(client, server);
+    CHECK(server.finish_body(*empty).has_value());
+    exchange(client, server);
+    CHECK(client.stream(*empty)->remote_end);
+    auto exact = request_headers("POST");
+    exact.push_back({"content-length", "3"});
+    auto mismatch = client.request_stream(exact);
+    CHECK(mismatch && !client.finish_body(*mismatch));
+    CHECK(client.write_body(*mismatch, bytes("abc"), true).has_value());
+    CHECK(client.state() == State::open);
+    auto head = client.request(request_headers("HEAD"));
+    CHECK(head.has_value());
+    exchange(client, server);
+    CHECK(server.respond_stream(*head, {{":status", "200"}, {"content-length", "9"}}).has_value());
+    CHECK(!server.write_body(*head, bytes("forbidden")));
+    CHECK(server.finish_body(*head).has_value());
+    exchange(client, server);
+    CHECK(client.stream(*head)->remote_end && !client.stream(*head)->error);
+    CHECK(client.stream(*head)->body.empty());
+}
+
 void queued_cancel_and_close() {
     auto client = make_session(Role::client);
     auto server = make_session(Role::server);
@@ -320,6 +407,7 @@ Task<void> adapter_case() {
 }
 
 int main() {
+    streaming_bodies();
     multiplex_and_cancel();
     flow_control_and_bounds();
     queued_cancel_and_close();

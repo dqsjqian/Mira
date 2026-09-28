@@ -85,11 +85,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install openssl:x64-windows
+          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install openssl:x64-windows nghttp2:x64-windows
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "CMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Enable Windows HTTP2
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"MIRA_PLATFORM_PROTOCOL_FLAGS=-DMIRA_ENABLE_HTTP2=ON" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8'
       - name: Configure TLS
-        run: cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=${{ matrix.std }} -DMIRA_ENABLE_TLS=ON
+        run: cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=${{ matrix.std }} -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON ${{ env.MIRA_PLATFORM_PROTOCOL_FLAGS }}
       - name: Build TLS
         run: cmake --build build/tls --parallel --config Debug
       - name: Test TLS and HTTPS
@@ -121,8 +125,9 @@ jobs:
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-nghttp2
       - name: Configure with TLS
-        run: cmake -S . -B build/mingw -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON
+        run: cmake -S . -B build/mingw -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_HTTP2=ON
       - name: Build
         run: cmake --build build/mingw --parallel
       - name: Test
@@ -153,7 +158,7 @@ jobs:
       - name: Configure with ASan + UBSan and TLS
         run: >
           cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=Debug
-          -DMIRA_ENABLE_TLS=ON
+          -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
       - name: Build
         run: cmake --build build/asan --parallel
@@ -249,7 +254,7 @@ jobs:
         shell: bash
         run: >
           cmake -S . -B build/protocols -DCMAKE_BUILD_TYPE=Debug
-          -DMIRA_ENABLE_TLS=ON
+          -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON
           -DMIRA_ENABLE_HTTP2=ON
           -DMIRA_ENABLE_HTTP3=ON
           -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix"

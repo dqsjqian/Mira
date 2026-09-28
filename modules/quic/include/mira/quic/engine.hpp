@@ -45,6 +45,14 @@ inline std::uint64_t now_ns() noexcept {
 /// Fills the buffer from a cryptographically secure random source. Returns false on failure, never fills partial data.
 /// Reused by protocol modules above QUIC (HTTP/3 etc.) so they do not depend on the TLS backend directly.
 [[nodiscard]] bool fill_random(std::uint8_t* destination, std::size_t length) noexcept;
+struct PacketRoute {
+    Bytes destination_cid;
+    bool initial = false;
+};
+/// Decode routing metadata without authenticating the packet. Short headers use
+/// the engine's fixed 16-byte local CID length; only QUIC v1 Initials admit peers.
+[[nodiscard]] Result<PacketRoute> packet_route(std::span<const std::byte> packet);
+
 struct Options {
     bool server = false;
     transport::Endpoint local;
@@ -89,9 +97,14 @@ public:
     std::size_t write_capacity() const noexcept;
     std::uint64_t remote_bidi_stream_limit() const noexcept;
     bool closed() const noexcept;
+    /// Active locally-issued CIDs, including replacements; retired CIDs are omitted.
+    std::vector<Bytes> local_connection_ids() const;
+    /// The client's original Initial DCID (also available on server engines).
+    Bytes initial_destination_cid() const;
     std::string negotiated_protocol() const;
     Result<std::int64_t> open_stream(bool unidirectional = false);
-    /// Copies and holds the data until a real ACK or stream_close; returns a backpressure error once the total send budget is reached.
+    /// Copies and holds data until ACK or stream_close. Backpressure bounds both
+    /// total send bytes and 4096 queued chunks across all streams.
     Result<void> write(std::int64_t stream, std::span<const std::byte> bytes, bool fin);
     std::vector<Event> take_events();
     /// Restores the receive window after the application actually consumes (take_events does not count as consumption).

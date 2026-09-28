@@ -10,6 +10,9 @@
 #include "mira/core/error.hpp"
 #include "mira/core/executor.hpp"
 #include "mira/core/stream.hpp"
+#include "mira/core/resource_budget.hpp"
+#include "mira/core/connection_pool.hpp"
+#include <thread>
 #include "mira/core/task.hpp"
 
 #include <algorithm>
@@ -313,6 +316,112 @@ private:
     std::size_t limit_;
 };
 
+struct TestConnection {
+    int id;
+    int* destroyed;
+    ~TestConnection() { ++*destroyed; }
+};
+Task<Result<std::unique_ptr<TestConnection>>> connect_test(int& created, int& destroyed,
+                                                          OperationOptions) {
+    auto connection = std::make_unique<TestConnection>();
+    connection->id = ++created;
+    connection->destroyed = &destroyed;
+    co_return connection;
+}
+void test_connection_pool() {
+    test::section("bounded connection pool leases");
+    int created = 0, destroyed = 0;
+    auto factory = [&created, &destroyed](OperationOptions io) {
+        return connect_test(created, destroyed, io);
+    };
+    ConnectionPool<TestConnection> pool{1};
+    {
+        auto lease = pool.acquire(factory).sync_get();
+        CHECK(lease && lease->get().id == 1);
+        CHECK(pool.active_and_idle() == 1);
+        auto full = pool.acquire(factory).sync_get();
+        CHECK(!full && full.error() == Errc::would_block);
+        std::move(*lease).recycle();
+        CHECK(pool.idle() == 1);
+    }
+    CHECK(destroyed == 0);
+    {
+        auto reused = pool.acquire(factory).sync_get();
+        CHECK(reused && reused->get().id == 1 && created == 1);
+    }
+    CHECK(destroyed == 1 && pool.active_and_idle() == 0);
+    {
+        auto lease = pool.acquire(factory).sync_get();
+        CHECK(lease && lease->get().id == 2);
+        pool.close();
+        CHECK(pool.active_and_idle() == 1);
+        std::move(*lease).recycle();
+    }
+    CHECK(destroyed == 2 && pool.active_and_idle() == 0);
+    auto stopped = pool.acquire(factory).sync_get();
+    CHECK(!stopped && stopped.error() == Errc::cancelled);
+    ConnectionPool<TestConnection> no_idle{1, Clock::duration::zero()};
+    auto lease = no_idle.acquire(factory).sync_get();
+    CHECK(lease.has_value());
+    std::move(*lease).recycle();
+    CHECK(no_idle.idle() == 0 && no_idle.active_and_idle() == 0);
+    auto fail_factory = [](OperationOptions) -> Task<Result<std::unique_ptr<TestConnection>>> {
+        co_return fail(Errc::not_supported);
+    };
+    auto failed = no_idle.acquire(fail_factory).sync_get();
+    CHECK(!failed && failed.error() == Errc::not_supported && no_idle.active_and_idle() == 0);
+    auto timeout = no_idle.acquire(factory, {.deadline = Clock::now()}).sync_get();
+    CHECK(!timeout && timeout.error() == Errc::timed_out);
+    Task<Result<ConnectionPool<TestConnection>::Lease>> pending;
+    {
+        ConnectionPool<TestConnection> temporary{1};
+        pending = temporary.acquire(factory);
+    }
+    auto gone = std::move(pending).sync_get();
+    CHECK(!gone && gone.error() == Errc::cancelled);
+}
+
+void test_resource_budget() {
+    test::section("shared resource reservations");
+    ResourceBudget budget{8};
+    auto shared = budget;
+    auto first = budget.try_acquire(6);
+    CHECK(first && first->size() == 6 && shared.used() == 6);
+    auto rejected = shared.try_acquire(3);
+    CHECK(!rejected && rejected.error() == Errc::would_block);
+    CHECK(budget.used() == 6);
+    auto second = shared.try_acquire(2);
+    CHECK(second && budget.used() == 8);
+    auto moved = std::move(*first);
+    CHECK(first->size() == 0 && budget.used() == 8);
+    moved.reset();
+    CHECK(budget.used() == 2);
+    second->reset();
+    CHECK(budget.used() == 0);
+    CHECK(budget.try_acquire(0).has_value());
+    CHECK(!budget.try_acquire(static_cast<std::size_t>(-1)));
+    ResourceBudget::Reservation survivor;
+    {
+        ResourceBudget temporary{1};
+        survivor = std::move(*temporary.try_acquire(1));
+    }
+    CHECK(survivor.size() == 1);
+    survivor.reset();
+    std::atomic<bool> exceeded{false};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 4; ++i) {
+        workers.emplace_back([shared, &exceeded] {
+            for (int j = 0; j < 2000; ++j) {
+                auto reservation = shared.try_acquire(3);
+                if (shared.used() > shared.limit()) exceeded.store(true);
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    CHECK(!exceeded.load());
+    CHECK(budget.used() == 0);
+}
+
 void test_vector_writes() {
     test::section("scattered writes with empty fragments");
     const std::vector<std::vector<std::span<const std::byte>>> cases{
@@ -444,6 +553,8 @@ int main(int argc, char** argv) {
     test_buffer();
     test_stream_seam();
     test_vector_writes();
+    test_resource_budget();
+    test_connection_pool();
     test_executor_seam();
     return test::summary();
 }

@@ -12,6 +12,18 @@ target_include_directories(mira_transport_tests PRIVATE
 
 add_test(NAME transport COMMAND mira_transport_tests)
 
+add_executable(mira_local_tests test_local.cpp)
+target_link_libraries(mira_local_tests PRIVATE Mira::transport Mira::warnings)
+target_include_directories(mira_local_tests PRIVATE ${CMAKE_SOURCE_DIR}/modules/core/tests)
+add_test(NAME local_transport COMMAND mira_local_tests)
+set_tests_properties(local_transport PROPERTIES TIMEOUT 30)
+
+add_executable(mira_connection_pool_tests test_connection_pool.cpp)
+target_link_libraries(mira_connection_pool_tests PRIVATE Mira::transport Mira::warnings)
+target_include_directories(mira_connection_pool_tests PRIVATE ${CMAKE_SOURCE_DIR}/modules/core/tests)
+add_test(NAME connection_pool COMMAND mira_connection_pool_tests)
+set_tests_properties(connection_pool PROPERTIES TIMEOUT 30)
+
 # A transport bug hangs rather than fails; a timeout makes it red instead.
 set_tests_properties(transport PROPERTIES TIMEOUT 60)
 

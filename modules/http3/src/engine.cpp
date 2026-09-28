@@ -6,8 +6,11 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <deque>
 #include <exception>
 #include <map>
+#include <optional>
 
 namespace Mira::http3 {
 namespace {
@@ -39,11 +42,19 @@ struct Engine::Impl {
     std::uint64_t clock = 0;
     std::size_t output_bytes = 0, input_bytes = 0, header_bytes = 0;
     std::vector<Event> events;
+    std::size_t retained_chunk_count() const {
+        std::size_t total = 0;
+        for (const auto& [id, stream] : streams) { (void)id; total += stream.output.size(); }
+        return total;
+    }
     struct Stream {
-        quic::Bytes output;
-        std::size_t acked = 0, unread = 0, field_bytes = 0;
+        std::deque<quic::Bytes> output;
+        std::size_t offered = 0, acked = 0, queued = 0, produced = 0;
+        std::size_t unread = 0, field_bytes = 0;
+        std::optional<std::size_t> content_length;
         Headers fields;
-        bool responded = false, closed = false;
+        bool responded = false, closed = false, head = false;
+        bool streaming = false, finished = false, body_forbidden = false;
     };
     std::map<std::int64_t, Stream> streams;
     Impl(quic::Engine q, bool s, Limits l) : transport(std::move(q)), server(s), limits(l) {}
@@ -94,6 +105,7 @@ struct Engine::Impl {
             s.header_bytes += size;
             stream.fields.push_back(Header{std::string(reinterpret_cast<char*>(n.base), n.len),
                                            std::string(reinterpret_cast<char*>(v.base), v.len)});
+            if (stream.fields.back().name == ":method") stream.head = stream.fields.back().value == "HEAD";
             return 0;
         });
     }
@@ -150,9 +162,14 @@ struct Engine::Impl {
             if (it != s.streams.end()) {
                 auto& stream = it->second;
                 stream.acked += static_cast<std::size_t>(bytes);
-                if (stream.acked == stream.output.size()) {
-                    s.output_bytes -= stream.output.size();
-                    quic::Bytes{}.swap(stream.output);
+                while (!stream.output.empty() && stream.acked >= stream.output.front().size()) {
+                    const auto size = stream.output.front().size();
+                    if (!stream.offered) return NGHTTP3_ERR_CALLBACK_FAILURE;
+                    stream.acked -= size;
+                    stream.queued -= size;
+                    s.output_bytes -= size;
+                    --stream.offered;
+                    stream.output.pop_front();
                 }
             }
             return 0;
@@ -163,8 +180,9 @@ struct Engine::Impl {
             auto& s = self(p);
             auto it = s.streams.find(id);
             if (it != s.streams.end()) {
-                s.output_bytes -= it->second.output.size();
-                quic::Bytes{}.swap(it->second.output);
+                s.output_bytes -= it->second.queued;
+                it->second.queued = it->second.offered = it->second.acked = 0;
+                it->second.output.clear();
                 it->second.closed = true;
                 if (!it->second.unread) s.streams.erase(it);
             }
@@ -179,15 +197,18 @@ struct Engine::Impl {
                                    void* p,
                                    void*) noexcept {
         try {
-            auto& b = self(p).streams.at(id).output;
+            auto& stream = self(p).streams.at(id);
             if (count == 0) return NGHTTP3_ERR_CALLBACK_FAILURE;
-            // nghttp3's C API takes non-const uint8_t* (used read-only); the library-wide byte
-            // is std::byte, so the const_cast only marks the library boundary and grants no mutation.
-            vec[0].base = const_cast<std::uint8_t*>(
-                reinterpret_cast<const std::uint8_t*>(b.data()));
-            vec[0].len = b.size();
-            *flags |= NGHTTP3_DATA_FLAG_EOF;
-            return 1;
+            if (stream.offered == stream.output.size() && !stream.finished)
+                return NGHTTP3_ERR_WOULDBLOCK;
+            std::size_t filled = 0;
+            while (filled < count && stream.offered < stream.output.size()) {
+                auto& chunk = stream.output[stream.offered++];
+                vec[filled++] = {reinterpret_cast<std::uint8_t*>(chunk.data()), chunk.size()};
+            }
+            if (stream.finished && stream.offered == stream.output.size())
+                *flags |= NGHTTP3_DATA_FLAG_EOF;
+            return static_cast<nghttp3_ssize>(filled);
         } catch (...) {
             return NGHTTP3_ERR_CALLBACK_FAILURE;
         }
@@ -258,27 +279,76 @@ struct Engine::Impl {
         }
         return {};
     }
-    Result<void> valid_fields(const Headers& fields, std::span<const std::byte> body) {
-        if (fields.size() > limits.max_headers ||
-            body.size() > limits.max_buffered_body - output_bytes)
-            return std::unexpected(http3_error(invalid));
+    Result<void> valid_fields(const Headers& fields, std::span<const std::byte> body, bool streaming) {
+        if (body.size() > limits.max_buffered_body - output_bytes) return fail(Errc::would_block);
+        if (fields.size() > limits.max_headers) return fail(Errc::invalid_argument);
         std::size_t size = 0;
+        bool regular = false, method = false, scheme = false, path = false, authority = false;
+        bool status = false, length = false, forbidden = false;
         for (auto& [name, value] : fields) {
-            if (!nghttp3_check_header_name(reinterpret_cast<const std::uint8_t*>(name.data()),
-                                           name.size()) ||
-                !nghttp3_check_header_value(reinterpret_cast<const std::uint8_t*>(value.data()),
-                                            value.size()))
-                return std::unexpected(http3_error(invalid));
+            if (name.empty() || !nghttp3_check_header_name(reinterpret_cast<const std::uint8_t*>(name.data()),
+                                                          name.size()) ||
+                !nghttp3_check_header_value(reinterpret_cast<const std::uint8_t*>(value.data()), value.size()))
+                return fail(Errc::invalid_argument);
             if (name.size() + value.size() + 32 > limits.max_header_bytes - size)
-                return std::unexpected(http3_error(invalid));
+                return fail(Errc::invalid_argument);
             size += name.size() + value.size() + 32;
+            for (char c : name) if (c >= 'A' && c <= 'Z') return fail(Errc::invalid_argument);
+            if (name.front() == ':') {
+                if (regular || value.empty()) return fail(Errc::invalid_argument);
+                bool* seen = nullptr;
+                if (!server && name == ":method") {
+                    seen = &method;
+                    if (value == "CONNECT") return fail(Errc::invalid_argument);
+                } else if (!server && name == ":scheme") seen = &scheme;
+                else if (!server && name == ":path") seen = &path;
+                else if (!server && name == ":authority") seen = &authority;
+                else if (server && name == ":status") {
+                    seen = &status;
+                    unsigned code = 0;
+                    auto parsed = std::from_chars(value.data(), value.data() + value.size(), code);
+                    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                        value.size() != 3 || code < 200 || code > 599) return fail(Errc::invalid_argument);
+                    forbidden = code == 204 || code == 304;
+                }
+                if (!seen || *seen) return fail(Errc::invalid_argument);
+                *seen = true;
+            } else {
+                regular = true;
+                if (name == "connection" || name == "proxy-connection" || name == "keep-alive" ||
+                    name == "upgrade" || name == "transfer-encoding" ||
+                    (name == "te" && value != "trailers")) return fail(Errc::invalid_argument);
+                if (name == "content-length") {
+                    std::size_t n = 0;
+                    auto parsed = std::from_chars(value.data(), value.data() + value.size(), n);
+                    if (length || parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                        (!streaming && n != body.size())) return fail(Errc::invalid_argument);
+                    length = true;
+                }
+            }
         }
+        if ((server ? !status : !(method && scheme && path && authority)) ||
+            (forbidden && !body.empty())) return fail(Errc::invalid_argument);
         return {};
     }
     Result<void>
-    submit(std::int64_t id, const Headers& fields, std::span<const std::byte> body) {
+    submit(std::int64_t id, const Headers& fields, std::span<const std::byte> body, bool streaming) {
         auto& stream = streams.at(id);
-        stream.output.assign(body.begin(), body.end());
+        stream.streaming = streaming;
+        stream.finished = !streaming;
+        stream.body_forbidden = server && stream.head;
+        for (const auto& [name, value] : fields) {
+            if (name == "content-length") {
+                std::size_t size = 0;
+                std::from_chars(value.data(), value.data() + value.size(), size);
+                stream.content_length = size;
+            }
+            if (name == ":status" && (value == "204" || value == "304")) stream.body_forbidden = true;
+        }
+        if (stream.body_forbidden) body = {};
+        if (!body.empty() && retained_chunk_count() >= limits.max_events) return fail(Errc::would_block);
+        if (!body.empty()) stream.output.emplace_back(body.begin(), body.end());
+        stream.queued = stream.produced = body.size();
         output_bytes += body.size();
         std::vector<nghttp3_nv> nv;
         for (auto& [name, value] : fields)
@@ -290,10 +360,31 @@ struct Engine::Impl {
         nghttp3_data_reader reader{read_body};
         int rv =
             server ? nghttp3_conn_submit_response(
-                         conn, id, nv.data(), nv.size(), body.empty() ? nullptr : &reader)
+                         conn, id, nv.data(), nv.size(), streaming || !body.empty() ? &reader : nullptr)
                    : nghttp3_conn_submit_request(
-                         conn, id, nv.data(), nv.size(), body.empty() ? nullptr : &reader, nullptr);
-        if (auto r = check(rv); !r) return r;
+                         conn, id, nv.data(), nv.size(), streaming || !body.empty() ? &reader : nullptr, nullptr);
+        if (rv < 0) {
+            output_bytes -= stream.queued;
+            stream.queued = 0;
+            stream.output.clear();
+            if (nghttp3_err_is_fatal(rv)) failed = true;
+            return std::unexpected(http3_error(rv));
+        }
+        if (streaming) {
+            // Incremental producers must not serialize later streams behind an unfinished body.
+            if (server) {
+                nghttp3_pri priority{};
+                rv = nghttp3_conn_get_stream_priority(conn, &priority, id);
+                if (!rv) {
+                    priority.inc = 1;
+                    rv = nghttp3_conn_set_server_stream_priority(conn, id, &priority);
+                }
+            } else {
+                const std::uint8_t priority[] = {'i'};
+                rv = nghttp3_conn_set_client_stream_priority(conn, id, priority, sizeof(priority));
+            }
+            if (auto r = check(rv); !r) return r;
+        }
         stream.responded = true;
         return {};
     }
@@ -302,6 +393,8 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
 Engine::~Engine() = default;
+quic::Engine& Engine::transport() noexcept { return impl_->transport; }
+const quic::Engine& Engine::transport() const noexcept { return impl_->transport; }
 Result<Engine> Engine::create(quic::Engine transport, bool server, Limits limits) {
     if (transport.is_server() != server || transport.closed())
         return std::unexpected(http3_error(invalid));
@@ -382,7 +475,7 @@ Result<quic::Bytes> Engine::poll(std::uint64_t now) {
                 fin != 0 && bytes.size() == available);
             if (!r) {
                 // -100001 is the QUIC engine's send-budget backpressure: pause output this round and retry on the next poll.
-                if (r.error().value() == -100001) break;
+                if (r.error() == Errc::would_block || r.error().value() == -100001) break;
                 s.failed = true;
                 return std::unexpected(r.error());
             }
@@ -418,26 +511,73 @@ bool Engine::is_server() const noexcept {
     return impl_->server;
 }
 Result<std::int64_t> Engine::request(const Headers& fields, std::span<const std::byte> body) {
+    return request_impl(fields, body, false);
+}
+Result<std::int64_t> Engine::request_stream(const Headers& fields) {
+    return request_impl(fields, {}, true);
+}
+Result<std::int64_t> Engine::request_impl(const Headers& fields, std::span<const std::byte> body,
+                                         bool streaming) {
     auto& s = *impl_;
     if (!ready() || s.server || s.going || s.remote_going ||
         s.streams.size() >= s.limits.max_streams)
         return std::unexpected(http3_error(invalid));
-    if (auto r = s.valid_fields(fields, body); !r) return std::unexpected(r.error());
+    if (auto r = s.valid_fields(fields, body, streaming); !r) return std::unexpected(r.error());
     auto id = s.transport.open_stream();
     if (!id) return std::unexpected(id.error());
     s.streams.try_emplace(*id);
-    if (auto r = s.submit(*id, fields, body); !r) return std::unexpected(r.error());
+    if (auto r = s.submit(*id, fields, body, streaming); !r) {
+        s.streams.erase(*id);
+        static_cast<void>(s.transport.cancel(*id, NGHTTP3_H3_REQUEST_CANCELLED));
+        return std::unexpected(r.error());
+    }
     return *id;
 }
 Result<void>
 Engine::respond(std::int64_t id, const Headers& fields, std::span<const std::byte> body) {
+    return respond_impl(id, fields, body, false);
+}
+Result<void> Engine::respond_stream(std::int64_t id, const Headers& fields) {
+    return respond_impl(id, fields, {}, true);
+}
+Result<void> Engine::respond_impl(std::int64_t id, const Headers& fields,
+                                 std::span<const std::byte> body, bool streaming) {
     auto& s = *impl_;
     auto it = s.streams.find(id);
-    if (!ready() || !s.server || it == s.streams.end() || it->second.responded)
+    if (!ready() || !s.server || it == s.streams.end() || it->second.responded || it->second.closed)
         return std::unexpected(http3_error(invalid));
-    if (auto r = s.valid_fields(fields, body); !r) return r;
-    return s.submit(id, fields, body);
+    if (auto r = s.valid_fields(fields, body, streaming); !r) return r;
+    return s.submit(id, fields, body, streaming);
 }
+Result<void> Engine::write_body(std::int64_t id, std::span<const std::byte> body, bool end) {
+    auto& s = *impl_;
+    auto it = s.streams.find(id);
+    if (!ready() || it == s.streams.end()) return fail(Errc::invalid_argument);
+    auto& stream = it->second;
+    if (!stream.streaming || !stream.responded || stream.closed || stream.finished ||
+        (stream.body_forbidden && !body.empty())) return fail(Errc::invalid_argument);
+    if (stream.content_length && !stream.body_forbidden &&
+        (body.size() > *stream.content_length - stream.produced ||
+         (end && stream.produced + body.size() != *stream.content_length))) return fail(Errc::invalid_argument);
+    if (body.size() > s.limits.max_buffered_body - s.output_bytes ||
+        (!body.empty() && s.retained_chunk_count() >= s.limits.max_events)) return fail(Errc::would_block);
+    if (body.empty() && !end) return {};
+    if (!body.empty()) stream.output.emplace_back(body.begin(), body.end());
+    const int rv = nghttp3_conn_resume_stream(s.conn, id);
+    if (rv < 0) {
+        if (!body.empty()) stream.output.pop_back();
+        if (nghttp3_err_is_fatal(rv)) s.failed = true;
+        return std::unexpected(http3_error(rv));
+    }
+    stream.queued += body.size();
+    s.output_bytes += body.size();
+    stream.produced += body.size();
+    stream.finished = end;
+    return {};
+}
+Result<void> Engine::finish_body(std::int64_t id) { return write_body(id, {}, true); }
+std::size_t Engine::queued_body_bytes() const noexcept { return impl_->output_bytes; }
+
 std::vector<Event> Engine::take_events() {
     std::vector<Event> result;
     result.swap(impl_->events);
@@ -472,7 +612,10 @@ Result<void> Engine::cancel(std::int64_t id) {
         return std::unexpected(http3_error(invalid));
     nghttp3_conn_shutdown_stream_write(s.conn, id);
     if (auto r = s.check(nghttp3_conn_shutdown_stream_read(s.conn, id)); !r) return r;
-    return s.transport.cancel(id, NGHTTP3_H3_REQUEST_CANCELLED);
+    if (auto r = s.transport.cancel(id, NGHTTP3_H3_REQUEST_CANCELLED); !r) return r;
+    const int rv = nghttp3_conn_close_stream(s.conn, id, NGHTTP3_H3_REQUEST_CANCELLED);
+    if (rv != NGHTTP3_ERR_STREAM_NOT_FOUND) return s.check(rv);
+    return {};
 }
 Result<void> Engine::shutdown_notice() {
     auto& s = *impl_;

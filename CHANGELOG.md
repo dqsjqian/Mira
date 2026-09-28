@@ -7,6 +7,26 @@ version is 0, the minor version is where breaking changes land: a request for
 
 ## [Unreleased]
 
+### Added
+
+- CID-routed single-port QUIC/H3 dispatchers, bounded admission and resource
+  reservations, shared payload budgets, multi-client runtime tests and example.
+- H2/H3 incremental request/response bodies with bounded chunk queues,
+  deferred/resumed output, ACK-safe H3 lifetimes and stream fairness tests.
+- Optional RFC6455 WebSocket/WSS, secure masking/handshake primitives, framing
+  and UTF-8 negative tests, independent Python interoperability and TCP duplex.
+- Shareable RAII resource budgets, bounded connection leases, establishment-only
+  reconnect policy, admission-controlled TCP serving and cooperative shutdown.
+- SSE resume example, POSIX filesystem local streams and real socket benchmarks
+  reporting throughput, latency percentiles and observed server RSS.
+
+### Fixed
+
+- QUIC rotates bidirectional stream output instead of starving higher stream IDs.
+- Installed consumer verification restricts multi-config generators to the
+  configuration actually installed, including vcpkg's configuration mappings.
+
+
 ## [0.5.0] — 2026-09-28
 
 ### Added
