@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -63,6 +65,14 @@ def main() -> None:
         source = extract(archive, Path(temp), f"curl-{VERSION}")
         build = Path(temp) / "build"
         install = work / "prefix"
+        extra = []
+        if sys.platform.startswith("linux") and (openssl / "lib/libssl.a").is_file():
+            # curl's raw NGTCP2 library list has no CMake dependency edge to
+            # OpenSSL. GNU ld needs the static TLS archives after that adapter,
+            # not only in curl's earlier TLS list. Standard libraries are last.
+            tls_tail = " ".join(shlex.quote(str(openssl / "lib" / name))
+                                for name in ("libssl.a", "libcrypto.a"))
+            extra.append(f"-DCMAKE_C_STANDARD_LIBRARIES={tls_tail} -ldl -pthread")
         run(["cmake", "-S", str(source), "-B", str(build),
              "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_PREFIX_PATH={prefix}",
              f"-DOPENSSL_ROOT_DIR={openssl}", f"-DCMAKE_INSTALL_PREFIX={install}",
@@ -70,7 +80,7 @@ def main() -> None:
              "-DBUILD_SHARED_LIBS=OFF", "-DBUILD_STATIC_LIBS=ON", "-DBUILD_STATIC_CURL=ON",
              "-DBUILD_TESTING=OFF", "-DBUILD_LIBCURL_DOCS=OFF", "-DBUILD_MISC_DOCS=OFF",
              "-DCURL_USE_LIBPSL=OFF", "-DCURL_USE_LIBSSH2=OFF",
-             "-DCURL_BROTLI=OFF", "-DCURL_ZSTD=OFF"])
+             "-DCURL_BROTLI=OFF", "-DCURL_ZSTD=OFF", *extra])
         run(["cmake", "--build", str(build), "--parallel", str(args.jobs)])
         run(["cmake", "--install", str(build)])
     binary = install / "bin/curl"
