@@ -7,6 +7,7 @@ The existing protocol dependency prefix and OpenSSL 3.5+ are prerequisites.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -51,6 +52,13 @@ def main() -> None:
             if sha256(candidate) != DIGEST:
                 raise ValueError("downloaded curl archive failed SHA256 verification")
             candidate.replace(archive)
+    # The ngtcp2 ossl .pc file requires libssl. Make pkg-config use the same
+    # OpenSSL prefix as CMake, not the distro libssl (which may lack QUIC).
+    pkg_paths = [prefix / "lib/pkgconfig", openssl / "lib/pkgconfig",
+                 openssl / "lib64/pkgconfig"]
+    previous = os.environ.get("PKG_CONFIG_PATH", "")
+    os.environ["PKG_CONFIG_PATH"] = os.pathsep.join(
+        [str(path) for path in pkg_paths] + ([previous] if previous else []))
     with tempfile.TemporaryDirectory(prefix="source-", dir=work) as temp:
         source = extract(archive, Path(temp), f"curl-{VERSION}")
         build = Path(temp) / "build"

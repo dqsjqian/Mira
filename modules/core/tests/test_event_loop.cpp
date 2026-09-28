@@ -942,8 +942,13 @@ void test_ready_batch_both_directions_detach() {
                                std::array<Result<std::size_t>, 2>& results, int& count) {
             const std::size_t index = writing ? 1U : 0U;
             std::array<std::byte, 1> scratch{};
-            results[index] = writing ? co_await target.write(fd, bytes_of("x"))
-                                     : co_await target.read(fd, scratch);
+            // Keep coroutine suspension out of a conditional expression:
+            // GCC can mis-lower the two awaiters and strand the continuation.
+            if (writing) {
+                results[index] = co_await target.write(fd, bytes_of("x"));
+            } else {
+                results[index] = co_await target.read(fd, scratch);
+            }
             ++count;
             if (results[index]) {
                 target.detach(fd);
