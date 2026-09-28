@@ -17,11 +17,11 @@ std::vector<std::byte> raw(std::initializer_list<unsigned> values) {
     for (auto value : values) result.push_back(std::byte(value));
     return result;
 }
-std::array<std::byte, 4> mask{std::byte{0x12}, std::byte{0x34}, std::byte{0x56}, std::byte{0x78}};
+std::array<std::byte, 4> test_mask{std::byte{0x12}, std::byte{0x34}, std::byte{0x56}, std::byte{0x78}};
 void codec() {
     for (std::size_t size : {0U, 1U, 125U, 126U, 65535U, 65536U}) {
         Frame frame{Opcode::binary, true, std::vector<std::byte>(size, std::byte{0xa5})};
-        auto wire = serialize(frame, Role::client, mask);
+        auto wire = serialize(frame, Role::client, test_mask);
         CHECK(wire.has_value());
         if (!wire) continue;
         FrameParser parser(Role::server);
@@ -56,8 +56,8 @@ void codec() {
         CHECK(!valid_utf8(invalid_utf8));
     CHECK(valid_utf8(raw({0xf0,0x9f,0x92,0xa9})));
     FrameParser client(Role::client);
-    auto masked = serialize(Frame{}, Role::client, mask);
-    CHECK(!client.feed(*masked).has_value());
+    auto test_masked = serialize(Frame{}, Role::client, test_mask);
+    CHECK(!client.feed(*test_masked).has_value());
     Limits limits; limits.max_frame = 10;
     FrameParser limited(Role::server, limits);
     auto oversized = raw({0x82,0xfe,0,126,0,0,0,0});
@@ -68,23 +68,23 @@ void codec() {
     Frame continuation{Opcode::continuation, true, raw({0x82,0xac})};
     Frame ping{Opcode::ping, true, bytes("p")};
     for (const auto& frame : {start, ping, continuation}) {
-        auto wire = serialize(frame, Role::client, mask);
+        auto wire = serialize(frame, Role::client, test_mask);
         auto parsed = fragments.feed(*wire);
         CHECK(parsed && parsed->frame.has_value());
     }
     FrameParser truncated(Role::server);
-    CHECK(truncated.feed(*serialize(start, Role::client, mask)).has_value());
+    CHECK(truncated.feed(*serialize(start, Role::client, test_mask)).has_value());
     continuation.payload = raw({0x82});
-    CHECK(!truncated.feed(*serialize(continuation, Role::client, mask)).has_value());
+    CHECK(!truncated.feed(*serialize(continuation, Role::client, test_mask)).has_value());
     FrameParser overlapping(Role::server);
-    CHECK(overlapping.feed(*serialize(start, Role::client, mask)).has_value());
-    CHECK(!overlapping.feed(*serialize(start, Role::client, mask)).has_value());
+    CHECK(overlapping.feed(*serialize(start, Role::client, test_mask)).has_value());
+    CHECK(!overlapping.feed(*serialize(start, Role::client, test_mask)).has_value());
     Limits message_limit; message_limit.max_message = 3;
     FrameParser cumulative(Role::server, message_limit);
     Frame first_binary{Opcode::binary, false, bytes("ab")};
     Frame last_binary{Opcode::continuation, true, bytes("cd")};
-    CHECK(cumulative.feed(*serialize(first_binary, Role::client, mask)).has_value());
-    CHECK(!cumulative.feed(*serialize(last_binary, Role::client, mask)).has_value());
+    CHECK(cumulative.feed(*serialize(first_binary, Role::client, test_mask)).has_value());
+    CHECK(!cumulative.feed(*serialize(last_binary, Role::client, test_mask)).has_value());
     Frame forbidden_server_close{Opcode::close, true, *close_payload(1010)};
     CHECK(!serialize(forbidden_server_close, Role::server).has_value());
     for (auto code : {1000,1001,1002,1003,1007,1008,1009,1010,1011,1012,1013,1014,3000,4999})
@@ -170,7 +170,7 @@ Task<void> connection_tests() {
     Frame ping{Opcode::ping, true, bytes("heartbeat")};
     Frame close{Opcode::close, true, *close_payload()};
     for (const auto& frame : {ping, text, ping, close}) {
-        auto wire = serialize(frame, Role::client, mask);
+        auto wire = serialize(frame, Role::client, test_mask);
         stream.input.insert(stream.input.end(), wire->begin(), wire->end());
     }
     Connection conn(stream, Role::server);
