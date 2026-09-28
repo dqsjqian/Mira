@@ -111,11 +111,10 @@ Task<void> server_side(transport::udp::Socket& server_socket,
                 require(server->consume(event.stream_id, event.data.size()));
             } else if (event.kind == http3::Event::Kind::end) {
                 auto& body = bodies.at(event.stream_id);
-                require(co_await server->respond(
-                    event.stream_id,
-                    {{":status", "200"}, {"content-length", std::to_string(body.size())}},
-                    wire(body),
-                    {.deadline = Clock::now() + 10s}));
+                const http3::Headers response_fields{
+                    {":status", "200"}, {"content-length", std::to_string(body.size())}};
+                require(co_await server->respond(event.stream_id, response_fields, wire(body),
+                                                 {.deadline = Clock::now() + 10s}));
                 bodies.erase(event.stream_id);
                 ++answered;
             } else if (event.kind == http3::Event::Kind::reset) {
@@ -143,10 +142,9 @@ Task<void> client_side(EventLoop& loop,
     client = std::make_unique<H3Connection>(std::move(*connected));
     if (overflow) {
         for (int i = 0; i < 3; ++i) {
-            require(co_await client->request({{":method", "GET"},
-                                              {":scheme", "https"},
-                                              {":authority", "localhost"},
-                                              {":path", "/queued"}}));
+            const http3::Headers queued_fields{{":method", "GET"}, {":scheme", "https"},
+                                                {":authority", "localhost"}, {":path", "/queued"}};
+            require(co_await client->request(queued_fields));
             auto round = co_await client->pump({.deadline = Clock::now() + 10s});
             if (!round) {
                 check(client->closed(), "queue-test client failed before peer close");
@@ -165,16 +163,12 @@ Task<void> client_side(EventLoop& loop,
 
     Bytes payload(20000, std::byte{0x48});
     payload[11] = std::byte{0};  // Binary safety.
-    const std::int64_t first = require(co_await client->request({{":method", "POST"},
-                                                                 {":scheme", "https"},
-                                                                 {":authority", "localhost"},
-                                                                 {":path", "/echo"}},
-                                                                wire(payload)));
-    const std::int64_t second = require(co_await client->request({{":method", "POST"},
-                                                                  {":scheme", "https"},
-                                                                  {":authority", "localhost"},
-                                                                  {":path", "/another"}},
-                                                                 wire(payload)));
+    const http3::Headers first_fields{{":method", "POST"}, {":scheme", "https"},
+                                      {":authority", "localhost"}, {":path", "/echo"}};
+    const http3::Headers second_fields{{":method", "POST"}, {":scheme", "https"},
+                                       {":authority", "localhost"}, {":path", "/another"}};
+    const std::int64_t first = require(co_await client->request(first_fields, wire(payload)));
+    const std::int64_t second = require(co_await client->request(second_fields, wire(payload)));
     check(first != second, "requests must have distinct stream IDs");
     // Submit both requests before reading; the second response may arrive while reading the first.
     for (const auto stream : {first, second}) {
@@ -208,10 +202,9 @@ Task<void> client_side(EventLoop& loop,
         auto ended = require(co_await client->read_body(stream, {.deadline = Clock::now() + 1s}));
         check(ended.fin && ended.data.empty(), "consumed EOF must remain terminal");
     }
-    const auto reset_stream = require(co_await client->request({{":method", "GET"},
-                                                                {":scheme", "https"},
-                                                                {":authority", "localhost"},
-                                                                {":path", "/reset"}}));
+    const http3::Headers reset_fields{{":method", "GET"}, {":scheme", "https"},
+                                      {":authority", "localhost"}, {":path", "/reset"}};
+    const auto reset_stream = require(co_await client->request(reset_fields));
     auto reset_head = co_await client->await_head(reset_stream, {.deadline = Clock::now() + 10s});
     check(!reset_head && reset_head.error() == std::errc::connection_reset,
           "reset must fail await_head rather than produce an empty successful head");
