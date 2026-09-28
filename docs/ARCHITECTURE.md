@@ -33,11 +33,11 @@ and remaining acceptance work must be described separately.
 | Concern | Current foundation | Remaining acceptance work |
 |---|---|---|
 | Execution and ownership | Lazy, move-only `Task` that terminates rather than destroy a started, unfinished frame; single-threaded `TaskScope` with immediate spawn and one-shot join; executor seam; single-threaded `EventLoop` whose operations carry never-reused identities | Explicit operation/buffer ownership across layers and continued join/drain validation; loop destruction during dispatch is refused rather than supported |
-| Cancellation and deadlines | `OperationOptions` on every core operation, forwarded through TCP, TLS and the HTTP connection loop; `BoundedStream` distinguishes streams that can honour it; HTTP converts `idle_timeout` / `request_timeout` into a fresh deadline per request | Runtime evidence on Windows, where the IOCP semantics rest on CI alone; a cancelled IOCP read may lose bytes, so that connection must be closed; `stop()` is still a stop-pumping request, not I/O cancellation |
+| Cancellation and deadlines | `OperationOptions` on core/TCP/HTTP operations; TLS owns independent loop timers for each application request without rearming wire I/O; `BoundedStream` exposes cancellation support; registration is rolled back on allocation failure | Maintain runtime evidence for backend-specific completion races; a cancelled IOCP read may lose bytes, so that connection cannot be resumed; `stop()` is a stop-pumping request, not I/O cancellation |
 | Transport and composition | TCP and completion-shaped kqueue/epoll/IOCP implementations; stream concepts; message-preserving UDP datagrams with cancellation/deadline support; `transport::DatagramTransport` pins the datagram contract (`mira/transport/datagram.hpp`), positive and negative conformance asserted at compile time | Equivalent observable semantics across backends, verified teardown, bounded queues |
 | Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered and streaming request bodies (`RequestBodyReader`), chunked trailers, connection-loop drain guarantees; request- and response-parser fuzzing in CI; curl interop exercised out-of-process against the example servers — HTTP/1.1 against the file server, real-nghttp2 HTTP/2 (prior knowledge, including concurrent streams) against `examples/h2_prior_knowledge_server`, native-QUIC HTTP/3 (ngtcp2 + nghttp3) against `examples/h3_server` | Protocol conformance evidence, slow-consumer backpressure bounds and bounded aggregate memory measurements |
-| Security and robustness | Optional OpenSSL TLS stream, parser limits, negative-input tests and fuzzing of both HTTP parsers (request and response) | Lifecycle-safe TLS cancellation, fuzzing beyond the HTTP parsers, failure injection and resource-exhaustion tests |
-| Engineering evidence | C++23-only build, desktop runtime CI and mobile cross-compilation jobs exist; last confirmed passing desktop baseline is `f796db9` | Fresh validation of current streaming/fuzz changes, mobile runtime evidence, reproducible interop/performance/resource measurements; no current stable ABI promise |
+| Security and robustness | Optional duplex OpenSSL TLS stream with terminal cancellation, bounded parser limits, HTTP and WebSocket parser/handshake fuzzing, official Autobahn non-compression cases in both roles, timer-registration allocation-failure rollback | Longer fault injection, additional resource-exhaustion scenarios and mobile TLS runtime evidence |
+| Engineering evidence | C++23-only desktop runtime CI, independent HTTP/3 curl, full non-compression Autobahn client/server reports, sanitizer builds and real-socket benchmarks; mobile jobs cross-compile | Track the current CI commit rather than a stale baseline; mobile runtime evidence, multi-machine load and longer resource measurements remain outstanding; no stable ABI promise |
 
 Rejecting ambiguous or malformed input is part of protocol correctness, not a
 substitute for the other contracts. The HTTP parser rejects conflicting
@@ -591,8 +591,15 @@ immediately on the calling thread before any suspension. Fatal errors poison
 the session, and ciphertext EOF without close_notify is truncation. Shutdown
 sends and flushes only the local close_notify; it does not certify a two-way
 shutdown. Context lifetime is retained by SSL; the borrowed transport and spans
-must remain alive. One outstanding operation per TLS stream is supported;
-overlapping calls are rejected rather than racing the SSL state machine.
+must remain alive. The stream also borrows its explicitly supplied EventLoop.
+After handshake, one read and one write may overlap on that loop thread; same-
+direction calls and overlapping handshake/shutdown are rejected. SSL calls stay
+synchronous and serialized, while ciphertext read/write operations use separate
+bounded buffers. Each request owns a cancellable deadline timer. A deadline
+change never cancels and resubmits wire I/O: IOCP cancellation can hide bytes
+already transferred. Terminal failures permanently stop both directions. Reads
+wait only for output they generated, not unrelated backpressured application
+writes; TLS 1.3 KeyUpdate and WSS duplex have dedicated regression coverage.
 
 Tests generate fresh private CA/certificate/key fixtures at runtime; no private
 keys are committed. HTTPS exercises the existing HTTP loop unchanged, with
@@ -604,7 +611,7 @@ outstanding. BSD also has no dedicated CI evidence.
 
 This integration also fixes HTTP EOF before the end of a partial request head
 being mistaken for idle disconnect, and rejects a zero read-chunk policy.
-Current request bodies remain buffered, not streamed to handlers.
+HTTP/1 also provides a streaming RequestBodyReader; H2/H3 expose bounded incremental outbound bodies.
 
 **Structured task foundation.** `TaskScope` adds immediate owned spawn, one-shot
 join, prompt child-frame reclamation, cooperative stop and first-exception

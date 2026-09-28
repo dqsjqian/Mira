@@ -98,7 +98,8 @@ Solid arrows are dependency directions; dashed arrows are application-level comp
 |---|---|
 | `Mira::core` | Coroutines and task scopes, errors, stream and executor interfaces, buffers, event loop and timers |
 | `Mira::transport` | IP endpoints, TCP (exclusive bind by default), message-boundary UDP, bounded background system resolver |
-| `Mira::tls` | Optional TLS streams, certificate and hostname verification, mTLS client verification, multi-protocol ALPN |
+| `Mira::tls` | Same-loop duplex TLS streams, per-request deadlines, certificate/hostname verification, mTLS and ALPN |
+| `Mira::ws` / `Mira::crypto` | RFC6455 WebSocket and WSS composition, secure nonce/masking and handshake digest |
 | `Mira::http` | HTTP/1 request/response parsing, serialization, per-connection serving (incl. chunked streaming) and client |
 | `Mira::http2` | Optional nghttp2 session, multi-stream state, generic stream adaptation |
 | `Mira::quic` / `Mira::http3` | QUIC v1 and nghttp3 / QPACK engines |
@@ -188,7 +189,7 @@ No 408 is sent: announcing it would require a second budget the caller never gra
 | Windows | IOCP | Desktop loopback CI, dedicated TLS matrix |
 | iOS / Android | kqueue / epoll | Cross-compile core / transport / HTTP1; Android requires **NDK 29+** |
 
-CI covers desktop base/TLS, MinGW, sanitizers, parser fuzzing and Linux/macOS H2/H3 runs. **Windows H2/H3 and mobile protocol runtime coverage are not yet verified**; mobile jobs cross-compile base non-TLS modules, not every protocol on real devices. The Linux protocol job builds a pinned HTTP/3 curl for mandatory independent interoperability; missing tooling cannot count as a pass. See the CI link above for the current run.
+CI covers desktop base/TLS/WSS, MinGW H2, sanitizers, HTTP/WebSocket fuzzing, both Autobahn roles and Linux/macOS H2/H3 runs. Windows MSVC executes QUIC/H3, multi-client and duplex TLS tests. Mobile jobs still cross-compile base non-TLS modules, not protocols on real devices. Linux builds a pinned HTTP/3 curl for mandatory independent interoperability; other platforms explicitly skip external H3 interoperability when curl lacks HTTP3, never count it as passed. See the CI link above for the current run.
 
 ## ✨ Capability overview
 
@@ -214,7 +215,7 @@ Requires **CMake 3.20+ and a C++23 compiler**. Tested baseline: **GCC 14+ / Clan
 - **GCC 14+**: GCC 13's coroutine optimizer has a known internal compiler error; fixed in GCC 14.
 - **Clang 19+ on Linux**: clang-18 keeps `__cpp_concepts` outdated, so libstdc++ hides `std::expected` behind its feature-test.
 
-Non-TLS builds have zero third-party dependencies.
+The base core / transport / HTTP/1 build has zero third-party dependencies. TLS, WebSocket, HTTP/2 and QUIC/HTTP/3 dependencies are introduced only when those optional modules are enabled.
 
 ```bash
 git clone https://github.com/dqsjqian/Mira.git
@@ -303,7 +304,7 @@ Real network benchmark: `python3 tools/bench/network_bench.py --server build/rel
 
 ## Next: remaining verification boundaries
 
-1. Windows H3 runtime validation is in progress. iOS/Android TLS/protocol device runs still require connected devices; mobile currently cross-compiles only. WSS duplex and concurrent TLS 1.3 KeyUpdate regression coverage are implemented.
+1. iOS/Android TLS/protocol device runs still require connected devices; mobile currently cross-compiles only. Windows MSVC H3, WSS duplex and concurrent TLS 1.3 KeyUpdate regressions have run. Independent third-party HTTP/3 interoperability on Windows and MinGW H3 remain uncovered.
 2. Longer fault injection, multi-machine load and process-memory governance. Official Autobahn 25.10.1 non-compression RFC6455 coverage is complete for both roles: 301 cases each, 298 OK + 3 INFORMATIONAL, zero failures, NON-STRICT results or missing cases. The 216 RFC7692 compression cases per role are explicitly excluded; this is not compression support. Reproduce on Linux with `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker`; CI preserves the complete reports.
 3. QUIC migration/NAT rebinding, 0-RTT, Retry/address validation and HTTP/3 Extended CONNECT remain unsupported. Closing/draining protects admitted connections; the listener is not an Internet flood-protection system.
 4. MQTT, SOCKS5 and DNS/DoH are demand-driven independent extensions. Keep gRPC/Redis/WebRTC in the ecosystem layer, not bundled into the network core.

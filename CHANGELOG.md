@@ -9,6 +9,8 @@ version is 0, the minor version is where breaking changes land: a request for
 
 ### Added
 
+- Windows MSVC QUIC/HTTP3 runtime coverage, pinned multi-config dependency
+  builds and installed-package static-library dependency propagation.
 - Same-event-loop TLS and WSS duplex I/O, with independent request deadline
   timers and permanent session cancellation instead of unsafe wire retries.
   TLS `Stream::create` now requires its `EventLoop&` as the first argument.

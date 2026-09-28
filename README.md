@@ -98,7 +98,8 @@ flowchart TB
 |---|---|
 | `Mira::core` | 协程与任务作用域、错误、流与执行器接口、缓冲、事件循环和定时器 |
 | `Mira::transport` | IP 端点、TCP（默认独占绑定）、保持消息边界的 UDP、有界后台系统解析器 |
-| `Mira::tls` | 可选 TLS 流、证书与主机名验证、mTLS 客户端验证、多协议 ALPN |
+| `Mira::tls` | 同事件循环全双工 TLS 流、独立请求期限、证书与主机名验证、mTLS、多协议 ALPN |
+| `Mira::ws` / `Mira::crypto` | RFC6455 WebSocket、TLS 组合 WSS、安全 nonce/mask 与握手摘要 |
 | `Mira::http` | HTTP/1 请求 / 响应解析、序列化、单连接服务（含 chunked 流式响应）与客户端 |
 | `Mira::http2` | 可选 nghttp2 Session、多流状态与泛型流适配 |
 | `Mira::quic` / `Mira::http3` | QUIC v1 与 nghttp3 / QPACK 引擎 |
@@ -188,7 +189,7 @@ auto client = Mira::tls::Context::client({
 | Windows | IOCP | 桌面 loopback 运行 CI，独立 TLS 矩阵 |
 | iOS / Android | kqueue / epoll | core / transport / HTTP1 交叉编译；Android 需 **NDK 29+** |
 
-CI 覆盖三桌面基础/TLS、MinGW、sanitizers、parser fuzz，以及 Linux/macOS H2/H3 运行测试。Windows H2/H3 和移动端协议运行尚未验证；移动端是基础模块交叉编译。Linux 协议任务使用固定源码构建的 HTTP/3 curl 做强制独立互操作，缺工具不得算通过。当前结果以顶部 CI 链接为准。
+CI 覆盖三桌面基础/TLS/WSS、MinGW H2、sanitizers、HTTP/WebSocket fuzz、Autobahn 双端及 Linux/macOS H2/H3 运行测试。Windows MSVC 已实跑 QUIC/H3、多客户端与双工 TLS；移动端仍是基础模块交叉编译，不能替代协议真机运行。Linux 协议任务使用固定源码构建的 HTTP/3 curl 做强制独立互操作；其它平台缺少 HTTP3 curl 时明确跳过外部互操作，不计为通过。当前结果以顶部 CI 链接为准。
 
 ## ✨ 能力全景
 
@@ -214,7 +215,7 @@ CI 覆盖三桌面基础/TLS、MinGW、sanitizers、parser fuzz，以及 Linux/m
 - **GCC 14+**：GCC 13 的协程优化器存在已知内部错误（GCC 14 修复）。
 - **Linux 上 Clang 19+**：clang-18 的 `__cpp_concepts` 宏版本过旧，libstdc++ 据此隐藏 `std::expected`。
 
-非 TLS 构建零第三方依赖。
+基础 core / transport / HTTP/1 构建零第三方依赖；TLS、WebSocket、HTTP/2、QUIC/HTTP/3 的可选依赖仅在启用对应模块时引入。
 
 ```bash
 git clone https://github.com/dqsjqian/Mira.git
@@ -303,7 +304,7 @@ ctest --test-dir build/ws --output-on-failure
 
 ## 接下来：仍需验证的边界
 
-1. Windows H3 运行门禁正在验收；iOS/Android TLS 与协议真机运行仍待设备，当前移动仅交叉编译。WSS 全双工及 TLS 1.3 KeyUpdate 并行回归已落地。
+1. iOS/Android TLS 与协议真机运行仍待设备，当前移动仅交叉编译。Windows MSVC H3、WSS 全双工及 TLS 1.3 KeyUpdate 并行回归已实跑；Windows 独立第三方 HTTP/3 互操作和 MinGW H3 尚未覆盖。
 2. 更长时故障注入、真实多机负载与进程内存治理。官方 Autobahn 25.10.1 已完成双端 RFC6455 非压缩用例：每端 301 项，298 OK + 3 INFORMATIONAL，零失败、零 NON-STRICT、零缺项；每端 216 项 RFC7692 压缩用例明确排除，不代表支持压缩。可用 `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker` 在 Linux 复现，完整报告由 CI 保存。
 3. QUIC migration/NAT rebinding、0-RTT、Retry/地址验证与 HTTP/3 Extended CONNECT 尚未实现；closing/draining 已保护已准入连接，但 listener 不是互联网抗洪泛防护系统。
 4. MQTT、SOCKS5、DNS/DoH 依具体需求独立扩展；gRPC/Redis/WebRTC 保持生态层边界，不将专业子系统全部塞进网络内核。
