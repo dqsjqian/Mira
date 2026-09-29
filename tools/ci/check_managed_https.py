@@ -11,6 +11,7 @@ import shutil
 import socket
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -62,19 +63,26 @@ class Server:
         assert stats["accepted"] == stats["rejected"] + stats["completed"], stats
         return stats
 
-    def close(self):
+    def close(self, report=False):
         if self.process.poll() is None:
             self.process.kill()
             self.process.wait(timeout=5)
         self.reader.join(timeout=5)
+        if report:
+            events = []
+            while not self.lines.empty():
+                if (line := self.lines.get_nowait()) is not None:
+                    events.append(line)
+            print(f"server events not yet consumed: {events}; stderr: {self.process.stderr.read()!r}",
+                  file=sys.stderr)
         self.process.stdout.close()
         self.process.stderr.close()
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *_):
-        self.close()
+    def __exit__(self, kind, *_):
+        self.close(report=kind is not None)
 
 
 def context(cert, protocols=("http/1.1",)):
@@ -245,7 +253,12 @@ def main():
         untrusted.set_alpn_protocols(["http/1.1"])
         unsupported = context(cert, ("unsupported-protocol",))
         no_alpn = context(cert, ())
-        with Server(args.executable, cert, key) as server:
+        # This phase checks ALPN dispatch and certificate/ALPN rejection, not
+        # deadlines, yet it carries the first handshake of both cold processes.
+        # A TLS 1.3 client finishes locally even after the server's budget has
+        # expired, and only sees the abort on its first write. The dedicated
+        # phases below keep their deliberately short budgets.
+        with Server(args.executable, cert, key, lifetime=6000, handshake_timeout=4000) as server:
             h1(server, trusted)
             if curl:
                 h2(server, cert, curl)
