@@ -64,11 +64,13 @@ Task<void> serve_one(transport::udp::Socket socket, quic::Options options, http3
                 require(server.consume(event.stream_id, event.data.size()), "consume");
             } else if (event.kind == http3::Event::Kind::end) {
                 const std::string body = "ok " + paths[event.stream_id];
-                require(co_await server.respond(event.stream_id,
-                            {{":status", "200"}, {"content-length", std::to_string(body.size())}},
-                            std::as_bytes(std::span{body.data(), body.size()}),
-                            {.deadline = Clock::now() + 10s}),
-                        "respond");
+                // Named arguments: braced lists inside co_await expressions trip GCC.
+                const http3::Headers response_fields{{":status", "200"},
+                                                     {"content-length", std::to_string(body.size())}};
+                const auto bytes = std::as_bytes(std::span{body.data(), body.size()});
+                auto sent = co_await server.respond(event.stream_id, response_fields, bytes,
+                                                    {.deadline = Clock::now() + 10s});
+                require(std::move(sent), "respond");
                 ++answered;
             }
         }
@@ -105,12 +107,14 @@ Task<void> client_one(EventLoop& loop, quic::Options options, bool expect_early)
                                                          {.deadline = Clock::now() + 10s}),
                           "connect");
     check(client.early_ready() == expect_early, "0-RTT readiness does not match the ticket state");
-    const auto get = require(co_await client.request(fields("GET", "/get")), "GET");
+    const auto get_fields = fields("GET", "/get");
+    auto get_sent = co_await client.request(get_fields);
+    const auto get = require(std::move(get_sent), "GET");
     // Not early-eligible: waits for the handshake (bounded) and goes out in 1-RTT.
-    const auto post = require(co_await client.request(fields("POST", "/post"),
-                                  std::as_bytes(std::span{"abc", 3}),
-                                  {.deadline = Clock::now() + 10s}),
-                              "POST");
+    const auto post_fields = fields("POST", "/post");
+    const auto upload = std::as_bytes(std::span{"abc", 3});
+    auto post_sent = co_await client.request(post_fields, upload, {.deadline = Clock::now() + 10s});
+    const auto post = require(std::move(post_sent), "POST");
     check(client.ready(), "POST returned before the handshake completed");
     const auto get_body = co_await fetch(client, get);
     check(get_body == "ok /get", "GET body mismatch");

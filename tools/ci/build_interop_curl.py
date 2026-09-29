@@ -98,7 +98,13 @@ def main() -> None:
     previous = os.environ.get("PKG_CONFIG_PATH", "")
     os.environ["PKG_CONFIG_PATH"] = os.pathsep.join(
         [str(path) for path in pkg_paths] + ([previous] if previous else []))
-    with tempfile.TemporaryDirectory(prefix="source-", dir=work) as temp:
+    if os.name == "nt":
+        # Reused MSBuild nodes outlive the build and keep handles on its tree.
+        os.environ["MSBUILDDISABLENODEREUSE"] = "1"
+    # Cleanup runs after a successful install; a Windows process that still
+    # holds a handle in the scratch tree must not turn that success into a
+    # failure. Leftovers stay inside the ignored build directory.
+    with tempfile.TemporaryDirectory(prefix="source-", dir=work, ignore_cleanup_errors=True) as temp:
         source = extract(archive, Path(temp), f"curl-{VERSION}")
         build = Path(temp) / "build"
         install = work / "prefix"

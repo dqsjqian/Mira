@@ -670,7 +670,8 @@ worker loops, not cross-worker transfer of already attached sockets.
 - 2026-09-29 phase source (HTTP/3 0-RTT, MQTT, documentation sync): local
   AppleClang Release, GCC 16 and ASan+UBSan each ran 97 tests, 95 passed and
   the 2 external HTTP/3 curl interop tests skipped (no HTTP3 curl locally), 0
-  failed. GCC 13 base configuration 49/49; MinGW cross-compiled every MQTT
+  failed. GCC 13 base configuration 49/49 and GCC 14 full protocol configuration
+  95 passed + 2 skipped; MinGW cross-compiled every MQTT
   target; installed-consumer and layering checks passed. `http3_early` counts
   flights to prove accepted 0-RTT completes in one round trip, rejected 0-RTT
   is resubmitted on the same stream IDs, a hand-built client's unsafe early

@@ -140,19 +140,25 @@ Task<void> exchange(EventLoop& loop, Version version) {
     auto& client = *connected;
     CHECK(stats.version == version);
     if (version == Version::v5) CHECK(client.session().client_id() == "assigned-1");
-    auto sub = co_await client.subscribe({{"test/+", QoS::exactly_once, false, false, 0},
-                                          {"other/#", QoS::at_least_once, false, false, 0}}, {}, io);
+    // Braced arguments stay out of co_await expressions: GCC 13/14 ICE on them.
+    const Properties none;
+    std::vector<Subscription> filters(2);
+    filters[0] = {"test/+", QoS::exactly_once, false, false, 0};
+    filters[1] = {"other/#", QoS::at_least_once, false, false, 0};
+    auto sub = co_await client.subscribe(std::move(filters), none, io);
     CHECK(sub.has_value());
     auto granted = co_await client.wait_for(*sub, io);
     CHECK(granted && granted->kind == Event::Kind::subscribed &&
           granted->reasons == std::vector<std::uint8_t>({2, 1}));
     std::vector<std::uint16_t> ids;
     for (const auto qos : {QoS::at_most_once, QoS::at_least_once, QoS::exactly_once}) {
-        auto id = co_await client.publish("test/a", text("qos" + std::to_string(static_cast<int>(qos))), qos, false, {}, io);
+        auto payload = text("qos" + std::to_string(static_cast<int>(qos)));
+        auto id = co_await client.publish("test/a", std::move(payload), qos, false, none, io);
         CHECK(id.has_value());
         if (id && *id) ids.push_back(*id);
     }
-    auto other = co_await client.publish("other/x/y", text("downgraded"), QoS::exactly_once, false, {}, io);
+    auto downgraded = text("downgraded");
+    auto other = co_await client.publish("other/x/y", std::move(downgraded), QoS::exactly_once, false, none, io);
     CHECK(other.has_value());
     if (other) ids.push_back(*other);
     for (const auto id : ids) {
@@ -170,11 +176,12 @@ Task<void> exchange(EventLoop& loop, Version version) {
     CHECK(received["qos0"] == QoS::at_most_once && received["qos1"] == QoS::at_least_once &&
           received["qos2"] == QoS::exactly_once && received["downgraded"] == QoS::at_least_once);
     CHECK(client.session().inflight() == 0);
-    auto unsub = co_await client.unsubscribe({"test/+"}, {}, io);
+    std::vector<std::string> removed_filters(1, "test/+");
+    auto unsub = co_await client.unsubscribe(std::move(removed_filters), none, io);
     CHECK(unsub.has_value());
     auto removed = co_await client.wait_for(*unsub, io);
     CHECK(removed && removed->kind == Event::Kind::unsubscribed);
-    auto bye = co_await client.disconnect(reason::success, {}, io);
+    auto bye = co_await client.disconnect(reason::success, none, io);
     CHECK(bye.has_value() && client.closed());
     co_await scope.join();
     CHECK(stats.disconnected && stats.publishes == 4);
@@ -217,7 +224,9 @@ Task<void> keep_alive(EventLoop& loop) {
     CHECK(!kept && kept.error() == Errc::cancelled);
     CHECK(!read && read.error() == Errc::cancelled);
     CHECK(!client.closed());
-    auto bye = co_await client.disconnect(reason::success, {}, {.deadline = Clock::now() + 5s});
+    const Properties none;
+    const OperationOptions finish{.deadline = Clock::now() + 5s};
+    auto bye = co_await client.disconnect(reason::success, none, finish);
     CHECK(bye.has_value());
     co_await scope.join();
     CHECK(stats.disconnected);

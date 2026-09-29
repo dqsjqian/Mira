@@ -216,7 +216,7 @@ auto client = Mira::tls::Context::client({
 
 历史 CI 覆盖三桌面基础/TLS/WSS、MinGW H2、sanitizers、HTTP/WebSocket fuzz、Autobahn 双端及 Linux/macOS H2/H3；Windows MSVC 已实跑 QUIC/H3、多客户端与双工 TLS。Linux 使用固定源码构建的 HTTP/3 curl 做独立互操作；其它平台缺少 HTTP3 curl 时明确跳过，不计为通过。新增 Windows 独立 H3 / MinGW 验证入口仅有参数单测 3/3，通过不代表入口已实跑。
 
-验证按快照计量：2026-09-29 阶段源码（H3 0-RTT、MQTT 及文档同步）在本机 AppleClang Release / GCC 16 / ASan+UBSan 各 **97 项：95 通过、2 项外部 HTTP/3 curl 互操作因本机 curl 无 HTTP3 跳过、0 失败**；GCC 13 基础配置 49/49，MinGW 交叉编译 MQTT 全部目标通过，安装消费与分层检查通过；MQTT 互操作 25 例（其中 mosquitto 2.1.2 8 例），MQTT 模糊测试 ASan+UBSan 91 秒 14.5 万次无崩溃。macOS 未运行 LeakSanitizer。远端已完成的 `8c448ed` CI 为 17/17；本轮新提交的跨平台结果须单独查看顶部 CI，不能借用旧结果。
+验证按快照计量：2026-09-29 阶段源码（H3 0-RTT、MQTT 及文档同步）在本机 AppleClang Release / GCC 16 / ASan+UBSan 各 **97 项：95 通过、2 项外部 HTTP/3 curl 互操作因本机 curl 无 HTTP3 跳过、0 失败**；GCC 13 基础配置 49/49，GCC 14 协议全配置 95 通过 + 2 跳过，MinGW 交叉编译 MQTT 全部目标通过，安装消费与分层检查通过；MQTT 互操作 25 例（其中 mosquitto 2.1.2 8 例），MQTT 模糊测试 ASan+UBSan 91 秒 14.5 万次无崩溃。macOS 未运行 LeakSanitizer。远端最近全绿的 `81f8edf` CI 为 17/17；本轮新提交的跨平台结果须单独查看顶部 CI，不能借用旧结果。
 
 ## ✨ 能力全景
 

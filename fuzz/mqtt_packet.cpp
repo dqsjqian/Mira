@@ -45,10 +45,10 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         mqtt::ClientOptions options;
         options.version = version;
         options.client_id = "fuzz";
-        options.receive_maximum = 4;
+        options.receive_maximum = std::uint16_t{4};
         options.maximum_packet_size = 4096;
         options.max_events = 64;
-        if (version == mqtt::Version::v5) options.topic_alias_maximum = 4;
+        if (version == mqtt::Version::v5) options.topic_alias_maximum = std::uint16_t{4};
         auto session = mqtt::Session::create(options);
         if (!session || !session->connect(0)) std::abort();
         static_cast<void>(session->take_output(0));

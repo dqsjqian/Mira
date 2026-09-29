@@ -41,8 +41,8 @@ std::error_code decode_error(const Bytes& wire, Version version, Role receiver, 
 
 Properties rich_publish_properties() {
     Properties p;
-    p.payload_format_indicator = 1;
-    p.message_expiry_interval = 3600;
+    p.payload_format_indicator = std::uint8_t{1};
+    p.message_expiry_interval = std::uint32_t{3600};
     p.content_type = "text/plain; charset=utf-8";
     p.response_topic = "reply/here";
     p.correlation_data = bytes({0, 1, 2, 255});
@@ -102,13 +102,13 @@ void round_trips() {
         Will will{"will/topic", text("gone"), QoS::exactly_once, true, {}};
         if (v5) {
             will.properties = rich_publish_properties();
-            will.properties.will_delay_interval = 5;
-            c.properties.session_expiry_interval = 60;
-            c.properties.receive_maximum = 10;
-            c.properties.maximum_packet_size = 4096;
-            c.properties.topic_alias_maximum = 8;
-            c.properties.request_problem_information = 0;
-            c.properties.request_response_information = 1;
+            will.properties.will_delay_interval = std::uint32_t{5};
+            c.properties.session_expiry_interval = std::uint32_t{60};
+            c.properties.receive_maximum = std::uint16_t{10};
+            c.properties.maximum_packet_size = std::uint32_t{4096};
+            c.properties.topic_alias_maximum = std::uint16_t{8};
+            c.properties.request_problem_information = std::uint8_t{0};
+            c.properties.request_response_information = std::uint8_t{1};
             c.properties.authentication_method = "SCRAM-SHA-256";
             c.properties.authentication_data = bytes({9, 9});
             c.properties.user_properties = {{"a", "b"}};
@@ -122,17 +122,17 @@ void round_trips() {
 
         Connack ack{false, v5 ? reason::not_authorized : std::uint8_t{5}, {}};
         if (v5) {
-            ack.properties.session_expiry_interval = 10;
+            ack.properties.session_expiry_interval = std::uint32_t{10};
             ack.properties.assigned_client_identifier = "auto-1";
-            ack.properties.server_keep_alive = 15;
-            ack.properties.receive_maximum = 2;
-            ack.properties.maximum_qos = 1;
-            ack.properties.retain_available = 0;
-            ack.properties.maximum_packet_size = 1000;
-            ack.properties.topic_alias_maximum = 4;
-            ack.properties.wildcard_subscription_available = 0;
-            ack.properties.subscription_identifiers_available = 0;
-            ack.properties.shared_subscription_available = 1;
+            ack.properties.server_keep_alive = std::uint16_t{15};
+            ack.properties.receive_maximum = std::uint16_t{2};
+            ack.properties.maximum_qos = std::uint8_t{1};
+            ack.properties.retain_available = std::uint8_t{0};
+            ack.properties.maximum_packet_size = std::uint32_t{1000};
+            ack.properties.topic_alias_maximum = std::uint16_t{4};
+            ack.properties.wildcard_subscription_available = std::uint8_t{0};
+            ack.properties.subscription_identifiers_available = std::uint8_t{0};
+            ack.properties.shared_subscription_available = std::uint8_t{1};
             ack.properties.response_information = "resp";
             ack.properties.server_reference = "other:1883";
             ack.properties.reason_string = "no";
@@ -149,7 +149,7 @@ void round_trips() {
             p.payload = Bytes(300, std::byte{0x7A});
             if (v5) {
                 p.properties = rich_publish_properties();
-                p.properties.topic_alias = 3;
+                p.properties.topic_alias = std::uint16_t{3};
             }
             CHECK(round_trip(p, version, Role::server));
             if (v5) p.properties.subscription_identifiers = {1, 268'435'455};
@@ -157,7 +157,7 @@ void round_trips() {
         }
         if (v5) {
             Publish aliased;
-            aliased.properties.topic_alias = 1;
+            aliased.properties.topic_alias = std::uint16_t{1};
             aliased.payload = text("x");
             CHECK(round_trip(aliased, version, Role::client));
         }
@@ -199,7 +199,7 @@ void round_trips() {
         CHECK(round_trip(Disconnect{}, version, Role::server));
         if (v5) {
             Disconnect d{reason::session_taken_over, {}};
-            d.properties.session_expiry_interval = 0;
+            d.properties.session_expiry_interval = std::uint32_t{0};
             d.properties.reason_string = "bye";
             d.properties.server_reference = "elsewhere";
             CHECK(round_trip(d, version, Role::client));
@@ -329,11 +329,11 @@ void refusals() {
     CHECK(!encode(props_v3, Version::v311));
     Publish forbidden;
     forbidden.topic = "a";
-    forbidden.properties.maximum_qos = 1;
+    forbidden.properties.maximum_qos = std::uint8_t{1};
     CHECK(!encode(forbidden, Version::v5));
     Publish bad_value;
     bad_value.topic = "a";
-    bad_value.properties.payload_format_indicator = 2;
+    bad_value.properties.payload_format_indicator = std::uint8_t{2};
     CHECK(!encode(bad_value, Version::v5));
     Connect mismatch;
     mismatch.version = Version::v5;

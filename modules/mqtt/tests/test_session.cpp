@@ -86,10 +86,10 @@ void connect_limits() {
     Broker broker;
     ClientOptions options;
     options.keep_alive = 10;
-    options.receive_maximum = 2;
-    options.topic_alias_maximum = 2;
+    options.receive_maximum = std::uint16_t{2};
+    options.topic_alias_maximum = std::uint16_t{2};
     options.maximum_packet_size = 2048;
-    options.properties.session_expiry_interval = 120;
+    options.properties.session_expiry_interval = std::uint32_t{120};
     auto session = make(options);
     CHECK(session.state() == SessionState::idle);
     CHECK(!session.publish(publish("a", QoS::at_most_once)));
@@ -99,15 +99,15 @@ void connect_limits() {
     CHECK(sent.size() == 1 && std::holds_alternative<Connect>(sent[0]));
     const auto& connect = std::get<Connect>(sent[0]);
     CHECK(connect.client_id.empty() && connect.clean_start && connect.keep_alive == 10);
-    CHECK(connect.properties.receive_maximum == 2 && connect.properties.maximum_packet_size == 2048 &&
-          connect.properties.topic_alias_maximum == 2 && connect.properties.session_expiry_interval == 120);
+    CHECK(connect.properties.receive_maximum == std::uint16_t{2} && connect.properties.maximum_packet_size == std::uint32_t{2048} &&
+          connect.properties.topic_alias_maximum == std::uint16_t{2} && connect.properties.session_expiry_interval == std::uint32_t{120});
     Connack ack;
-    ack.properties.receive_maximum = 2;
-    ack.properties.maximum_qos = 1;
-    ack.properties.retain_available = 0;
-    ack.properties.server_keep_alive = 5;
+    ack.properties.receive_maximum = std::uint16_t{2};
+    ack.properties.maximum_qos = std::uint8_t{1};
+    ack.properties.retain_available = std::uint8_t{0};
+    ack.properties.server_keep_alive = std::uint16_t{5};
     ack.properties.assigned_client_identifier = "auto-7";
-    ack.properties.maximum_packet_size = 512;
+    ack.properties.maximum_packet_size = std::uint32_t{512};
     CHECK(broker.send(session, ack).has_value());
     auto events = session.take_events();
     CHECK(events.size() == 1 && events[0].kind == Event::Kind::connected && !events[0].session_present &&
@@ -165,7 +165,7 @@ void inbound() {
     test::section("inbound QoS 1/2, duplicates, receive maximum");
     Broker broker;
     ClientOptions options;
-    options.receive_maximum = 2;
+    options.receive_maximum = std::uint16_t{2};
     auto session = connected(broker, options);
     CHECK(broker.send(session, publish("in/1", QoS::at_least_once, 3, "one")).has_value());
     auto events = session.take_events();
@@ -199,23 +199,23 @@ void aliases() {
     test::section("inbound topic aliases");
     Broker broker;
     ClientOptions options;
-    options.topic_alias_maximum = 2;
+    options.topic_alias_maximum = std::uint16_t{2};
     auto session = connected(broker, options);
     auto set = publish("alias/topic", QoS::at_most_once);
-    set.properties.topic_alias = 1;
+    set.properties.topic_alias = std::uint16_t{1};
     CHECK(broker.send(session, set).has_value());
     auto use = publish("", QoS::at_most_once);
-    use.properties.topic_alias = 1;
+    use.properties.topic_alias = std::uint16_t{1};
     CHECK(broker.send(session, use).has_value());
     auto events = session.take_events();
     CHECK(events.size() == 2 && events[0].message.topic == "alias/topic" && events[1].message.topic == "alias/topic");
     auto unknown = publish("", QoS::at_most_once);
-    unknown.properties.topic_alias = 2;
+    unknown.properties.topic_alias = std::uint16_t{2};
     auto failed = broker.send(session, unknown);
     CHECK(!failed && failed.error() == MqttError::topic_alias_invalid);
     auto other = connected(broker, options);
     auto beyond = publish("t", QoS::at_most_once);
-    beyond.properties.topic_alias = 3;
+    beyond.properties.topic_alias = std::uint16_t{3};
     failed = broker.send(other, beyond);
     CHECK(!failed && failed.error() == MqttError::topic_alias_invalid);
     auto sent = broker.take(other);
@@ -226,8 +226,8 @@ void subscriptions() {
     test::section("SUBSCRIBE / UNSUBSCRIBE and server capabilities");
     Broker broker;
     Connack ack;
-    ack.properties.wildcard_subscription_available = 0;
-    ack.properties.shared_subscription_available = 0;
+    ack.properties.wildcard_subscription_available = std::uint8_t{0};
+    ack.properties.shared_subscription_available = std::uint8_t{0};
     auto session = connected(broker, {}, ack);
     CHECK(session.subscribe({{"a/+", QoS::at_most_once, false, false, 0}}).error() == Errc::not_supported);
     CHECK(session.subscribe({{"$share/g/a", QoS::at_most_once, false, false, 0}}).error() == Errc::not_supported);
@@ -399,12 +399,12 @@ void failures() {
     CHECK(broker.send(authing, Connack{}).has_value() && authing.state() == SessionState::connected);
 
     ClientOptions invalid;
-    invalid.properties.receive_maximum = 5;
+    invalid.properties.receive_maximum = std::uint16_t{5};
     CHECK(!Session::create(invalid));
     ClientOptions v3_alias;
     v3_alias.version = Version::v311;
     v3_alias.client_id = "c";
-    v3_alias.topic_alias_maximum = 1;
+    v3_alias.topic_alias_maximum = std::uint16_t{1};
     CHECK(!Session::create(v3_alias));
 }
 
