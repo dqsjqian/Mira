@@ -2,7 +2,7 @@
 
 # 🌐 Mira
 
-**C++23 协程网络库 · 传输为基，协议其上** · TCP / UDP / TLS / WebSocket / HTTP/1.1 / HTTP/2 / QUIC / HTTP/3
+**C++23 协程网络库 · 传输为基，协议其上** · TCP / UDP / TLS / WebSocket / HTTP/1.1 / HTTP/2 / QUIC / HTTP/3 / SOCKS5 / DoH / MQTT
 
 一套完成式 I/O 接口连接 kqueue、epoll 与 IOCP，让协议不必认识套接字。
 
@@ -86,10 +86,17 @@ flowchart TB
     App -.-> H2[http2 · 可选 nghttp2]
     App -.-> H3[http3 · nghttp3]
     App -.-> WS[ws · WebSocket / WSS / RFC7692]
-    App -.-> Client[client · HTTP/1 连接池组合]
+    App -.-> Client[client · HTTP/1 连接池 / SOCKS5 拨号组合]
     App -.-> ClientTLS[client_tls · HTTPS 组合]
+    App -.-> SOCKS[socks · SOCKS5]
+    App -.-> DNS[dns · DNS 报文 / DoH]
+    App -.-> MQTT[mqtt · MQTT 3.1.1 / 5.0]
     Client --> HTTP
+    Client --> SOCKS
     Client --> TCP
+    SOCKS --> Core
+    DNS --> HTTP
+    MQTT --> Core
     ClientTLS --> Client
     ClientTLS --> TLS
     WS --> Crypto[crypto · OpenSSL Crypto]
@@ -113,10 +120,13 @@ flowchart TB
 | `Mira::transport` | TCP/UDP、本地流、有界系统解析器、交错候选 `tcp::dial`、受管服务生命周期 |
 | `Mira::tls` | 同事件循环全双工 TLS 流、独立请求期限、证书与主机名验证、mTLS、多协议 ALPN |
 | `Mira::ws` / `Mira::crypto` | WebSocket/WSS、子协议、RFC7692 有界压缩、安全 nonce/mask、Extended CONNECT 字段协商 |
-| `Mira::http` | HTTP/1 解析、序列化、单连接服务、流式请求/响应；仅依赖流契约 |
-| `Mira::client` / `Mira::client_tls` | 独立 HTTP/1 / HTTPS 连接池组合，拥有 DNS/TCP/可选 TLS 与会话生命周期 |
+| `Mira::http` | HTTP/1 解析、序列化、单连接服务、流式请求/响应、`Expect: 100-continue` 双工交换；仅依赖流契约 |
+| `Mira::client` / `Mira::client_tls` | 独立 HTTP/1 / HTTPS 连接池组合与 `dial_via_socks5`，拥有 DNS/TCP/可选 TLS 与会话生命周期 |
 | `Mira::http2` | 可选 nghttp2 Session、多流、Extended CONNECT 与 `ConnectStream` |
-| `Mira::quic` / `Mira::http3` | QUIC v1、显式迁移/会话恢复、nghttp3/QPACK、Extended CONNECT；不含 H3 0-RTT |
+| `Mira::quic` / `Mira::http3` | QUIC v1、显式迁移/会话恢复、nghttp3/QPACK、Extended CONNECT、HTTP/3 0-RTT（票据域绑定 SETTINGS） |
+| `Mira::socks` | SOCKS5（RFC 1928/1929）客户端与代理握手，按报文精确读长，跑在任意有界流上 |
+| `Mira::dns` | DNS 报文编解码（RFC 1035/6891，含 EDNS(0)）与 DoH 映射（RFC 8484） |
+| `Mira::mqtt` | MQTT 3.1.1/5.0 全报文编解码、无套接字客户端 `Session`、双工 `Client<Stream>` |
 
 分层由 `tools/ci/check_layering.py` 强制检查：禁止反向依赖与宿主框架头文件，平台识别集中在 `platform.hpp`，协议模块不包含 OS 头文件。
 
@@ -206,7 +216,7 @@ auto client = Mira::tls::Context::client({
 
 历史 CI 覆盖三桌面基础/TLS/WSS、MinGW H2、sanitizers、HTTP/WebSocket fuzz、Autobahn 双端及 Linux/macOS H2/H3；Windows MSVC 已实跑 QUIC/H3、多客户端与双工 TLS。Linux 使用固定源码构建的 HTTP/3 curl 做独立互操作；其它平台缺少 HTTP3 curl 时明确跳过，不计为通过。新增 Windows 独立 H3 / MinGW 验证入口仅有参数单测 3/3，通过不代表入口已实跑。
 
-验证按快照计量：2026-09-28 最终源码（含信任域缓存修复）在本机 AppleClang Release / GCC / ASan+UBSan 各 **85/85**，安装消费与依赖隔离通过；macOS 未运行 LeakSanitizer。远端已完成的 `d3424f0` CI 为 17/17；本轮新提交的跨平台结果须单独查看顶部 CI，不能借用旧结果。
+验证按快照计量：2026-09-29 阶段源码（H3 0-RTT、MQTT 及文档同步）在本机 AppleClang Release / GCC 16 / ASan+UBSan 各 **97 项：95 通过、2 项外部 HTTP/3 curl 互操作因本机 curl 无 HTTP3 跳过、0 失败**；GCC 13 基础配置 49/49，MinGW 交叉编译 MQTT 全部目标通过，安装消费与分层检查通过；MQTT 互操作 25 例（其中 mosquitto 2.1.2 8 例），MQTT 模糊测试 ASan+UBSan 91 秒 14.5 万次无崩溃。macOS 未运行 LeakSanitizer。远端已完成的 `8c448ed` CI 为 17/17；本轮新提交的跨平台结果须单独查看顶部 CI，不能借用旧结果。
 
 ## ✨ 能力全景
 
@@ -216,13 +226,15 @@ auto client = Mira::tls::Context::client({
 | 取消与截止时间 | `OperationOptions` 贯穿 `EventLoop` → TCP → TLS → HTTP 全栈 |
 | TCP | IPv4/IPv6、交错候选 `dial`、短读写、独占绑定、grace drain / cancel / join |
 | UDP | IPv4/IPv6、零长数据报、截断报错并消费整包、取消与 deadline |
-| DNS | 有界工作线程、系统 getaddrinfo、结果去重、总 deadline |
+| DNS | 有界工作线程、系统 getaddrinfo、结果去重、总 deadline；独立 DNS 报文编解码与 DoH GET/POST |
 | TLS | OpenSSL 3、证书链与 DNS/IP 验证、mTLS、多协议 ALPN、关闭通知 |
 | WebSocket/WSS | 子协议协商、分片与控制帧、UTF-8、可选 permessage-deflate、TCP/TLS 同 loop 双工 |
 | 本地传输 / SSE | POSIX Unix-domain socket；基于 HTTP/1 chunked 的 SSE 与 Last-Event-ID 示例 |
-| HTTP/1 | 增量解析、keep-alive、HEAD、chunked、流式上传/响应、独立 HTTP/HTTPS 池组合 |
+| HTTP/1 | 增量解析、keep-alive、HEAD、chunked、流式上传/响应、`Expect: 100-continue` 与提前响应双工、独立 HTTP/HTTPS 池组合 |
 | HTTP/2 | nghttp2、HPACK、多流、消费驱动窗口、显式 Extended CONNECT |
-| QUIC/H3 | ngtcp2 + nghttp3 + OpenSSL ossl；validated migration、QUIC 会话恢复/显式 0-RTT、QPACK、Extended CONNECT、两阶段 GOAWAY；不含 H3 0-RTT |
+| QUIC/H3 | ngtcp2 + nghttp3 + OpenSSL ossl；validated migration、QUIC 会话恢复/显式 0-RTT、HTTP/3 0-RTT（0.5-RTT 应答、拒绝后同流 ID 重提、不安全方法自动 425）、QPACK、Extended CONNECT、两阶段 GOAWAY |
+| SOCKS5 | CONNECT 客户端与代理、用户名/密码、握手后流恰好停在隧道首字节、域名目标不在本地解析 |
+| MQTT | 3.1.1 / 5.0、QoS 0/1/2 双向流程、CONNACK 限额、主题别名、keep-alive 监督、增强认证、会话恢复重发 |
 | 安全与资源 | 协议级限额、有界 TLS BIO、跨 loop 共享预算；非进程 RSS 上限 |
 
 `stop()` 只请求 `run()` 返回；逐操作取消是 `OperationOptions` 的职责 —— 每一层职责清晰、互不越界。
@@ -302,7 +314,7 @@ target_link_libraries(my_app PRIVATE Mira::transport Mira::http)
 
 本地开发也可以直接指向源码树：`add_subdirectory(vendor/Mira)`（子目录模式下 `MIRA_BUILD_TESTS` 默认关闭）。安装消费则用 `find_package(Mira REQUIRED COMPONENTS core transport http)`，需要 TLS 时加 `tls` 组件。
 
-仅主线的拥有式客户端组合使用 `find_package(Mira REQUIRED COMPONENTS client)` / `Mira::client`；HTTPS 使用 `client_tls` / `Mira::client_tls`，构建时需 `MIRA_ENABLE_TLS=ON`。基础 `client` 不引入 OpenSSL；`http` 本身仍不依赖 transport。不要把这些目标套用到上述 v0.4.0 发布档。
+仅主线的拥有式客户端组合使用 `find_package(Mira REQUIRED COMPONENTS client)` / `Mira::client`；HTTPS 使用 `client_tls` / `Mira::client_tls`，构建时需 `MIRA_ENABLE_TLS=ON`。基础 `client` 不引入 OpenSSL；`http` 本身仍不依赖 transport。主线协议组件 `socks`、`dns`、`mqtt` 对应 `Mira::socks` / `Mira::dns` / `Mira::mqtt`，均不引入 OpenSSL，TLS 由调用方组合。不要把这些目标套用到上述 v0.4.0 发布档。
 
 Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` 门控关闭了；NDK 29（clang 21）在 API 24 上实测可构建。
 
@@ -314,6 +326,10 @@ Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` �
 - **连接生命周期**：`client::HttpClient` / `HttpsClient` 组合解析、`tcp::dial` 与每 origin 有界连接池，客户端实例及固定 TLS 配置彼此隔离；`Session::recycle()` 要求响应完全 drain、连接可复用且无留存 session task，否则拒绝。默认析构丢弃，不自动重放业务请求；`tcp::connect_with_retry` 也只重试建连。`tcp::serve(loop, ...)` 停止接入并关闭 listener，先给 `grace_period` 排空，再协作 cancel 与 join；grace 只限定何时请求取消，不保证不合作 handler 的返回时限。
 - **WebSocket/WSS**：`MIRA_ENABLE_WEBSOCKET=ON`，独立 `Mira::ws` + OpenSSL Crypto（安全 nonce/mask、RFC6455 SHA-1 握手）+ zlib；分片、增量 UTF-8、ping/pong/close、消息限额、双向独立互操作。TCP 和 TLS/WSS 均支持同一事件循环上一读一写并行，握手与关闭独占；每个 TLS 请求有独立期限，取消或超时令整个 TLS 会话永久失效并唤醒同伴，不取消后重放密文。`Stream::create` 显式接收事件循环，`close()` 终止包装器但不拥有底层流。支持可选子协议协商与 permessage-deflate，并可经显式协商的 H2/H3 Extended CONNECT 承载；隧道适配器的并发契约与 TCP/TLS 双工不同，见下文。
 - **SSE / 本地流**：`mira_sse_server` 演示 chunked SSE、事件 ID 与 Last-Event-ID 恢复；`transport::local` 提供 POSIX filesystem Unix-domain socket，Windows 显式 `not_supported`，不自动删除调用方路径。
+- **HTTP/3 0-RTT**：两端 `EarlyDataPolicy::replay_safe`。持票客户端创建即 `early_ready()`，GET/HEAD/OPTIONS 整体请求随 0-RTT 发出；服务端接受后在握手完成前以 0.5-RTT 应答，实测一个往返完成。服务端拒绝时，TLS 保证其未处理任何早期数据，引擎按原顺序重提安全请求并复现相同流 ID，调用方只看到一次正常响应。早期请求在事件上带 `early_data` 标记，不安全方法由引擎直接答 `425 Too Early` 且不上交应用。票据域通过 `early_data_context` 绑定服务端 SETTINGS，SETTINGS 不一致的服务端无法创建。无防重放存储，详见下文。
+- **HTTP/1 `Expect: 100-continue` 与双工上传**：`ClientConnection::exchange` 边上传边读取 1xx/最终响应；先等 100、最终响应或 `continue_timeout`，中途收到 ≥300 或关闭即停发剩余 body，提前 2xx 且保持连接则允许上传完成；进行中的写不会为提前响应被取消（TLS 下取消会毁掉会话）。服务端对缓冲 handler 立即答 100，流式 handler 首次读取时答 100，拒收时关闭而不排空，未知期望答 417。
+- **SOCKS5 / DoH**：`Mira::socks` 为 CONNECT 客户端与代理提供 RFC 1929 认证与严格地址处理，`client::dial_via_socks5` 一个 deadline 贯穿拨号与握手；`Mira::dns` 以“字节皆不可信”解码 DNS 报文，DoH 双向映射 GET/POST，`doh::query` 可跑在 HTTP/1 over TLS 上。示例与 curl、独立 Python 对端互通。
+- **MQTT 3.1.1 / 5.0**：编解码器覆盖全部 15 种报文与两种角色，绝不编出自身解码器会拒收的字节；`Session` 无套接字实现 QoS 1/2 收发、CONNACK 限额、入站主题别名、PINGRESP 监督、增强认证与按原顺序重发的会话恢复；`Client<Stream>` 借用调用方的流，一个读者与串行写者并发，`keep_alive(loop)` 是定时写者，不依赖会毁掉 TLS 会话的读超时。`mira_mqtt_client` 与独立 Python broker 及 mosquitto 互通，CI 强制 mosquitto 用例并对编解码器做模糊测试。
 
 ```bash
 cmake -S . -B build/ws -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_TLS=ON
@@ -322,14 +338,17 @@ ctest --test-dir build/ws --output-on-failure
 # 两个终端分别运行：mira_ws_server 8080 / mira_ws_client 8080
 # SSE：mira_sse_server 8081；客户端 GET /events
 # 多客户端 H3 + Retry：mira_h3_multi_server cert.pem key.pem 8443 --retry
+# SOCKS5：mira_socks5_server 1080 / mira_socks5_client 1080 example.com 80
+# DoH：mira_doh_client 1.1.1.1 443 example.com AAAA
+# MQTT（本机 mosquitto -p 1883）：mira_mqtt_client 127.0.0.1 1883 echo mira/demo hello --qos 2
 ```
 
 真实网络基准：`python3 tools/bench/network_bench.py --server build/release/mira_managed_echo_server --clients 8 --requests 1000 --slow-clients 4`，输出吞吐、p50/p99、峰值 RSS 采样和环境 JSON。负载发生器使用独立进程 Python sockets；loopback 数字不是跨库性能排名，也不是公网性能。
 
 ### 主线 API 的使用边界
 
-- **QUIC 路径与早期数据**：validated 模式必须使用带 `quic::Path` 的 `receive` 与 `poll_datagram` / `close_datagram`；客户端 `initiate_migration()` 发起验证，应用须保留验证期间所需的两条路径并按返回路径发送。CID 命中不等于通过地址验证。有界内存 `SessionCache` 限制条目、字节、单 ticket 大小与存活期，`ServerContext` 显式共享服务端 ticket 域。普通 `open_stream` / `write` 不发送早期数据；只有 `EarlyDataPolicy::replay_safe` 加 `open_early_stream` / `write_early` 才尝试原始 QUIC 0-RTT。调用方负责保证操作可安全重放；库不提供防重放保证，拒绝后不自动重放。**这不是 HTTP/3 0-RTT**，H3 引擎拒绝该 opt-in。
-- **拨号与上传**：`tcp::dial` 对解析后的去重候选交错 IPv4/IPv6，在总 deadline 内错峰、有界并发建连，返回前取消并 join 落败尝试；系统 `getaddrinfo` 仍在线程池完成，不是独立异步 A/AAAA 查询。HTTP/1 `begin` → `send_body` → `finish` 支持 content-length/chunked 上传、逐块背压与贯穿上传/生产者停顿/响应的预算；当前为 **send-first**，不支持 `Expect: 100-continue` 或上传同时读取提前响应，拒收上传的对端可能需要总 deadline 才能结束写入。
+- **QUIC 路径与早期数据**：validated 模式必须使用带 `quic::Path` 的 `receive` 与 `poll_datagram` / `close_datagram`；客户端 `initiate_migration()` 发起验证，应用须保留验证期间所需的两条路径并按返回路径发送。CID 命中不等于通过地址验证。有界内存 `SessionCache` 限制条目、字节、单 ticket 大小与存活期，`ServerContext` 显式共享服务端 ticket 域。普通 `open_stream` / `write` 不发送早期数据；只有 `EarlyDataPolicy::replay_safe` 加 `open_early_stream` / `write_early` 才尝试原始 QUIC 0-RTT。调用方负责保证操作可安全重放；库不提供防重放保证，原始 QUIC 层拒绝后不自动重放。HTTP/3 0-RTT 的契约见下文专节。
+- **拨号与上传**：`tcp::dial` 对解析后的去重候选交错 IPv4/IPv6，在总 deadline 内错峰、有界并发建连，返回前取消并 join 落败尝试；系统 `getaddrinfo` 仍在线程池完成，不是独立异步 A/AAAA 查询。HTTP/1 `begin` → `send_body` → `finish` 支持 content-length/chunked 上传、逐块背压与贯穿上传/生产者停顿/响应的预算；这一组是 **send-first**；需要 `Expect: 100-continue` 或上传同时读取提前响应时改用双工 `exchange`，它要求流允许一读一写同时在途（Mira TCP/TLS/本地流均满足），既不读也不关闭的对端仍由 deadline 或 stop 兜底。
 - **执行与预算**：`EventLoop::post` 保留可靠 continuation 通道；应用准入走 `try_post` / `BoundedExecutor`，满额返回 `would_block`，后者故意不满足 `Executor`。投递配额在调用前释放，不约束回调新建的异步任务。`LoopGroup` 每 worker 拥有独立线程亲和 loop，配额覆盖排队及未完成根任务；socket 必须在所属 worker 创建/使用，不迁移已关联 socket。共享 `ResourceBudget` 是计量配额，不覆盖全部分配器、第三方状态或进程 RSS。
 - **TLS 管理服务示例**：同时启用 TLS/H2 后运行 `build/protocols/mira_https_managed_server cert.pem key.pem 8444 64 16 5000 1000 1000`。它分别限制连接/握手、设置握手 deadline、按协商后的 ALPN 分发 H1/H2、拒绝缺失/未知 ALPN，并演示 grace drain / cancel / join；每连接处理一个 H1 请求或一批 H2 请求，不是通用生产服务器。
 
@@ -353,6 +372,43 @@ WebSocket 用 `extended_connect_request` / `accept_extended_connect` / `validate
 
 独立 Python socket/zlib 双向互操作：`python3 tools/ci/check_ws_interop.py --extensions-peer build/ws/mira_ws_extensions_peer`。提交 `d3424f0` 的官方 Autobahn 25.10.1 全量（含压缩）已验：每端 517 项，514 OK + 3 INFORMATIONAL；双端 1,034 项 = 1,028 OK + 6 INFORMATIONAL，零失败、零 NON-STRICT、零缺项、零排除。信息项不冒充严格 OK；后续改动仍须重新验证。完整压缩模式以 `run_autobahn.py --compression` 启动。
 
+### HTTP/3 0-RTT
+
+```cpp
+// 服务端：ServerContext 创建前绑定本端 H3 SETTINGS，票据域与 SETTINGS 一一对应
+Mira::http3::Limits limits;
+server_options.service_scope = "api";
+server_options.early_data = Mira::quic::EarlyDataPolicy::replay_safe;
+server_options.early_data_context = Mira::http3::early_data_context(limits);
+server_options.server_context = Mira::quic::ServerContext::create(server_options).value();
+
+// 客户端：显式 ca_file + 同一 SessionCache；持票时 connect 不发包即返回
+client_options.service_scope = "api";
+client_options.session_cache = cache;
+client_options.early_data = Mira::quic::EarlyDataPolicy::replay_safe;
+auto h3 = co_await H3::connect(loop, client_options, limits, io);
+auto get = co_await h3->request(get_fields);             // 安全方法：随 0-RTT 发出
+auto post = co_await h3->request(post_fields, body, io); // 其他：先完成握手（受 io 约束）再 1-RTT
+```
+
+客户端不记忆服务端 SETTINGS，早期请求一律按默认值（QPACK 动态表 0、无 Extended CONNECT），RFC 9114 §7.2.4.2 允许且任何合规服务端都能接受。兼容性判断落在服务端：`http3::Engine::create` / `make_server` 拒绝 SETTINGS 与票据域不一致的配置，而其他 `ServerContext` 签发的票据本就无法解密。服务端应用对带 `early_data` 的安全方法请求仍须自行判断能否执行两次（RFC 8470，不能则答 425）；没有防重放存储，截获的 0-RTT 首包可被重放到共享票据域的任一服务端。
+
+### MQTT
+
+```cpp
+Mira::mqtt::ClientOptions options;                        // 默认 5.0；options.version 可选 v311
+options.client_id = "sensor-7";
+options.keep_alive = 30;
+auto client = co_await Mira::mqtt::Client<tcp::Socket>::connect(socket, options, io);
+auto sub = co_await client->subscribe({{"sensors/+/temp", Mira::mqtt::QoS::at_least_once}});
+auto granted = co_await client->wait_for(*sub);           // SUBACK，其余事件留给 receive
+auto id = co_await client->publish("sensors/7/temp", payload, Mira::mqtt::QoS::exactly_once);
+auto events = co_await client->receive();                 // 消息、发布完成、服务端 DISCONNECT……
+// keep_alive(loop) 是定时写者：与 receive 在同一 loop 并发，TLS 下同样安全
+```
+
+流由调用方拥有并在客户端之后销毁；客户端从不关闭它。超出服务端 Receive Maximum、包标识耗尽或输出预算满时返回 `would_block`，不暗中排队；对端违规时 5.0 以带原因的 DISCONNECT 关闭会话。收到的 QoS 1 消息在上交时即确认。断线后在新流上 `reconnect`：`clean_start = false` 且服务端报告会话仍在时，未确认的 PUBLISH（DUP）与 PUBREL 按原顺序重发，否则以 `discarded` 事件报告。不含 broker、MQTT over WebSocket、出站主题别名、会话持久化与重连策略。
+
 ### Retry 真实 UDP 故障验收
 
 启用 `MIRA_ENABLE_HTTP3=ON` 与 `MIRA_BUILD_BENCH=ON` 后，可复现有界丢包、重复、延迟、重排与连接 churn：
@@ -370,8 +426,8 @@ python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak 
 
 1. iOS 已通过宿主 smoke 和无签名交叉编译，真机缺签名 profile；Android 真机尚无证据。Windows MSVC H3、WSS 全双工及 TLS 1.3 KeyUpdate 已有运行回归；新增 Windows 独立 H3 / MinGW 入口只有参数单测 3/3，仍待实跑。
 2. 本轮新提交的跨平台 CI、更长时故障注入、真实多机/WAN 与进程内存治理仍待验；本机最终三套完整矩阵已各 85/85。官方 Autobahn 全量含压缩仅有上述 `d3424f0` 的完整报告；可用 `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker --compression` 在 Linux 复现，完整报告由 CI 保存。
-3. QUIC validated migration/NAT rebinding、显式原始 QUIC 0-RTT 与 H2/H3 Extended CONNECT 已在主线实现，但 HTTP/3 0-RTT、完整防重放保证与第三方 Extended CONNECT 互操作未交付/未验证。Retry 不保证 token 一次性使用，listener 不是互联网抗洪泛防护系统。
-4. **下一阶段目标**：HTTP/3 0-RTT、HTTP/1 `Expect: 100-continue` / 提前响应并发读取，以及独立 MQTT、SOCKS5、DoH 模块；本轮不实现。gRPC/Redis/WebRTC 保持生态层边界，不将专业子系统全部塞进网络内核。
+3. QUIC validated migration/NAT rebinding、显式原始 QUIC 0-RTT、HTTP/3 0-RTT 与 H2/H3 Extended CONNECT 已在主线实现，但完整防重放保证与第三方 Extended CONNECT 互操作未交付/未验证；HTTP/3 0-RTT 目前只有同库引擎与真实 UDP 证据，尚无第三方 0-RTT 互操作。Retry 不保证 token 一次性使用，listener 不是互联网抗洪泛防护系统。
+4. **2026-09-29 阶段已交付**：HTTP/3 0-RTT、HTTP/1 `Expect: 100-continue` / 提前响应双工，以及独立 SOCKS5、DNS/DoH、MQTT 模块。仍开放：0-RTT 防重放存储、客户端记忆服务端 SETTINGS、打包好的 DoH over H2/H3 查询、MQTT over WebSocket 与会话持久化。gRPC/Redis/WebRTC 保持生态层边界，不将专业子系统全部塞进网络内核。
 
 设计依据与验收要求见[架构文档](docs/ARCHITECTURE.md)。
 

@@ -19,8 +19,7 @@ retained development history, not a release announcement for this work.
 - Bounded, in-memory QUIC `SessionCache` and explicitly shared `ServerContext`
   ticket domains. Raw QUIC 0-RTT requires `EarlyDataPolicy::replay_safe` plus
   `open_early_stream` / `write_early`; it provides no anti-replay guarantee and
-  rejected early data is never automatically replayed. HTTP/3 0-RTT remains
-  unsupported; its engine rejects the early-data opt-in.
+  rejected early data is never automatically replayed at the QUIC layer.
 - Opt-in H2/H3 Extended CONNECT with actual peer SETTINGS gating, `:protocol`
   validation and bounded tunnel I/O. `ConnectStream` borrows a driver that
   serializes connection progress/flush and honors cancellation/deadlines; each
@@ -33,8 +32,44 @@ retained development history, not a release announcement for this work.
   System resolution still completes through bounded getaddrinfo workers; this
   is not independent asynchronous A/AAAA resolution.
 - HTTP/1 `begin` / `send_body` / `finish` streaming uploads with content-length
-  or chunked framing and one exchange budget. Uploads are send-first: no
-  `Expect: 100-continue` handshake or concurrent early-response reads.
+  or chunked framing and one exchange budget; this form is send-first.
+- HTTP/1 duplex `ClientConnection::exchange`: a pulled body uploads while a
+  concurrent reader parses 1xx/final heads. `Expect: 100-continue` holds the
+  body until 100, a final response (`skipped`) or `continue_timeout`; an early
+  refusal (>= 300 or closing) withholds the rest (`interrupted`), an early
+  keep-alive 2xx lets it finish. In-flight writes are never cancelled for an
+  early response. `serve_connection` answers 100-continue eagerly for buffered
+  handlers and on first read for streaming ones, closes instead of draining a
+  refused body, and rejects unknown expectations with 417.
+- HTTP/3 0-RTT on both ends (`EarlyDataPolicy::replay_safe`). Clients with a
+  ticket are `early_ready()` at once and send GET/HEAD/OPTIONS whole-body
+  requests in 0-RTT under default SETTINGS; other requests wait for 1-RTT
+  (`http3::Connection::request` drives the handshake for them). Rejected early
+  requests are resubmitted after the handshake on the same stream IDs. Servers
+  accepting 0-RTT answer in 0.5-RTT, flag early requests with
+  `Event::early_data` and answer unsafe early requests `425 Too Early` without
+  surfacing them. `quic::Options::early_data_context`, pinned by
+  `ServerContext`, must equal `http3::early_data_context(limits)`, binding every
+  ticket domain to identical SETTINGS. Tests prove one-round-trip completion,
+  transparent rejection, the 425 path with a hand-built client, and binding
+  failures; there is still no anti-replay store.
+- `Mira::socks`: RFC 1928 CONNECT and RFC 1929 password authentication for
+  clients and proxies over any bounded stream, exact-length reads that leave
+  the stream at the first tunnelled byte, strict address handling and typed
+  reply errors. `client::dial_via_socks5` composes `tcp::dial` under one
+  deadline and never resolves domain targets locally.
+- `Mira::dns`: RFC 1035/6891 codec with strictly backward compression
+  pointers, bounded names/counts before allocation, typed common records and
+  EDNS(0) with RFC 8467 padding; RFC 8484 DoH GET/POST mapping in both
+  directions and an HTTP/1 `doh::query` over TCP or TLS.
+- `Mira::mqtt`: MQTT 3.1.1 and 5.0 codec for all packet types and both roles
+  (strict flags, minimal lengths, UTF-8, topic syntax, reason codes and the 5.0
+  per-packet property table), a socket-free client `Session` (QoS 1/2 flows,
+  CONNACK limits, inbound topic aliases, keep-alive supervision, enhanced
+  AUTH, ordered DUP/PUBREL resumption or `discarded` reports) and a duplex
+  `Client<Stream>` whose keep-alive is a timer-driven writer safe over TLS.
+  `mira_mqtt_client` interoperates with an independent Python broker and
+  mosquitto; CI requires the mosquitto cases and fuzzes the codec.
 - Separate `Mira::client` and optional `Mira::client_tls` composition targets for
   owned HTTP/1 and HTTPS pools. Normalized origins and client/TLS configuration
   instances stay isolated; recycling requires a drained reusable response and

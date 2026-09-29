@@ -39,8 +39,8 @@ and remaining acceptance work must be described separately.
 | Execution and ownership | Lazy, move-only `Task` and single-threaded `TaskScope`; reliable continuation posting separate from bounded application admission; `LoopGroup` owns independent thread-affine loops and bounded root tasks | Continued cross-layer join/drain validation; attached sockets cannot migrate between workers; loop destruction during dispatch is refused |
 | Cancellation and deadlines | `OperationOptions` on core/TCP/HTTP operations; TLS owns independent loop timers for each application request without rearming wire I/O; `BoundedStream` exposes cancellation support; registration is rolled back on allocation failure | Maintain runtime evidence for backend-specific completion races; a cancelled IOCP read may lose bytes, so that connection cannot be resumed; `stop()` is a stop-pumping request, not I/O cancellation |
 | Transport and composition | Completion-shaped TCP/UDP/local streams; `DatagramTransport` conformance assertions; bounded family-interleaved `tcp::dial`; separately composed HTTP/HTTPS client pools and grace-draining TCP serving | Maintain backend-specific teardown evidence; DNS is bounded system getaddrinfo, not independent asynchronous A/AAAA resolution |
-| Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered and streaming request bodies (`RequestBodyReader`), chunked trailers, connection-loop drain guarantees; request- and response-parser fuzzing in CI; curl interop exercised out-of-process against the example servers — HTTP/1.1 against the file server, real-nghttp2 HTTP/2 (prior knowledge, including concurrent streams) against `examples/h2_prior_knowledge_server`, native-QUIC HTTP/3 (ngtcp2 + nghttp3) against `examples/h3_server` | Protocol conformance evidence, slow-consumer backpressure bounds and bounded aggregate memory measurements |
-| Security and robustness | Duplex TLS with terminal cancellation, bounded parsers, shared accounting budgets, HTTP/WS fuzzing, opt-in validated QUIC paths and explicit replay-safe raw-QUIC early data | No complete anti-replay or process-RSS guarantee; HTTP/3 0-RTT is unsupported; longer exhaustion tests and mobile TLS runtime evidence remain open |
+| Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered and streaming request bodies (`RequestBodyReader`), chunked trailers, connection-loop drain guarantees; request- and response-parser fuzzing in CI; curl interop exercised out-of-process against the example servers — HTTP/1.1 against the file server, real-nghttp2 HTTP/2 (prior knowledge, including concurrent streams) against `examples/h2_prior_knowledge_server`, native-QUIC HTTP/3 (ngtcp2 + nghttp3) against `examples/h3_server`; HTTP/1 `Expect: 100-continue` and duplex early responses; SOCKS5 against curl and independent Python peers; DoH against curl and Python peers; MQTT 3.1.1/5.0 against an independent Python broker and mosquitto | Protocol conformance evidence, slow-consumer backpressure bounds and bounded aggregate memory measurements |
+| Security and robustness | Duplex TLS with terminal cancellation, bounded parsers, shared accounting budgets, HTTP/WS/SOCKS/DNS/MQTT fuzzing, opt-in validated QUIC paths, explicit replay-safe raw-QUIC early data and HTTP/3 0-RTT with SETTINGS-bound ticket domains and automatic 425 for unsafe early requests | No complete anti-replay or process-RSS guarantee; longer exhaustion tests and mobile TLS runtime evidence remain open |
 | Engineering evidence | `d3424f0` desktop CI and full compression-inclusive Autobahn reports; snapshot-scoped sanitizer suites, real-network H2/H3 CONNECT tests and a 600-second H3 loopback soak | Local final Release/GCC/ASan+UBSan each passed 85/85; new Windows H3/MinGW entry points await execution, iOS lacks signed device evidence, Android devices and multi-host/WAN remain unverified; no stable ABI promise |
 
 Rejecting ambiguous or malformed input is part of protocol correctness, not a
@@ -105,7 +105,8 @@ core lifetime and backpressure work.
 ```
 composition       client / client_tls          application drivers
                       │                              │
-protocol       HTTP/1.1 · HTTP/2 · WS          HTTP/3 / QUIC
+protocol  HTTP/1.1 · HTTP/2 · WS · SOCKS5      HTTP/3 / QUIC
+          DNS/DoH · MQTT
                       │                              │
 adapter          optional TLS                  path-aware datagrams
                       │                              │
@@ -119,7 +120,9 @@ backend                kqueue · epoll · IOCP
 This diagram describes runtime composition, not concrete header dependencies.
 HTTP/1 and TLS use core stream concepts and do not depend on TCP. Shared HTTP
 fields live in dependency-free `Mira::http_common`; H3 does not require H2.
-`Mira::client` is a separate composition target linking HTTP and transport;
+`Mira::socks` and `Mira::mqtt` depend on core only and run over any bounded
+stream (TCP, TLS, local); `Mira::dns` adds `Mira::http` for the DoH mapping.
+`Mira::client` is a separate composition target linking HTTP, SOCKS5 and transport;
 `Mira::client_tls` adds TLS only with `MIRA_ENABLE_TLS=ON`. Installed components
 are `client` / `client_tls`; a base client consumer does not discover OpenSSL.
 Stream protocols must not assume datagrams are byte streams: a protocol only
@@ -460,10 +463,26 @@ HTTP/1 `ClientConnection::begin` sends the head, `send_body` borrows one chunk
 until sent, and `finish` completes framing then reads the final response head.
 Content-length and chunked uploads do not collect the whole body; size/framing
 errors invalidate reuse. The exchange budget covers producer pauses, upload
-and response without reset. This is send-first, not full-duplex HTTP upload:
-`Expect: 100-continue`, concurrent early-response reads and request trailers
-are unsupported. A peer that rejects without consuming may require the total
-deadline to end blocked writes. No business request is automatically retried.
+and response without reset. That trio is send-first: it reads nothing until
+the body is sent.
+
+`ClientConnection::exchange` is the duplex form. It writes the head, then pulls
+the body from a producer while a concurrent reader parses 1xx and final heads,
+so it needs a stream that allows one read and one write in flight (Mira TCP,
+TLS and local streams do). With `expect_continue` no body byte is written until
+`100 Continue`, a final response (`skipped`) or `continue_timeout`. A final
+response with status >= 300 or a closing connection mid-upload withholds the
+rest of the body (`interrupted`); an early 2xx that keeps the connection lets
+the upload finish (RFC 9112 section 9.5). An in-flight chunk write is never
+cancelled for an early response, because on TLS that would invalidate the
+session and lose the response; a peer that neither reads nor closes is bounded
+by the deadline or stop. Reader failure cancels the writer and producer failure
+cancels the reader; `skipped`/`interrupted` forbid reuse, and the response body
+is read after the upload. On the server, `serve_connection` answers
+`100-continue` eagerly for buffered handlers and on the first body read for
+streaming ones, closes rather than draining a refused body, and answers unknown
+expectations with 417. Request trailers remain unsupported and no business
+request is automatically retried.
 
 `client::HttpClient` / `HttpsClient` own resolver/dial/pool composition above
 HTTP's transport-independent layer. Pools use normalized host/port origins,
@@ -504,10 +523,52 @@ certificate, ALPN, scope and limits. Normal `open_stream` / `write` do not send
 early data. Raw QUIC 0-RTT additionally requires `EarlyDataPolicy::replay_safe`,
 a compatible cached ticket and explicit `open_early_stream` / `write_early`.
 Applications inspect `early_data_status` and own the replay-safety decision;
-rejected data is never replayed automatically. This provides no anti-replay
-guarantee. HTTP/3 needs remembered SETTINGS/QPACK policy beyond a QUIC ticket:
-its engine rejects the early-data opt-in with `not_supported`. H3 0-RTT is not
-implemented. Retry tokens also are not guaranteed single-use or replay-proof.
+rejected data is never replayed automatically at the QUIC layer. This provides
+no anti-replay guarantee. A server engine reports `accepted` once TLS accepted
+early data, the 0-RTT read key is installed and the 1-RTT write key exists; it
+may then open streams for 0.5-RTT responses, still bounded by ngtcp2's
+anti-amplification limit. `Options::early_data_context` is opaque application
+compatibility state that a `ServerContext` pins, so engines sharing a ticket
+domain must carry an identical value. Retry tokens also are not guaranteed
+single-use or replay-proof.
+
+### HTTP/3 0-RTT
+
+Both ends opt in with `EarlyDataPolicy::replay_safe`. RFC 9114 section 7.2.4.2
+lets a client either remember the server's SETTINGS or use defaults; the Mira
+client remembers nothing and sends early requests under default SETTINGS
+(QPACK dynamic table capacity 0, no extended CONNECT), which any compliant
+server accepts. The server side is where compatibility must be decided: it may
+accept 0-RTT only if SETTINGS a client remembered are still compatible. Mira
+therefore requires `early_data_context = http3::early_data_context(limits)`
+before creating the `ServerContext`; every ticket that context issues was
+issued under identical SETTINGS, and `http3::Engine::create` / `make_server`
+refuse a server whose limits produce a different context. A ticket from another
+`ServerContext` cannot be decrypted, so drifted SETTINGS never meet old tickets.
+
+A client holding a compatible ticket is `early_ready()` right after `create`:
+its control/QPACK streams are opened as 0-RTT streams and `request()` sends
+GET/HEAD/OPTIONS whole-body requests in 0-RTT. Other methods, streaming bodies
+and extended CONNECT return `not_supported` until `ready()`;
+`http3::Connection::request` instead drives the handshake (bounded by its
+`OperationOptions`) and sends them in 1-RTT, and `Connection::connect` returns
+before any datagram when 0-RTT is usable. If the server rejects early data,
+ngtcp2 discards every early stream and stream-ID allocation, and TLS
+guarantees the server processed none of it. The engine then rebuilds nghttp3
+under the server's real SETTINGS and resubmits the safe requests in order,
+which reproduces their stream IDs, so callers observe one normal response per
+request. This is the HTTP layer deciding to resend requests it restricted to
+safe methods, not the QUIC layer replaying opaque bytes.
+
+A server that accepted 0-RTT becomes `ready()` before handshake completion
+and answers in 0.5-RTT, so an accepted early request completes in one round
+trip; the tests count flights to prove it. Requests whose bidirectional stream
+carried 0-RTT data are surfaced with `Event::early_data`, and the application
+decides whether a safe-method request may run twice (RFC 8470: answer 425 if
+not). Early requests with unsafe methods, including extended CONNECT, are
+answered `425 Too Early` by the engine and never surfaced; their request body
+is consumed and discarded. There is no anti-replay store: a captured 0-RTT
+flight can be replayed to any server sharing the ticket domain.
 
 ### H2/H3 Extended CONNECT and WebSocket
 
@@ -539,6 +600,53 @@ No HTTP/1 Upgrade, nonce or accept-digest exchange runs on this path. These
 helpers do not perform network I/O or relax ConnectStream's single-operation
 contract. The default compression policy remains disabled.
 
+### SOCKS5, DNS/DoH and MQTT
+
+`Mira::socks` implements RFC 1928 CONNECT with RFC 1929 username/password over
+any bounded stream, for both the client and the proxy side. Every message is
+read at its exact length, so after a handshake the stream is positioned at the
+first tunnelled byte and TLS or HTTP can follow without a pushback buffer.
+Addresses are parsed and formatted strictly; non-success replies become typed
+errors; the proxy side parses BIND and UDP ASSOCIATE only to refuse them.
+`client::dial_via_socks5` composes `tcp::dial` and `socks::connect` under one
+deadline and sends domain targets unresolved, so no lookup for the target
+leaks outside the tunnel. Credentials are clear text per RFC 1929.
+
+`Mira::dns` is an RFC 1035 / RFC 6891 codec that treats every byte as hostile:
+compression pointers must point strictly backwards past the header, names stay
+within 255 wire bytes, record counts are checked against limits and against
+the bytes that could hold them before allocation, fixed RDATA sizes and
+trailing bytes are enforced. A, AAAA, CNAME/NS/PTR, MX, TXT, SOA and EDNS(0)
+(extended RCODE, RFC 8467 padding) are typed; other records round-trip as raw
+RDATA. Encoding never compresses. The RFC 8484 helpers map GET/POST in both
+directions with strict base64url, media-type and status checks and HTTP error
+mapping; `doh::query` runs one exchange over an HTTP/1 `ClientConnection`,
+including over TLS, and HTTP/2/3 callers use the request/response helpers.
+Queries use id 0 and responses must answer the question.
+
+`Mira::mqtt` covers MQTT 3.1.1 and 5.0 in three layers. The codec encodes and
+decodes all fifteen packet types for both roles and refuses to emit anything
+its decoder would reject: fixed-header flags, minimal Variable Byte Integers,
+well-formed UTF-8 without U+0000, topic name/filter syntax (including 5.0
+shared subscriptions), packet identifiers, reason codes per packet and version,
+and in 5.0 the per-packet property table, property values and duplicates.
+Direction is part of decoding, and an oversized packet fails from its fixed
+header alone. `Session` is a socket-free client: QoS 1/2 sender and receiver
+flows, packet-identifier allocation, the server's CONNACK limits (Receive
+Maximum, Maximum Packet Size, Maximum QoS, Retain/Wildcard/Shared/Subscription
+Identifier availability, Server Keep Alive, Assigned Client Identifier),
+inbound topic aliases, keep-alive with PINGRESP supervision, enhanced AUTH
+exchange, and resumption that resends unacknowledged PUBLISH (DUP) and PUBREL
+in original order or reports them `discarded`. Nothing is queued invisibly:
+the server's Receive Maximum, identifier exhaustion and the output bound return
+`would_block`; peer violations close the session with a 5.0 DISCONNECT reason.
+`Client<Stream>` borrows a caller-owned stream and follows the duplex stream
+contract: one reader (`receive` / `wait_for`) beside serialized writers, with
+`keep_alive(loop)` as a timer-driven writer, so keep-alive never depends on
+read deadlines that would poison a TLS session. Received QoS 1 messages are
+acknowledged when surfaced. Out of scope: a broker, MQTT over WebSocket,
+outbound topic aliases, persistent session storage and reconnect policy.
+
 ### Managed serving and grace shutdown
 
 `tcp::serve(loop, listener, handler, options)` stops admission, drains accept,
@@ -558,6 +666,20 @@ complete production HTTP server. `mira_loop_group_server` demonstrates separate
 worker loops, not cross-worker transfer of already attached sockets.
 
 ## Verification snapshots and remaining evidence
+
+- 2026-09-29 phase source (HTTP/3 0-RTT, MQTT, documentation sync): local
+  AppleClang Release, GCC 16 and ASan+UBSan each ran 97 tests, 95 passed and
+  the 2 external HTTP/3 curl interop tests skipped (no HTTP3 curl locally), 0
+  failed. GCC 13 base configuration 49/49; MinGW cross-compiled every MQTT
+  target; installed-consumer and layering checks passed. `http3_early` counts
+  flights to prove accepted 0-RTT completes in one round trip, rejected 0-RTT
+  is resubmitted on the same stream IDs, a hand-built client's unsafe early
+  POST gets 425 without surfacing, and SETTINGS drift is refused; mutations
+  removing the 425 path, the resubmission or 0.5-RTT readiness each fail it.
+  `http3_early_udp` repeats the client path through `http3::Connection` over
+  real UDP. MQTT: codec 190 checks, session 160, real-TCP client 98, interop
+  25 cases including 8 against mosquitto 2.1.2, and 145k fuzz inputs in 91 s
+  under ASan+UBSan. There is no third-party HTTP/3 0-RTT peer evidence yet.
 
 - Commit `d3424f0`: CI 17/17 and official Autobahn 25.10.1 including compression,
   517 cases per role (514 OK + 3 INFORMATIONAL), 1,034 total (1,028 OK +
@@ -638,10 +760,15 @@ pretending to be verification.
 
 ## Next-phase goals
 
-HTTP/3 0-RTT, HTTP/1 `Expect: 100-continue` and concurrent early-response reads,
-plus independent MQTT, SOCKS5 and DoH modules are deferred to the next phase.
-They are not included in this delivery. Release and downstream migrations remain
-separate from work on Mira itself.
+The 2026-09-29 phase delivered HTTP/3 0-RTT, HTTP/1 `Expect: 100-continue` with
+duplex early-response handling, and the independent SOCKS5, DNS/DoH and MQTT
+modules; their boundaries are recorded above. Still open: an anti-replay store
+for 0-RTT, remembered server SETTINGS on the client, DoH over HTTP/2 and
+HTTP/3 as a packaged query, MQTT over WebSocket and session persistence,
+independent third-party interoperability for Extended CONNECT, device runs,
+and multi-host/WAN measurements. gRPC, Redis and WebRTC stay ecosystem layers
+above the network core. Release and downstream migrations remain separate from
+work on Mira itself.
 
 ## Decisions on record
 
@@ -656,7 +783,7 @@ separate from work on Mira itself.
 | Standard floor | C++23-only build; `Result<T>` directly aliases `std::expected<T, Error>` | Validate each toolchain and standard library; no C++20 compatibility mandate |
 | Buffer shape | Current `Buffer` is contiguous | Future segmented or borrowed-buffer designs need measured benefit and an explicit ownership contract |
 | Framework coupling | No host-framework dependency or old Aria API compatibility promise | Consumers adapt to the independent library after its contracts are established |
-| Protocol scope | HTTP/1.1, TLS, WebSocket/WSS, HTTP/2, QUIC and HTTP/3 are implemented modules | Track protocol implementation separately from independent interoperability and per-platform runtime evidence |
+| Protocol scope | HTTP/1.1, TLS, WebSocket/WSS, HTTP/2, QUIC, HTTP/3, SOCKS5, DNS/DoH and MQTT are implemented modules | Track protocol implementation separately from independent interoperability and per-platform runtime evidence |
 
 ## Staged acceptance
 
