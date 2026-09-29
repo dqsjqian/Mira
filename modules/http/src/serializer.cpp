@@ -189,12 +189,20 @@ Result<void> write_request_head(Buffer& out, const Request& request,
 }
 
 Result<void> write_request_head(Buffer& out, const Request& request,
-                                Framing framing, std::uint64_t body_size, Limits limits) {
+                                Framing framing, std::uint64_t body_size, Limits limits,
+                                Expectation expectation) {
     if (framing != Framing::content_length && framing != Framing::chunked)
+        return fail(Errc::invalid_argument);
+    if (expectation != Expectation::none && expectation != Expectation::continue_100)
         return fail(Errc::invalid_argument);
     if (framing == Framing::chunked) {
         if (request.version != Version::http_1_1) return fail(Errc::not_supported);
         if (body_size != 0) return fail(Errc::invalid_argument);
+    }
+    // RFC 9110 §10.1.1: never in HTTP/1.0, never without content.
+    if (expectation == Expectation::continue_100) {
+        if (request.version != Version::http_1_1) return fail(Errc::not_supported);
+        if (framing == Framing::content_length && body_size == 0) return fail(Errc::invalid_argument);
     }
     if (request.method == Method::connect || request.method == Method::other ||
         request.headers.contains("Upgrade") || request.headers.contains("Expect")) {
@@ -301,14 +309,24 @@ Result<void> write_request_head(Buffer& out, const Request& request,
     if (framing_line.size() > limits.max_header_line || framing_line.size() > limits.max_headers_total - total) {
         return fail(Errc::limit_exceeded);
     }
+    total += framing_line.size();
+    constexpr std::string_view expect_line = "Expect: 100-continue";
+    const bool expect = expectation == Expectation::continue_100;
+    if (expect && (request.headers.size() + 1 >= limits.max_header_count ||
+                   expect_line.size() > limits.max_headers_total - total)) {
+        return fail(Errc::limit_exceeded);
+    }
     // One reserve up front: method + target + version line, every header
     // line (name + ": " + value + CRLF), plus framing and the final CRLF.
     out.reserve(out.size() + method.size() + request.target.size() + 32 +
-                total + request.headers.size() * 4 + framing_line.size() + 4);
+                total + request.headers.size() * 4 + (expect ? expect_line.size() + 2 : 0) + 4);
     append(out, method); append(out, " "); append(out, request.target);
     append(out, " "); append(out, to_string(request.version)); append(out, "\r\n");
     for (const auto& [name, value] : request.headers) {
         append(out, name); append(out, ": "); append(out, value); append(out, "\r\n");
+    }
+    if (expect) {
+        append(out, expect_line); append(out, "\r\n");
     }
     append(out, framing_line); append(out, "\r\n\r\n");
     return {};

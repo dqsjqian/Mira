@@ -66,8 +66,16 @@ enum class SerializeError {
                                                Framing framing,
                                                std::uint64_t body_size = 0);
 
+/// Request expectation owned by the serializer, never by caller headers.
+enum class Expectation {
+    none,
+    /// `Expect: 100-continue` (RFC 9110 §10.1.1): HTTP/1.1 with content only.
+    continue_100,
+};
+
 /// Requests support only origin-form and OPTIONS *; proxy absolute-form,
-/// CONNECT, Upgrade, and Expect are not supported.
+/// CONNECT and Upgrade are not supported. A caller-supplied Expect header is
+/// rejected; `Expectation::continue_100` is the only way to send one.
 /// HTTP/1.1 requires exactly one valid Host; framing is owned entirely by
 /// the serializer.
 [[nodiscard]] Result<void> write_request_head(Buffer& out, const Request& request,
@@ -75,7 +83,8 @@ enum class SerializeError {
                                               Limits limits = {});
 [[nodiscard]] Result<void> write_request_head(Buffer& out, const Request& request,
                                               Framing framing, std::uint64_t body_size = 0,
-                                              Limits limits = {});
+                                              Limits limits = {},
+                                              Expectation expectation = Expectation::none);
 
 /// Write one chunk of a chunked body, including its size line and trailing CRLF.
 ///

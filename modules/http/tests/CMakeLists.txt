@@ -12,9 +12,11 @@ add_executable(mira_http_e2e_tests test_end_to_end.cpp)
 target_link_libraries(mira_http_e2e_tests PRIVATE Mira::transport)
 
 add_executable(mira_http_streaming_tests test_streaming.cpp)
+add_executable(mira_http_expect_tests test_expect.cpp)
+target_link_libraries(mira_http_expect_tests PRIVATE Mira::transport)
 foreach(target mira_http_tests mira_http_server_tests mira_http_e2e_tests
                mira_http_response_tests mira_http_client_tests
-               mira_http_streaming_tests)
+               mira_http_streaming_tests mira_http_expect_tests)
     target_link_libraries(${target} PRIVATE
         Mira::http
         Mira::warnings
@@ -34,4 +36,5 @@ add_test(NAME http_end_to_end COMMAND mira_http_e2e_tests)
 add_test(NAME http_response_parser COMMAND mira_http_response_tests)
 add_test(NAME http_client COMMAND mira_http_client_tests)
 add_test(NAME http_streaming COMMAND mira_http_streaming_tests)
-set_tests_properties(http_server http_end_to_end http_response_parser http_client http_streaming PROPERTIES TIMEOUT 60)
+add_test(NAME http_expect COMMAND mira_http_expect_tests)
+set_tests_properties(http_server http_end_to_end http_response_parser http_client http_streaming http_expect PROPERTIES TIMEOUT 60)

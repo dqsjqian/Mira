@@ -136,13 +136,15 @@ public:
     ResponseWriter& operator=(const ResponseWriter&) = delete;
 
     /// Send a complete response with a known body. The common case.
-    [[nodiscard]] Task<Result<void>> send(const Response& response,
+    [[nodiscard]] Task<Result<void>> send(const Response& original,
                                           std::span<const std::byte> body = {}) {
         if (sent_head_) {
             co_return fail(SerializeError::framing_conflict);
         }
 
         Buffer out;
+        std::optional<Response> announced;
+        const Response& response = announce(original, announced);
         const Framing framing =
             status_forbids_body(response.status) ? Framing::none : Framing::content_length;
 
@@ -175,12 +177,14 @@ public:
     /// Begin a streaming response whose size is not yet known.
     ///
     /// Bodies then go out via `write` and are terminated by `finish`.
-    [[nodiscard]] Task<Result<void>> send_head_chunked(const Response& response) {
+    [[nodiscard]] Task<Result<void>> send_head_chunked(const Response& original) {
         if (sent_head_) {
             co_return fail(SerializeError::framing_conflict);
         }
 
         Buffer out;
+        std::optional<Response> announced;
+        const Response& response = announce(original, announced);
         Result<void> head = write_response_head(out, response, Framing::chunked);
         if (!head) {
             co_return fail(head.error());
@@ -235,7 +239,26 @@ public:
     /// Whether the connection is expected to stay open after this response.
     [[nodiscard]] bool keep_alive() const noexcept { return keep_alive_; }
 
+    /// Set by `serve_connection` while a 100-continue expectation is still
+    /// unanswered: a final head sent in that state refuses the body, so it
+    /// announces `Connection: close` and the connection ends after it.
+    void set_refuses_unread_body(bool value) noexcept { refuses_unread_body_ = value; }
+
 private:
+    const Response& announce(const Response& response, std::optional<Response>& scratch) {
+        if (!refuses_unread_body_ || response.status < 200) {
+            return response;
+        }
+        keep_alive_ = false;
+        for (const auto& [name, value] : response.headers) {
+            if (!HeaderMap::names_equal(name, "Connection")) continue;
+            if (HeaderMap::names_equal(value, "close")) return response;
+        }
+        scratch = response;
+        scratch->headers.append("Connection", "close");
+        return *scratch;
+    }
+
     Stream* stream_;
     /// This request's budget, applied to every write the handler causes.
     OperationOptions io_{};
@@ -244,6 +267,7 @@ private:
     bool sent_head_{false};
     bool chunked_{false};
     bool finished_{false};
+    bool refuses_unread_body_{false};
 };
 
 /// Reads a request body incrementally while the handler runs.
@@ -282,6 +306,23 @@ public:
         }
         if (out.empty()) {
             co_return fail(Errc::invalid_argument);
+        }
+        // A pending 100-continue is answered by the first read: pulling the
+        // body is the handler deciding it wants it. Once a final head is out
+        // the client was told not to send, so no 100 follows it.
+        if (continue_pending_) {
+            continue_pending_ = false;
+            if (writer_ != nullptr && !writer_->sent_head()) {
+                writer_->set_refuses_unread_body(false);
+                constexpr std::string_view interim = "HTTP/1.1 100 Continue\r\n\r\n";
+                Result<void> sent = co_await write_all(
+                    stream_, std::as_bytes(std::span{interim.data(), interim.size()}), io_);
+                if (!sent) {
+                    finished_ = true;
+                    last_error_ = sent.error();
+                    co_return fail(sent.error());
+                }
+            }
         }
         // Leftovers from a previous read come first: a slice larger than the
         // caller's buffer was already split, and ordering must be preserved.
@@ -396,12 +437,17 @@ public:
     /// a value out while the reader is alive if it must outlive the request.
     [[nodiscard]] const HeaderMap& trailers() const noexcept { return parser_.trailers(); }
 
+    /// True while a 100-continue expectation has not been answered by a read.
+    [[nodiscard]] bool continue_pending() const noexcept { return continue_pending_; }
+
 public:
     RequestBodyReader(Stream& stream, Buffer& input, RequestParser& parser,
                       OperationOptions io, std::size_t read_chunk,
-                      std::size_t max_buffer_size = 64 * 1024)
+                      std::size_t max_buffer_size = 64 * 1024,
+                      ResponseWriter<Stream>* continue_writer = nullptr)
         : stream_(stream), input_(input), parser_(parser), io_(std::move(io)),
-          read_chunk_(read_chunk), max_buffer_size_(max_buffer_size) {}
+          read_chunk_(read_chunk), max_buffer_size_(max_buffer_size),
+          writer_(continue_writer), continue_pending_(continue_writer != nullptr) {}
 
     /// Drain whatever the handler left unread.
     ///
@@ -441,6 +487,8 @@ public:
     OperationOptions io_;
     std::size_t read_chunk_;
     std::size_t max_buffer_size_;
+    ResponseWriter<Stream>* writer_{nullptr};
+    bool continue_pending_{false};
     /// Remainder of a body slice that did not fit the caller's buffer, plus
     /// a read cursor: `pending_.size() - pending_pos_` bytes are owed.
     std::vector<std::byte> pending_{};
@@ -463,6 +511,36 @@ concept kHandlerWantsBuffer = requires(Handler handler, Stream& stream) {
             std::declval<std::span<const std::byte>>());
 };
 
+
+enum class RequestExpectation { none, continue_100, unsupported };
+
+/// RFC 9110 §10.1.1: 100-continue is honoured only for HTTP/1.1 requests with
+/// content (HTTP/1.0 expectations are ignored); any other member is refused.
+inline RequestExpectation request_expectation(const Request& request) {
+    if (request.version != Version::http_1_1) return RequestExpectation::none;
+    bool wants_continue = false;
+    for (const auto& [name, value] : request.headers) {
+        if (!HeaderMap::names_equal(name, "Expect")) continue;
+        std::string_view rest{value};
+        for (;;) {
+            const auto comma = rest.find(',');
+            auto member = rest.substr(0, comma);
+            while (!member.empty() && (member.front() == ' ' || member.front() == '\t'))
+                member.remove_prefix(1);
+            while (!member.empty() && (member.back() == ' ' || member.back() == '\t'))
+                member.remove_suffix(1);
+            if (HeaderMap::names_equal(member, "100-continue")) {
+                wants_continue = true;
+            } else if (!member.empty()) {
+                return RequestExpectation::unsupported;
+            }
+            if (comma == std::string_view::npos) break;
+            rest.remove_prefix(comma + 1);
+        }
+    }
+    if (!wants_continue || request.body_kind == BodyKind::none) return RequestExpectation::none;
+    return RequestExpectation::continue_100;
+}
 
 /// Send a minimal error response, used when a request cannot be understood.
 ///
@@ -546,6 +624,7 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         // begun, so it is on the request budget rather than the idle one.
         bool request_started = !input.empty();
         bool body_drained = false;
+        bool continue_pending = false;
         Buffer body;  // accumulated only up to the configured limit
 
         // Whichever window applies right now. Recomputed when the first byte
@@ -578,6 +657,22 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
             switch (*step) {
             case ParseStep::head:
                 head_ready = true;
+                if (const auto expectation = detail::request_expectation(parser.request());
+                    expectation == detail::RequestExpectation::unsupported) {
+                    // Whether content follows is now unknowable; refuse and close.
+                    static_cast<void>(co_await detail::send_error(stream, 417, io));
+                    co_return fail(Errc::not_supported);
+                } else if (expectation == detail::RequestExpectation::continue_100) {
+                    continue_pending = true;
+                }
+                if (buffered_mode && continue_pending) {
+                    // A buffered handler always wants the body: answer now.
+                    constexpr std::string_view interim = "HTTP/1.1 100 Continue\r\n\r\n";
+                    Result<void> sent = co_await write_all(
+                        stream, std::as_bytes(std::span{interim.data(), interim.size()}), io);
+                    if (!sent) co_return fail(sent.error());
+                    continue_pending = false;
+                }
                 if constexpr (buffered_mode) {
                     if (parser.request().body_kind == BodyKind::none) {
                         body_drained = true;
@@ -659,6 +754,7 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         // The handler shares the request budget: a deadline that covered the
         // reading but not the responding would bound half an exchange.
         ResponseWriter<Stream> writer{stream, head_request, keep_alive, io};
+        writer.set_refuses_unread_body(continue_pending);
 
         // A throwing handler is an internal error, not a protocol event: the
         // exception must not escape `serve_connection` (the caller's loop has
@@ -683,8 +779,18 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         if constexpr (detail::kHandlerWantsBuffer<Handler, Stream>) {
             handled = co_await run_handler(body.readable());
         } else {
-            RequestBodyReader<Stream> reader{stream, input, parser, io, options.read_chunk, options.max_buffer_size};
+            RequestBodyReader<Stream> reader{stream, input, parser, io, options.read_chunk,
+                                             options.max_buffer_size,
+                                             continue_pending ? &writer : nullptr};
             handled = co_await run_handler(reader);
+            // A final response sent while 100-continue was unanswered refused
+            // the body: the client will not send it, so draining would wait on
+            // bytes that never come. Finish the response and close instead.
+            if (handled && reader.continue_pending() && writer.sent_head()) {
+                Result<void> refused = co_await writer.finish();
+                if (!refused) co_return fail(refused.error());
+                co_return Result<void>{};
+            }
             // The streaming contract's other half: whatever the handler left
             // unread is drained here (bounded by `limits`, failures included)
             // so the next request starts from trustworthy framing. A drain
