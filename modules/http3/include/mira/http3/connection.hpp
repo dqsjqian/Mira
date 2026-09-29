@@ -61,7 +61,9 @@ public:
     Connection& operator=(const Connection&) = delete;
 
     /// Client: bind the transport and drive the QUIC handshake plus the h3
-    /// control-stream setup to completion.
+    /// control-stream setup to completion. With a compatible 0-RTT ticket
+    /// (EarlyDataPolicy::replay_safe) it returns at once, before any datagram
+    /// is sent, so the first safe request travels in 0-RTT.
     [[nodiscard]] static Task<Result<Connection>>
     connect(EventLoop& loop, quic::Options options, Limits limits = {}, OperationOptions io = {}) {
         if (options.migration != quic::MigrationPolicy::fixed_peer) co_return fail(Errc::not_supported);
@@ -82,12 +84,16 @@ public:
         Connection connection{std::move(*bound), std::move(*engine), limits};
         connection.remote_ = remote;
         auto ready = co_await connection.pump_until(
-            [&](const Connection& self) { return self.engine_->ready(); }, io);
+            [&](const Connection& self) {
+                return self.engine_->ready() || self.engine_->early_ready();
+            },
+            io);
         if (!ready) co_return fail(ready.error());
         co_return std::move(connection);
     }
 
     /// Server: take over the transport that received the QUIC Initial.
+    /// A server that accepted 0-RTT is ready before handshake completion.
     [[nodiscard]] static Task<Result<Connection>> serve(Transport transport,
                                                         quic::Options options,
                                                         Limits limits,
@@ -111,11 +117,27 @@ public:
     }
 
     /// Client: submit a request; the body is copied into the engine's budget.
+    /// While 0-RTT is pending, safe requests go out early; any other request
+    /// first drives the handshake (bounded by `io`) and is then sent in 1-RTT.
     [[nodiscard]] Task<Result<std::int64_t>> request(const Headers& fields,
-                                                     std::span<const std::byte> body = {}) {
+                                                     std::span<const std::byte> body = {},
+                                                     OperationOptions io = {}) {
         if (!engine_) co_return fail(Errc::invalid_argument);
         if (buffer_error_) co_return fail(buffer_error_);
+        if (engine_->early_ready()) {
+            auto early = engine_->request(fields, body);
+            if (early || early.error() != Errc::not_supported) co_return early;
+            if (pumping_) co_return fail(Errc::invalid_argument);
+            pumping_ = true;
+            const PumpGuard guard{pumping_};
+            auto ready = co_await pump_until(
+                [](const Connection& self) { return self.engine_->ready(); }, io);
+            if (!ready) co_return fail(ready.error());
+        }
         co_return engine_->request(fields, body);
+    }
+    [[nodiscard]] bool early_ready() const noexcept {
+        return engine_ && !buffer_error_ && engine_->early_ready();
     }
 
     /// Start an incremental request. Empty output pauses until write_body/finish_body.

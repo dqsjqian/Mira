@@ -133,6 +133,10 @@ struct Options {
     std::string service_scope;
     // Caller declares all early operations replay-safe; rejected data is never replayed automatically.
     EarlyDataPolicy early_data = EarlyDataPolicy::disabled;
+    // Opaque application 0-RTT compatibility state (HTTP/3 uses its SETTINGS). A ServerContext
+    // binds it immutably, so every ticket it issues was issued under identical application
+    // settings; engines sharing the context must match exactly. At most 1024 bytes.
+    std::string early_data_context;
 };
 
 struct SessionCacheLimits {
@@ -232,7 +236,10 @@ public:
     bool session_reused() const noexcept;
     MigrationPolicy migration_policy() const noexcept;
     EarlyDataPolicy early_data_policy() const noexcept;
+    /// Client: ticket-driven attempt result. Server: accepted once 0-RTT keys and the
+    /// 0.5-RTT send key are installed for an early-data ClientHello; otherwise not_attempted.
     EarlyDataStatus early_data_status() const noexcept;
+    const std::string& early_data_context() const noexcept;
     // Requires replay_safe and a compatible ticket; normal open_stream/write never send early data.
     Result<std::int64_t> open_early_stream(bool unidirectional = false);
     Result<void> write_early(std::int64_t stream, std::span<const std::byte> bytes, bool fin);
@@ -250,6 +257,8 @@ public:
     /// The client's original Initial DCID (also available on server engines).
     Bytes initial_destination_cid() const;
     std::string negotiated_protocol() const;
+    /// Requires a completed handshake, except that a server which accepted 0-RTT may open
+    /// streams for 0.5-RTT responses (still bounded by anti-amplification).
     Result<std::int64_t> open_stream(bool unidirectional = false);
     /// Copies and holds data until ACK or stream_close. Backpressure bounds both
     /// total send bytes and 4096 queued chunks across all streams.

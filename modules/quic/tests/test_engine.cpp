@@ -40,8 +40,20 @@ void sessions(const char* certificate, const char* key) {
     so.private_key_file = key;
     so.service_scope = co.service_scope;
     so.early_data = quic::EarlyDataPolicy::replay_safe;
+    so.early_data_context = "app-settings-v1";
     so.server_context = require(quic::ServerContext::create(so));
     std::uint64_t now = 1'000'000'000;
+    {
+        auto probe = co;
+        probe.session_cache.reset();
+        auto drifted = so;
+        drifted.early_data_context = "app-settings-v2";
+        auto initial = require(require(Engine::client(probe, now)).poll(now));
+        check(!Engine::accept(drifted, initial, now), "engine accepted a context its ticket domain did not pin");
+        drifted.early_data_context.assign(1025, 'x');
+        drifted.server_context.reset();
+        check(!quic::ServerContext::create(drifted), "oversized early-data context accepted");
+    }
     for (int attempt = 0; attempt < 6; ++attempt) {
         co.early_data = attempt >= 2 ? quic::EarlyDataPolicy::replay_safe : quic::EarlyDataPolicy::disabled;
         if (attempt == 3) so.early_data = quic::EarlyDataPolicy::disabled;
@@ -81,6 +93,8 @@ void sessions(const char* certificate, const char* key) {
         }
         check(client.handshake_complete() && server.handshake_complete(), "resumption handshake failed");
         check(client.session_reused() == (attempt == 1 || early), "TLS session reuse mismatch");
+        check((server.early_data_status() == quic::EarlyDataStatus::accepted) == (attempt == 2),
+              "server early-data status does not match what TLS accepted");
         if (attempt == 2) check(delivered == payload.size() && before_handshake &&
             client.early_data_status() == quic::EarlyDataStatus::accepted, "real 0RTT was not accepted");
         else check(delivered == 0, "rejected/default-off early data was delivered or replayed");

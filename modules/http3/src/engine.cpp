@@ -11,11 +11,19 @@
 #include <exception>
 #include <map>
 #include <optional>
+#include <set>
 
 namespace Mira::http3 {
 namespace {
 // Engine-owned error codes, placed far away from the native nghttp3 negative-code range to avoid clashing with the dependency.
 constexpr int invalid = -110000;
+constexpr std::size_t qpack_capacity = 4096;
+constexpr std::size_t qpack_blocked = 16;
+
+// RFC 9110 safe methods: the only requests this engine sends in, or surfaces from, 0-RTT.
+bool early_safe(std::string_view method) {
+    return method == "GET" || method == "HEAD" || method == "OPTIONS";
+}
 
 std::string_view field(const Headers& fields, std::string_view name) {
     for (const auto& h : fields) if (h.name == name) return h.value;
@@ -52,6 +60,12 @@ Error http3_error(int code) noexcept {
     static const Http3Category category{};
     return {code, category};
 }
+std::string early_data_context(const Limits& limits) {
+    return "h3-settings-v1;max_field_section_size=" + std::to_string(limits.max_header_bytes) +
+           ";qpack_max_dtable_capacity=" + std::to_string(qpack_capacity) +
+           ";qpack_blocked_streams=" + std::to_string(qpack_blocked) +
+           ";enable_connect_protocol=" + (limits.enable_connect_protocol ? "1" : "0");
+}
 struct Engine::Impl {
     quic::Engine transport;
     bool server;
@@ -59,6 +73,11 @@ struct Engine::Impl {
     nghttp3_conn* conn = nullptr;
     bool failed = false, initialized = false, going = false, remote_going = false;
     bool final_goaway = false, peer_connect = false;
+    // Client: control/QPACK streams and requests were opened as 0-RTT streams.
+    bool early_mode = false;
+    // Server: client bidi streams that carried 0-RTT data, and unsafe ones awaiting 425.
+    std::set<std::int64_t> early_ids;
+    std::vector<std::int64_t> too_early;
     std::uint64_t clock = 0;
     std::size_t output_bytes = 0, input_bytes = 0, header_bytes = 0;
     std::vector<Event> events;
@@ -77,6 +96,10 @@ struct Engine::Impl {
         bool streaming = false, finished = false, body_forbidden = false;
         std::string protocol;
         bool accepted = false, headers_received = false, remote_end = false;
+        // early: sent (client) in 0-RTT. too_early: unsafe 0-RTT request answered 425 (server).
+        bool early = false, too_early = false;
+        // Client 0-RTT request fields, kept until the server accepts or rejects early data.
+        Headers replay;
         Error error;
         std::deque<quic::Bytes> input;
         std::size_t input_offset = 0;
@@ -134,13 +157,30 @@ struct Engine::Impl {
             return 0;
         });
     }
+    void drop_fields(Stream& stream) {
+        header_bytes -= stream.field_bytes;
+        stream.fields.clear();
+        stream.field_bytes = 0;
+    }
     static int end_headers(nghttp3_conn*, std::int64_t id, int, void* p, void*) {
         return guard([&] {
             auto& s = self(p);
             auto& stream = s.streams.at(id);
+            if (stream.too_early) {
+                s.drop_fields(stream);
+                return 0;
+            }
             const auto status = field(stream.fields, ":status");
             const bool informational = !s.server && status.size() == 3 && status.front() == '1';
+            const bool early = s.server ? s.early_ids.contains(id) : stream.early;
             if (!stream.headers_received && !informational) {
+                if (s.server && early && !early_safe(field(stream.fields, ":method"))) {
+                    // RFC 8470: never surface a replayable unsafe request; answer 425 after this read.
+                    s.drop_fields(stream);
+                    stream.headers_received = stream.too_early = true;
+                    s.too_early.push_back(id);
+                    return 0;
+                }
                 if (s.server && field(stream.fields, ":method") == "CONNECT") {
                     if (!s.limits.enable_connect_protocol ||
                         !s.valid_fields(stream.fields, {}, true, true)) {
@@ -167,7 +207,9 @@ struct Engine::Impl {
                 }
                 stream.headers_received = true;
             }
-            return s.push({Event::Kind::headers, id, std::move(stream.fields), {}, 0});
+            Event event{Event::Kind::headers, id, std::move(stream.fields), {}, 0};
+            event.early_data = early;
+            return s.push(std::move(event));
         });
     }
     static int data(nghttp3_conn*,
@@ -181,7 +223,8 @@ struct Engine::Impl {
             if (size > s.limits.max_buffered_body - s.input_bytes)
                 return NGHTTP3_ERR_CALLBACK_FAILURE;
             auto& stream = s.streams.at(id);
-            if (stream.error) return s.transport.consume(id, size) ? 0 : NGHTTP3_ERR_CALLBACK_FAILURE;
+            if (stream.error || stream.too_early)
+                return s.transport.consume(id, size) ? 0 : NGHTTP3_ERR_CALLBACK_FAILURE;
             stream.unread += size;
             s.input_bytes += size;
             quic::Bytes chunk(reinterpret_cast<const std::byte*>(bytes),
@@ -201,9 +244,15 @@ struct Engine::Impl {
     static int end(nghttp3_conn*, std::int64_t id, void* p, void*) {
         return guard([&] {
             auto& s = self(p);
-            s.streams.at(id).remote_end = true;
+            auto& stream = s.streams.at(id);
+            stream.remote_end = true;
+            if (stream.too_early) return 0;
             return s.push({Event::Kind::end, id, {}, {}, 0});
         });
+    }
+    bool hidden(std::int64_t id) const {
+        const auto it = streams.find(id);
+        return it != streams.end() && it->second.too_early;
     }
     static int reset(nghttp3_conn*, std::int64_t id, std::uint64_t code, void* p, void*) {
         return guard([&] {
@@ -211,6 +260,7 @@ struct Engine::Impl {
             if (!s.transport.cancel(id, code)) return NGHTTP3_ERR_CALLBACK_FAILURE;
             auto it = s.streams.find(id);
             if (it != s.streams.end()) it->second.error = std::make_error_code(std::errc::connection_reset);
+            if (s.hidden(id)) return 0;
             return s.push({Event::Kind::reset, id, {}, {}, code});
         });
     }
@@ -244,6 +294,7 @@ struct Engine::Impl {
     static int stream_close(nghttp3_conn*, std::int64_t id, std::uint64_t code, void* p, void*) {
         return guard([&] {
             auto& s = self(p);
+            s.early_ids.erase(id);
             auto it = s.streams.find(id);
             if (it != s.streams.end()) {
                 for (const auto& h : it->second.fields) s.header_bytes -= h.name.size() + h.value.size() + 32;
@@ -290,26 +341,134 @@ struct Engine::Impl {
         }
         return {};
     }
+    int new_conn() {
+        nghttp3_callbacks cb{};
+        cb.begin_headers = begin;
+        cb.recv_header = header;
+        cb.end_headers = end_headers;
+        cb.begin_trailers = begin;
+        cb.recv_trailer = header;
+        cb.end_trailers = end_headers;
+        cb.recv_data = data;
+        cb.deferred_consume = deferred;
+        cb.end_stream = end;
+        cb.stop_sending = reset;
+        cb.reset_stream = reset;
+        cb.shutdown = shutdown;
+        cb.acked_stream_data = ack;
+        cb.stream_close = stream_close;
+        cb.recv_settings2 = [](nghttp3_conn*, const nghttp3_proto_settings* settings, void* p) {
+            self(p).peer_connect = settings->enable_connect_protocol != 0;
+            return 0;
+        };
+        cb.rand = [](std::uint8_t* p, std::size_t n) {
+            // The random source comes from the QUIC module; HTTP/3 does not depend on the TLS backend directly.
+            if (!quic::fill_random(p, n)) std::terminate();
+        };
+        nghttp3_settings settings;
+        nghttp3_settings_default(&settings);
+        // Any change here must be reflected in early_data_context().
+        settings.max_field_section_size = limits.max_header_bytes;
+        settings.qpack_max_dtable_capacity = qpack_capacity;
+        settings.qpack_blocked_streams = qpack_blocked;
+        settings.enable_connect_protocol = server && limits.enable_connect_protocol;
+        return server ? nghttp3_conn_server_new(&conn, &cb, &settings, nullptr, this)
+                      : nghttp3_conn_client_new(&conn, &cb, &settings, nullptr, this);
+    }
     Result<void> initialize() {
-        if (initialized || !transport.handshake_complete()) return {};
-        if (transport.negotiated_protocol() != "h3") {
+        if (initialized) return {};
+        const bool complete = transport.handshake_complete();
+        const auto early = transport.early_data_status();
+        // A client with a ticket opens its control/QPACK streams in 0-RTT; a server that accepted
+        // 0-RTT opens them for 0.5-RTT. ALPN is only known here once the server has chosen it.
+        const bool client_early = !server && !complete && early == quic::EarlyDataStatus::pending;
+        const bool server_early = server && !complete && early == quic::EarlyDataStatus::accepted;
+        if (!complete && !client_early && !server_early) return {};
+        if (!client_early && transport.negotiated_protocol() != "h3") {
             failed = true;
             return std::unexpected(http3_error(invalid));
         }
-        auto control = transport.open_stream(true);
+        const auto open = [&] {
+            return client_early ? transport.open_early_stream(true) : transport.open_stream(true);
+        };
+        auto control = open();
         if (!control) return std::unexpected(control.error());
-        auto enc = transport.open_stream(true);
+        auto enc = open();
         if (!enc) return std::unexpected(enc.error());
-        auto dec = transport.open_stream(true);
+        auto dec = open();
         if (!dec) return std::unexpected(dec.error());
         if (auto r = check(nghttp3_conn_bind_control_stream(conn, *control)); !r) return r;
         if (auto r = check(nghttp3_conn_bind_qpack_streams(conn, *enc, *dec)); !r) return r;
         initialized = true;
+        early_mode = client_early;
+        if (server) nghttp3_conn_set_max_client_streams_bidi(conn, transport.remote_bidi_stream_limit());
+        return {};
+    }
+    Result<void> broken(Error error) {
+        failed = true;
+        return std::unexpected(error);
+    }
+    // Client, at handshake completion after a 0-RTT attempt.
+    Result<void> settle_early() {
+        early_mode = false;
+        if (transport.negotiated_protocol() != "h3") return broken(http3_error(invalid));
+        if (transport.early_data_status() == quic::EarlyDataStatus::accepted) {
+            for (auto& [id, stream] : streams) {
+                (void)id;
+                stream.replay.clear();
+            }
+            return {};
+        }
+        // Rejected: ngtcp2 discarded every early stream and stream-ID allocation, and TLS
+        // guarantees the server processed none of it. Rebuild HTTP/3 under the server's real
+        // SETTINGS and resubmit the safe requests in order, which reproduces their stream IDs.
+        struct Replay {
+            std::int64_t id;
+            Headers fields;
+            quic::Bytes body;
+        };
+        std::vector<Replay> replay;
+        for (auto& [id, stream] : streams) {
+            if (stream.replay.empty()) continue;
+            Replay entry{id, std::move(stream.replay), {}};
+            for (auto& chunk : stream.output) entry.body.insert(entry.body.end(), chunk.begin(), chunk.end());
+            replay.push_back(std::move(entry));
+        }
+        streams.clear();
+        events.clear();
+        early_ids.clear();
+        too_early.clear();
+        output_bytes = input_bytes = header_bytes = 0;
+        peer_connect = remote_going = going = false;
+        nghttp3_conn_del(conn);
+        conn = nullptr;
+        initialized = false;
+        if (const int rv = new_conn(); rv) return broken(http3_error(rv));
+        if (auto r = initialize(); !r) return broken(r.error());
+        for (auto& entry : replay) {
+            auto id = transport.open_stream();
+            if (!id) return broken(id.error());
+            if (*id != entry.id) return broken(http3_error(invalid));
+            streams.try_emplace(*id);
+            if (auto r = submit(*id, entry.fields, entry.body, false); !r) return broken(r.error());
+        }
+        return {};
+    }
+    // Server: 425 for unsafe 0-RTT requests, submitted outside nghttp3 callbacks.
+    Result<void> answer_too_early() {
+        static const Headers fields{{":status", "425"}, {"content-length", "0"}};
+        for (const auto id : std::exchange(too_early, {})) {
+            const auto it = streams.find(id);
+            if (it == streams.end() || it->second.responded || it->second.closed) continue;
+            if (auto r = submit(id, fields, {}, false); !r) return broken(r.error());
+        }
         return {};
     }
     Result<void> process(std::uint64_t now) {
         if (failed || now < clock) return std::unexpected(http3_error(invalid));
         clock = now;
+        if (early_mode && transport.handshake_complete())
+            if (auto r = settle_early(); !r) return r;
         if (auto r = initialize(); !r) return r;
         if (!initialized) return {};
         if (server) nghttp3_conn_set_max_client_streams_bidi(conn, transport.remote_bidi_stream_limit());
@@ -317,6 +476,12 @@ struct Engine::Impl {
             int rv = 0;
             switch (event.kind) {
             case quic::Event::Kind::data: {
+                // Client-initiated bidirectional stream data carried in 0-RTT marks its request early.
+                if (server && event.early_data && (event.stream_id & 0x3) == 0) {
+                    if (!early_ids.contains(event.stream_id) && early_ids.size() >= limits.max_streams)
+                        return broken(make_error_code(Errc::limit_exceeded));
+                    early_ids.insert(event.stream_id);
+                }
                 auto n = nghttp3_conn_read_stream2(
                     conn, event.stream_id,
                     reinterpret_cast<const std::uint8_t*>(event.data.data()),
@@ -340,7 +505,8 @@ struct Engine::Impl {
                 if (auto it = streams.find(event.stream_id); it != streams.end())
                     it->second.error = std::make_error_code(std::errc::connection_reset);
                 rv = nghttp3_conn_shutdown_stream_read(conn, event.stream_id);
-                if (push({Event::Kind::reset, event.stream_id, {}, {}, event.value}))
+                if (!hidden(event.stream_id) &&
+                    push({Event::Kind::reset, event.stream_id, {}, {}, event.value}))
                     rv = NGHTTP3_ERR_CALLBACK_FAILURE;
                 break;
             case quic::Event::Kind::closed:
@@ -351,7 +517,7 @@ struct Engine::Impl {
             }
             if (auto r = check(rv); !r) return r;
         }
-        return {};
+        return answer_too_early();
     }
     Result<void> valid_fields(const Headers& fields, std::span<const std::byte> body, bool streaming,
                               bool request, bool connect_response = false) {
@@ -480,10 +646,6 @@ Engine::~Engine() = default;
 quic::Engine& Engine::transport() noexcept { return impl_->transport; }
 const quic::Engine& Engine::transport() const noexcept { return impl_->transport; }
 Result<Engine> Engine::create(quic::Engine transport, bool server, Limits limits) {
-    // HTTP/3 0-RTT also requires remembered SETTINGS/QPACK state. Raw QUIC's
-    // replay-safe opt-in is not sufficient to authorize early HTTP requests.
-    if (transport.early_data_policy() != quic::EarlyDataPolicy::disabled)
-        return fail(Errc::not_supported);
     if (transport.is_server() != server || transport.closed())
         return std::unexpected(http3_error(invalid));
     if (!limits.max_streams || limits.max_streams > 4096 || !limits.max_headers ||
@@ -492,40 +654,16 @@ Result<Engine> Engine::create(quic::Engine transport, bool server, Limits limits
         limits.max_buffered_body > 64 * 1024 * 1024 || !limits.max_events ||
         limits.max_events > 65536)
         return std::unexpected(http3_error(invalid));
+    // The ServerContext pins early_data_context for every ticket it issues; a server whose
+    // SETTINGS differ from that context could accept 0-RTT sent under incompatible SETTINGS.
+    if (server && transport.early_data_policy() != quic::EarlyDataPolicy::disabled &&
+        transport.early_data_context() != early_data_context(limits))
+        return fail(Errc::invalid_argument);
     auto s = std::make_unique<Impl>(std::move(transport), server, limits);
-    nghttp3_callbacks cb{};
-    cb.begin_headers = Impl::begin;
-    cb.recv_header = Impl::header;
-    cb.end_headers = Impl::end_headers;
-    cb.begin_trailers = Impl::begin;
-    cb.recv_trailer = Impl::header;
-    cb.end_trailers = Impl::end_headers;
-    cb.recv_data = Impl::data;
-    cb.deferred_consume = Impl::deferred;
-    cb.end_stream = Impl::end;
-    cb.stop_sending = Impl::reset;
-    cb.reset_stream = Impl::reset;
-    cb.shutdown = Impl::shutdown;
-    cb.acked_stream_data = Impl::ack;
-    cb.stream_close = Impl::stream_close;
-    cb.recv_settings2 = [](nghttp3_conn*, const nghttp3_proto_settings* settings, void* p) {
-        Impl::self(p).peer_connect = settings->enable_connect_protocol != 0;
-        return 0;
-    };
-    cb.rand = [](std::uint8_t* p, std::size_t n) {
-        // The random source comes from the QUIC module; HTTP/3 does not depend on the TLS backend directly.
-        if (!quic::fill_random(p, n)) std::terminate();
-    };
-    nghttp3_settings settings;
-    nghttp3_settings_default(&settings);
-    settings.max_field_section_size = limits.max_header_bytes;
-    settings.qpack_max_dtable_capacity = 4096;
-    settings.qpack_blocked_streams = 16;
-    settings.enable_connect_protocol = server && limits.enable_connect_protocol;
-    int rv = server ? nghttp3_conn_server_new(&s->conn, &cb, &settings, nullptr, s.get())
-                    : nghttp3_conn_client_new(&s->conn, &cb, &settings, nullptr, s.get());
-    if (rv) return std::unexpected(http3_error(rv));
+    if (const int rv = s->new_conn(); rv) return std::unexpected(http3_error(rv));
     if (server) nghttp3_conn_set_max_client_streams_bidi(s->conn, s->transport.remote_bidi_stream_limit());
+    // Client with a ticket: 0-RTT control streams. Server that accepted 0-RTT: 0.5-RTT setup.
+    if (auto r = s->initialize(); !r) return std::unexpected(r.error());
     return Engine(std::move(s));
 }
 Result<void> Engine::receive(std::span<const std::byte> packet, std::uint64_t now) {
@@ -577,10 +715,10 @@ Result<quic::Packet> Engine::poll_datagram(std::uint64_t now) {
                                          reinterpret_cast<const std::byte*>(part.base),
                                          reinterpret_cast<const std::byte*>(part.base) + count);
             }
-            auto r = s.transport.write(
-                id,
-                std::span<const std::byte>{bytes.data(), bytes.size()},
-                fin != 0 && bytes.size() == available);
+            const std::span<const std::byte> view{bytes.data(), bytes.size()};
+            const bool last = fin != 0 && bytes.size() == available;
+            auto r = s.early_mode ? s.transport.write_early(id, view, last)
+                                  : s.transport.write(id, view, last);
             if (!r) {
                 // -100001 is the QUIC engine's send-budget backpressure: pause output this round and retry on the next poll.
                 if (r.error() == Errc::would_block || r.error().value() == -100001) break;
@@ -607,7 +745,10 @@ std::uint64_t Engine::expiry() const noexcept {
     return impl_->transport.expiry();
 }
 bool Engine::ready() const noexcept {
-    return impl_->initialized && !impl_->failed;
+    return impl_->initialized && !impl_->failed && !impl_->early_mode;
+}
+bool Engine::early_ready() const noexcept {
+    return impl_->initialized && !impl_->failed && impl_->early_mode;
 }
 bool Engine::closed() const noexcept {
     return impl_->transport.closed() || impl_->failed;
@@ -627,15 +768,20 @@ Result<std::int64_t> Engine::request_stream(const Headers& fields) {
 Result<std::int64_t> Engine::request_impl(const Headers& fields, std::span<const std::byte> body,
                                          bool streaming) {
     auto& s = *impl_;
-    if (!ready() || s.server || s.going || s.remote_going ||
+    const bool early = early_ready();
+    if (!(ready() || early) || s.server || s.going || s.remote_going ||
         s.streams.size() >= s.limits.max_streams)
         return std::unexpected(http3_error(invalid));
     if (auto r = s.valid_fields(fields, body, streaming, true); !r) return std::unexpected(r.error());
     const auto protocol = field(fields, ":protocol");
     if (!protocol.empty() && (!streaming || !s.peer_connect)) return fail(Errc::not_supported);
-    auto id = s.transport.open_stream();
+    if (early && (streaming || !early_safe(field(fields, ":method")))) return fail(Errc::not_supported);
+    auto id = early ? s.transport.open_early_stream() : s.transport.open_stream();
     if (!id) return std::unexpected(id.error());
-    s.streams.try_emplace(*id).first->second.protocol = protocol;
+    auto& stream = s.streams.try_emplace(*id).first->second;
+    stream.protocol = protocol;
+    stream.early = early;
+    if (early) stream.replay = fields;
     if (auto r = s.submit(*id, fields, body, streaming); !r) {
         s.streams.erase(*id);
         static_cast<void>(s.transport.cancel(*id, NGHTTP3_H3_REQUEST_CANCELLED));

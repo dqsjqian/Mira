@@ -25,6 +25,11 @@ struct Limits {
     std::size_t max_streams = 64;
     bool enable_connect_protocol = false;
 };
+/// Canonical SETTINGS this engine advertises for `limits`. A server enabling 0-RTT must put this
+/// into quic::Options::early_data_context before creating its ServerContext: every ticket the
+/// context issues then carries identical SETTINGS, so 0-RTT is only accepted when a client's
+/// remembered SETTINGS are still compatible (RFC 9114 section 7.2.4.2).
+[[nodiscard]] std::string early_data_context(const Limits& limits);
 struct ConnectState {
     std::string protocol;
     bool accepted = false;
@@ -39,9 +44,21 @@ struct Event {
     Headers fields;
     quic::Bytes data;
     std::uint64_t error_code = 0;
+    /// Headers only. Server: the request arrived in 0-RTT and may be a replay (RFC 8470); answer
+    /// 425 if processing it twice is unsafe. Client: the request was sent and accepted in 0-RTT.
+    bool early_data = false;
 };
 /// HTTP/3 state machine owning a QUIC engine; h3 ALPN only, no server push.
 /// Extended CONNECT is opt-in and waits for the server's actual SETTINGS.
+///
+/// 0-RTT (quic EarlyDataPolicy::replay_safe on both ends). A client holding a compatible ticket is
+/// early_ready() right after create: request() then sends GET/HEAD/OPTIONS whole-body requests in
+/// 0-RTT under default SETTINGS (nothing is remembered, which RFC 9114 permits); other methods,
+/// streaming and extended CONNECT return not_supported until ready(). If the server rejects 0-RTT,
+/// TLS guarantees it processed none of them, and the engine resubmits them after the handshake on
+/// the same stream IDs. A server that accepted 0-RTT becomes ready() before handshake completion
+/// and answers in 0.5-RTT; early requests with unsafe methods are answered 425 (Too Early)
+/// automatically and never surfaced. There is no anti-replay guarantee for surfaced early requests.
 /// The pinned dependency treats 204 as bodyless; 204 tunnels are explicitly unsupported.
 /// Incoming body is delivered in chunks and the window is restored via consume. Outgoing chunks
 /// remain stable until acknowledged; max_buffered_body bounds the connection-wide retained body.
@@ -58,6 +75,8 @@ public:
     Result<void> handle_expiry(std::uint64_t now);
     std::uint64_t expiry() const noexcept;
     bool ready() const noexcept;
+    /// Client only: 0-RTT is pending and early-eligible requests may be submitted.
+    bool early_ready() const noexcept;
     bool peer_goaway() const noexcept;
     bool is_server() const noexcept;
     bool closed() const noexcept;

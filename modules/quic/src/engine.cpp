@@ -382,6 +382,7 @@ struct Engine::Impl {
     Path validated;
     std::optional<Path> probing;
     EarlyDataStatus early_status = EarlyDataStatus::not_attempted;
+    bool early_rx_key = false, application_tx_key = false;
     std::string session_key;
     ngtcp2_cid original_dcid{};
     bool failed = false;
@@ -622,6 +623,26 @@ struct Engine::Impl {
         } catch (...) { /* Cache failure must not invalidate an authenticated connection. */ }
         return 0;
     }
+    // A server accepts 0-RTT only when TLS accepted early data, the 0-RTT read key is
+    // installed and the 1-RTT write key exists for 0.5-RTT responses.
+    void settle_server_early() {
+        if (options.server && early_status == EarlyDataStatus::not_attempted && early_rx_key &&
+            application_tx_key && options.early_data == EarlyDataPolicy::replay_safe &&
+            SSL_get_early_data_status(ssl) == SSL_EARLY_DATA_ACCEPTED)
+            early_status = EarlyDataStatus::accepted;
+    }
+    static int rx_key(ngtcp2_conn*, ngtcp2_encryption_level level, void* p) {
+        auto& s = self(p);
+        if (level == NGTCP2_ENCRYPTION_LEVEL_0RTT) s.early_rx_key = true;
+        s.settle_server_early();
+        return 0;
+    }
+    static int tx_key(ngtcp2_conn*, ngtcp2_encryption_level level, void* p) {
+        auto& s = self(p);
+        if (level == NGTCP2_ENCRYPTION_LEVEL_1RTT) s.application_tx_key = true;
+        s.settle_server_early();
+        return 0;
+    }
     static int handshake_done(ngtcp2_conn* conn, void* p) {
         auto& s = self(p);
         if (s.early_status != EarlyDataStatus::pending) return 0;
@@ -665,7 +686,7 @@ Result<std::shared_ptr<ServerContext>> ServerContext::create(Options options, st
         options.alpn.size() > 255 || options.alpn.find('\0') != std::string::npos ||
         !lifetime || lifetime > 86400 || options.server_context || options.session_cache ||
         !options.max_streams || options.max_streams > 4096 || options.max_buffered_bytes < 4096 ||
-        options.max_buffered_bytes > 64 * 1024 * 1024 ||
+        options.max_buffered_bytes > 64 * 1024 * 1024 || options.early_data_context.size() > 1024 ||
         (options.early_data != EarlyDataPolicy::disabled && options.early_data != EarlyDataPolicy::replay_safe))
         return std::unexpected(quic_error(invalid));
     auto impl = std::make_unique<Impl>();
@@ -717,6 +738,7 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
         (options.early_data != EarlyDataPolicy::disabled && options.early_data != EarlyDataPolicy::replay_safe) ||
         options.peer_name.size() > 253 || options.ca_file.size() > 4096 ||
         options.service_scope.size() > 128 || options.service_scope.find('\0') != std::string::npos ||
+        options.early_data_context.size() > 1024 ||
         ((options.session_cache || options.server_context) && options.service_scope.empty()) ||
         (options.server && options.session_cache) || (!options.server && options.server_context) ||
         (options.early_data != EarlyDataPolicy::disabled &&
@@ -756,6 +778,8 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
     ngtcp2_callbacks cb{};
     cb.client_initial = ngtcp2_crypto_client_initial_cb;
     cb.handshake_completed = Impl::handshake_done;
+    cb.recv_rx_key = Impl::rx_key;
+    cb.recv_tx_key = Impl::tx_key;
     cb.recv_client_initial = ngtcp2_crypto_recv_client_initial_cb;
     cb.recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb;
     cb.encrypt = ngtcp2_crypto_encrypt_cb;
@@ -853,6 +877,7 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
             bound.service_scope != s->options.service_scope ||
             bound.max_streams != s->options.max_streams ||
             bound.max_buffered_bytes != s->options.max_buffered_bytes ||
+            bound.early_data_context != s->options.early_data_context ||
             (s->options.early_data == EarlyDataPolicy::replay_safe &&
              bound.early_data != EarlyDataPolicy::replay_safe) || SSL_CTX_up_ref(context.ctx) != 1)
             return std::unexpected(quic_error(invalid));
@@ -1110,6 +1135,7 @@ bool Engine::session_reused() const noexcept { return SSL_session_reused(impl_->
 MigrationPolicy Engine::migration_policy() const noexcept { return impl_->options.migration; }
 EarlyDataPolicy Engine::early_data_policy() const noexcept { return impl_->options.early_data; }
 EarlyDataStatus Engine::early_data_status() const noexcept { return impl_->early_status; }
+const std::string& Engine::early_data_context() const noexcept { return impl_->options.early_data_context; }
 Result<std::int64_t> Engine::open_early_stream(bool uni) {
     auto& s = *impl_;
     if (s.failed || s.ended || s.handshake_ready() || s.early_status != EarlyDataStatus::pending)
@@ -1178,7 +1204,8 @@ std::string Engine::negotiated_protocol() const {
 }
 Result<std::int64_t> Engine::open_stream(bool uni) {
     auto& s = *impl_;
-    if (s.failed || s.ended || !handshake_complete())
+    const bool half_rtt = s.options.server && s.early_status == EarlyDataStatus::accepted;
+    if (s.failed || s.ended || !(handshake_complete() || half_rtt))
         return std::unexpected(quic_error(invalid));
     if (!s.capacity()) return std::unexpected(quic_error(budget));
     std::int64_t id;

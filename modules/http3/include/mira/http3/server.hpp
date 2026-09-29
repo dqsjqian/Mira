@@ -30,6 +30,10 @@ inline Result<Server> make_server(quic::Options options,
         limits.max_buffered_body > 64 * 1024 * 1024 || !limits.max_events ||
         limits.max_events > 65536)
         return std::unexpected(http3_error(-110000));
+    // 0-RTT: the shared ServerContext must have been created with these exact SETTINGS.
+    if (options.early_data != quic::EarlyDataPolicy::disabled &&
+        options.early_data_context != early_data_context(limits))
+        return fail(Errc::invalid_argument);
     auto factory = [limits](quic::Options transport, std::span<const std::byte> initial,
                             std::uint64_t now) -> Result<Engine> {
         auto accepted = quic::Engine::accept(std::move(transport), initial, now);
