@@ -87,6 +87,8 @@ jobs:
         run: |
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
           echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          brew list mosquitto >/dev/null 2>&1 || brew install mosquitto
+          echo "MIRA_REQUIRE_MOSQUITTO=1" >> "$GITHUB_ENV"
       - name: Install OpenSSL on Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -188,6 +190,8 @@ jobs:
         run: |
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
           echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          brew list mosquitto >/dev/null 2>&1 || brew install mosquitto
+          echo "MIRA_REQUIRE_MOSQUITTO=1" >> "$GITHUB_ENV"
       - name: Configure with ASan + UBSan and TLS
         run: >
           cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=Debug
@@ -239,6 +243,8 @@ jobs:
           ./build/fuzz/fuzz/fuzz_ws_handshake
           -max_total_time=60 -max_len=16384 -rss_limit_mb=2560 &&
           ./build/fuzz/fuzz/fuzz_ws_compression
+          -max_total_time=60 -max_len=4096 -rss_limit_mb=2560 &&
+          ./build/fuzz/fuzz/fuzz_mqtt_packet
           -max_total_time=60 -max_len=4096 -rss_limit_mb=2560
 
   # Run the official RFC6455 and RFC7692 corpus against both roles.
@@ -284,9 +290,11 @@ jobs:
       - name: Install protocol toolchain on Linux
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev g++-14
+          sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev g++-14 mosquitto
           echo "CC=gcc-14" >> "$GITHUB_ENV"
           echo "CXX=g++-14" >> "$GITHUB_ENV"
+          # mqtt.interop must reach the third-party broker, not skip it.
+          echo "MIRA_REQUIRE_MOSQUITTO=1" >> "$GITHUB_ENV"
       - name: Build OpenSSL 3.5 for QUIC (Linux)
         if: runner.os == 'Linux'
         # The distro OpenSSL (3.0) predates SSL_set_quic_tls_cbs, which the
@@ -310,6 +318,8 @@ jobs:
         run: |
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
           echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          brew list mosquitto >/dev/null 2>&1 || brew install mosquitto
+          echo "MIRA_REQUIRE_MOSQUITTO=1" >> "$GITHUB_ENV"
       - name: Build pinned protocol dependencies
         run: python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
       - name: Build independent HTTP3 curl (Linux)

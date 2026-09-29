@@ -69,7 +69,7 @@ def main():
     args = parser.parse_args()
     build = args.build_dir.resolve()
     cache = cache_values(build)
-    installed = ['core', 'transport', 'http', 'client', 'socks', 'dns']
+    installed = ['core', 'transport', 'http', 'client', 'socks', 'dns', 'mqtt']
     for component, option in [('tls', 'TLS'), ('ws', 'WEBSOCKET'), ('http2', 'HTTP2'), ('http3', 'HTTP3')]:
         if cache.get('MIRA_ENABLE_' + option) == 'ON':
             installed.append(component)
@@ -190,6 +190,18 @@ int main() {
     auto address = Mira::socks::Address::parse("::ffff:192.0.2.1", 1080);
     if (!address || address->kind() != Mira::socks::Address::Kind::ipv6) return 1;
     return address->to_string() == "[::ffff:192.0.2.1]:1080" ? 0 : 2;
+}
+''')
+        case('mqtt-api', 'COMPONENTS mqtt', links='mqtt', hidden=True, source='''
+#include <mira/mqtt/session.hpp>
+int main() {
+    Mira::mqtt::ClientOptions options;
+    options.client_id = "consumer";
+    auto session = Mira::mqtt::Session::create(options);
+    if (!session || !session->connect(0)) return 1;
+    auto wire = session->take_output(0);
+    auto decoded = Mira::mqtt::decode(wire, Mira::mqtt::Version::v5, Mira::mqtt::Role::server);
+    return decoded && decoded->packet && Mira::mqtt::topic_matches("a/+", "a/b") ? 0 : 2;
 }
 ''')
         case('client-api', 'COMPONENTS client', links='client', hidden=True, source='''

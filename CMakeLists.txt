@@ -134,6 +134,7 @@ add_subdirectory(modules/transport)
 add_subdirectory(modules/http)
 add_subdirectory(modules/socks)
 add_subdirectory(modules/dns)
+add_subdirectory(modules/mqtt)
 
 if(MIRA_ENABLE_TLS)
     add_subdirectory(modules/tls)
@@ -204,8 +205,10 @@ if(MIRA_BUILD_EXAMPLES)
     target_link_libraries(mira_doh_server PRIVATE Mira::dns Mira::socks Mira::transport Mira::warnings)
     add_executable(mira_doh_client examples/doh_client.cpp)
     target_link_libraries(mira_doh_client PRIVATE Mira::dns Mira::transport Mira::warnings)
+    add_executable(mira_mqtt_client examples/mqtt_client.cpp)
+    target_link_libraries(mira_mqtt_client PRIVATE Mira::mqtt Mira::transport Mira::warnings)
     if(MIRA_ENABLE_TLS)
-        foreach(example IN ITEMS mira_doh_server mira_doh_client)
+        foreach(example IN ITEMS mira_doh_server mira_doh_client mira_mqtt_client)
             target_link_libraries(${example} PRIVATE Mira::tls)
             target_compile_definitions(${example} PRIVATE MIRA_EXAMPLE_TLS=1)
         endforeach()
@@ -296,6 +299,10 @@ if(MIRA_BUILD_EXAMPLES)
                     --client $<TARGET_FILE:mira_doh_client>
                     --http-server $<TARGET_FILE:mira_hello_world_server> ${mira_doh_tls_flag})
             set_tests_properties(dns.interop PROPERTIES TIMEOUT 120)
+            add_test(NAME mqtt.interop
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_mqtt.py
+                    --client $<TARGET_FILE:mira_mqtt_client>)
+            set_tests_properties(mqtt.interop PROPERTIES TIMEOUT 180)
             if(TARGET mira_https_managed_server)
                 add_test(NAME mira_managed_https
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_managed_https.py
