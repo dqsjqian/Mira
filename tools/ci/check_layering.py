@@ -58,21 +58,21 @@ LAYERS: dict[str, tuple[str, ...]] = {
     "tls": ("tls",),
     "crypto": ("crypto",),
     "quic": ("quic",),
-    "protocol": ("http_common", "http", "http2", "http3", "ws", "h2", "h3", "dns"),
+    "protocol": ("http_common", "http", "http2", "http3", "ws", "h2", "h3", "dns", "socks", "mqtt"),
 }
 
 # Layer -> include path prefixes it is not allowed to reach for.
 FORBIDDEN_INCLUDES: dict[str, tuple[str, ...]] = {
-    "core": ("mira/client/", "mira/crypto/", "mira/tls/", "openssl/", "mira/transport/", "mira/http/", "mira/ws/",
+    "core": ("mira/socks/", "mira/mqtt/", "mira/client/", "mira/crypto/", "mira/tls/", "openssl/", "mira/transport/", "mira/http/", "mira/ws/",
              "mira/h2/", "mira/h3/", "mira/dns/", "mira/http2/", "mira/http3/",
              "mira/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
-    "transport": ("mira/client/", "mira/tls/", "openssl/", "mira/http/", "mira/ws/", "mira/h2/",
+    "transport": ("mira/socks/", "mira/mqtt/", "mira/client/", "mira/tls/", "openssl/", "mira/http/", "mira/ws/", "mira/h2/",
                   "mira/h3/", "mira/dns/", "mira/http2/", "mira/http3/",
                   "mira/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
-    "crypto": ("mira/client/", "mira/transport/", "mira/tls/", "mira/http/", "mira/ws/", "mira/quic/"),
-    "tls": ("mira/client/", "mira/transport/", "mira/http/", "mira/ws/", "mira/h2/",
+    "crypto": ("mira/socks/", "mira/mqtt/", "mira/client/", "mira/transport/", "mira/tls/", "mira/http/", "mira/ws/", "mira/quic/"),
+    "tls": ("mira/socks/", "mira/mqtt/", "mira/client/", "mira/transport/", "mira/http/", "mira/ws/", "mira/h2/",
             "mira/h3/", "mira/dns/", "mira/http2/", "mira/http3/", "mira/quic/"),
-    "quic": ("mira/client/", "mira/http/", "mira/http2/", "mira/http3/", "mira/h2/",
+    "quic": ("mira/socks/", "mira/mqtt/", "mira/client/", "mira/http/", "mira/http2/", "mira/http3/", "mira/h2/",
              "mira/h3/", "nghttp2/", "nghttp3/"),
     "protocol": ("openssl/", "mira/tls/", "mira/transport/", "mira/client/"),
     "composition": ("openssl/", "ngtcp2/", "nghttp3/", "nghttp2/"),

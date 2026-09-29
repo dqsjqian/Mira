@@ -19,7 +19,7 @@ endif()
 
 # Instrument the actual parsers, not only the harness. Ordinary test binaries
 # retain their own entry points; installed consumers do not inherit these flags.
-set(mira_fuzz_libraries mira_core mira_http)
+set(mira_fuzz_libraries mira_core mira_http mira_socks)
 if(MIRA_ENABLE_WEBSOCKET)
     list(APPEND mira_fuzz_libraries mira_ws)
 endif()
@@ -42,6 +42,14 @@ target_link_libraries(fuzz_response_parser
 target_compile_features(fuzz_response_parser PRIVATE cxx_std_23)
 target_compile_options(fuzz_response_parser PRIVATE -fsanitize=fuzzer)
 target_link_options(fuzz_response_parser PRIVATE -fsanitize=fuzzer)
+
+foreach(harness IN ITEMS socks_handshake)
+    add_executable(fuzz_${harness} ${harness}.cpp)
+    target_link_libraries(fuzz_${harness} PRIVATE Mira::socks Mira::warnings)
+    target_compile_features(fuzz_${harness} PRIVATE cxx_std_23)
+    target_compile_options(fuzz_${harness} PRIVATE -fsanitize=fuzzer)
+    target_link_options(fuzz_${harness} PRIVATE -fsanitize=fuzzer)
+endforeach()
 
 if(MIRA_ENABLE_WEBSOCKET)
     foreach(harness IN ITEMS ws_parser ws_handshake ws_compression)

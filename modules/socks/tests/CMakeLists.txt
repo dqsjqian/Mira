@@ -1,0 +1,5 @@
+add_executable(mira_socks_tests test_socks5.cpp)
+target_link_libraries(mira_socks_tests PRIVATE Mira::client Mira::transport Mira::warnings)
+target_include_directories(mira_socks_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+add_test(NAME socks.protocol COMMAND mira_socks_tests)
+set_tests_properties(socks.protocol PROPERTIES TIMEOUT 60)

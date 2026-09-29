@@ -69,7 +69,7 @@ def main():
     args = parser.parse_args()
     build = args.build_dir.resolve()
     cache = cache_values(build)
-    installed = ['core', 'transport', 'http', 'client']
+    installed = ['core', 'transport', 'http', 'client', 'socks']
     for component, option in [('tls', 'TLS'), ('ws', 'WEBSOCKET'), ('http2', 'HTTP2'), ('http3', 'HTTP3')]:
         if cache.get('MIRA_ENABLE_' + option) == 'ON':
             installed.append(component)
@@ -182,6 +182,14 @@ int main() {
     frame.payload.assign(1024, std::byte{0x61});
     auto compressed = codec->encode(frame);
     return compressed && compressed->compressed && compressed->payload.size() < frame.payload.size() ? 0 : 2;
+}
+''')
+        case('socks-api', 'COMPONENTS socks', links='socks', hidden=True, source='''
+#include <mira/socks/socks5.hpp>
+int main() {
+    auto address = Mira::socks::Address::parse("::ffff:192.0.2.1", 1080);
+    if (!address || address->kind() != Mira::socks::Address::Kind::ipv6) return 1;
+    return address->to_string() == "[::ffff:192.0.2.1]:1080" ? 0 : 2;
 }
 ''')
         case('client-api', 'COMPONENTS client', links='client', hidden=True, source='''

@@ -132,6 +132,7 @@ add_subdirectory(modules/core)
 add_subdirectory(modules/http_common)
 add_subdirectory(modules/transport)
 add_subdirectory(modules/http)
+add_subdirectory(modules/socks)
 
 if(MIRA_ENABLE_TLS)
     add_subdirectory(modules/tls)
@@ -194,6 +195,10 @@ if(MIRA_BUILD_EXAMPLES)
     target_link_libraries(mira_http1_client PRIVATE Mira::http Mira::transport Mira::warnings)
     add_executable(mira_sse_server examples/sse_server.cpp)
     target_link_libraries(mira_sse_server PRIVATE Mira::http Mira::transport Mira::warnings)
+    add_executable(mira_socks5_server examples/socks5_server.cpp)
+    target_link_libraries(mira_socks5_server PRIVATE Mira::socks Mira::transport Mira::warnings)
+    add_executable(mira_socks5_client examples/socks5_client.cpp)
+    target_link_libraries(mira_socks5_client PRIVATE Mira::client Mira::warnings)
 
     if(MIRA_ENABLE_WEBSOCKET)
         foreach(example IN ITEMS ws_server ws_client ws_autobahn_server ws_autobahn_client ws_extensions_peer)
@@ -260,6 +265,12 @@ if(MIRA_BUILD_EXAMPLES)
                     $<TARGET_FILE:mira_tiny_file_server>
             )
             set_tests_properties(mira_tiny_file_server_example PROPERTIES TIMEOUT 120)
+            add_test(NAME socks.interop
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_socks5.py
+                    --proxy $<TARGET_FILE:mira_socks5_server>
+                    --client $<TARGET_FILE:mira_socks5_client>
+                    --http-server $<TARGET_FILE:mira_hello_world_server>)
+            set_tests_properties(socks.interop PROPERTIES TIMEOUT 90)
             if(TARGET mira_https_managed_server)
                 add_test(NAME mira_managed_https
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_managed_https.py
