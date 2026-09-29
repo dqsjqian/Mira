@@ -69,7 +69,7 @@ def main():
     args = parser.parse_args()
     build = args.build_dir.resolve()
     cache = cache_values(build)
-    installed = ['core', 'transport', 'http', 'client', 'socks']
+    installed = ['core', 'transport', 'http', 'client', 'socks', 'dns']
     for component, option in [('tls', 'TLS'), ('ws', 'WEBSOCKET'), ('http2', 'HTTP2'), ('http3', 'HTTP3')]:
         if cache.get('MIRA_ENABLE_' + option) == 'ON':
             installed.append(component)

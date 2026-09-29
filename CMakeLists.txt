@@ -133,6 +133,7 @@ add_subdirectory(modules/http_common)
 add_subdirectory(modules/transport)
 add_subdirectory(modules/http)
 add_subdirectory(modules/socks)
+add_subdirectory(modules/dns)
 
 if(MIRA_ENABLE_TLS)
     add_subdirectory(modules/tls)
@@ -199,6 +200,16 @@ if(MIRA_BUILD_EXAMPLES)
     target_link_libraries(mira_socks5_server PRIVATE Mira::socks Mira::transport Mira::warnings)
     add_executable(mira_socks5_client examples/socks5_client.cpp)
     target_link_libraries(mira_socks5_client PRIVATE Mira::client Mira::warnings)
+    add_executable(mira_doh_server examples/doh_server.cpp)
+    target_link_libraries(mira_doh_server PRIVATE Mira::dns Mira::socks Mira::transport Mira::warnings)
+    add_executable(mira_doh_client examples/doh_client.cpp)
+    target_link_libraries(mira_doh_client PRIVATE Mira::dns Mira::transport Mira::warnings)
+    if(MIRA_ENABLE_TLS)
+        foreach(example IN ITEMS mira_doh_server mira_doh_client)
+            target_link_libraries(${example} PRIVATE Mira::tls)
+            target_compile_definitions(${example} PRIVATE MIRA_EXAMPLE_TLS=1)
+        endforeach()
+    endif()
 
     if(MIRA_ENABLE_WEBSOCKET)
         foreach(example IN ITEMS ws_server ws_client ws_autobahn_server ws_autobahn_client ws_extensions_peer)
@@ -271,6 +282,20 @@ if(MIRA_BUILD_EXAMPLES)
                     --client $<TARGET_FILE:mira_socks5_client>
                     --http-server $<TARGET_FILE:mira_hello_world_server>)
             set_tests_properties(socks.interop PROPERTIES TIMEOUT 90)
+            set(mira_doh_tls_flag "")
+            if(MIRA_ENABLE_TLS)
+                find_program(MIRA_DOH_OPENSSL openssl HINTS "${OPENSSL_ROOT_DIR}/bin")
+                set(mira_doh_tls_flag --tls)
+                if(MIRA_DOH_OPENSSL)
+                    list(APPEND mira_doh_tls_flag --openssl "${MIRA_DOH_OPENSSL}")
+                endif()
+            endif()
+            add_test(NAME dns.interop
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_doh.py
+                    --server $<TARGET_FILE:mira_doh_server>
+                    --client $<TARGET_FILE:mira_doh_client>
+                    --http-server $<TARGET_FILE:mira_hello_world_server> ${mira_doh_tls_flag})
+            set_tests_properties(dns.interop PROPERTIES TIMEOUT 120)
             if(TARGET mira_https_managed_server)
                 add_test(NAME mira_managed_https
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_managed_https.py
