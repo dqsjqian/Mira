@@ -61,8 +61,13 @@ target_link_libraries(my_app PRIVATE Mira::transport Mira::http)
 ## Release verification
 
 Prepare version and changelog changes, compile the installed SDK consumer, and
-push the candidate commit. Check every CI job and review warnings. Only after
-that exact commit passes CI, create its tag and Release. Package the tagged
-source tree, attach the archive and `SHA256SUMS`, then download and verify both.
-Release notes link the successful CI run and describe remaining validation
-limits. A green historical run does not certify a newer commit.
+push the candidate commit. Check every CI job and review warnings. Code, build
+configuration and verification-tool changes require a successful run for that
+candidate before tagging and publishing. A follow-up changing only Markdown
+may reuse that passing run: verify the complete diff contains only Markdown
+files and record both the tested commit and the release commit in the notes.
+
+Package the tagged source tree, attach the archive and `SHA256SUMS`, then
+download and verify both. Release notes link the successful CI run and describe
+remaining validation limits. A historical run does not certify later code or
+build changes.

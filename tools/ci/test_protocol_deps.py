@@ -45,6 +45,62 @@ class InteropConfigurationTests(unittest.TestCase):
         self.assertFalse(any("STATICLIB" in item or "SCHANNEL" in item for item in flags))
 
 
+class ProtocolDebugSymbolsTests(unittest.TestCase):
+    def test_symbols_survive_temporary_build_cleanup_beside_archives(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prefix = root / "prefix"
+            library_dir = prefix / "lib"
+            library_dir.mkdir(parents=True)
+            names = ("nghttp2_static", "nghttp3_static", "ngtcp2_static",
+                     "ngtcp2_crypto_ossl_static")
+            with tempfile.TemporaryDirectory(dir=root) as staging:
+                build = Path(staging)
+                for name in names:
+                    (library_dir / f"{name}.lib").write_bytes(b"installed archive")
+                    symbols = build / name / "Debug" / f"{name}.pdb"
+                    symbols.parent.mkdir(parents=True)
+                    symbols.write_bytes((name + " compiler debug information").encode())
+                (build / "unrelated.pdb").write_bytes(b"CMake compiler probe")
+                deps.install_compile_pdbs(build, prefix)
+            self.assertFalse(build.exists())
+            for name in names:
+                self.assertEqual((library_dir / f"{name}.pdb").read_bytes(),
+                                 (name + " compiler debug information").encode())
+            self.assertFalse((library_dir / "unrelated.pdb").exists())
+
+    def test_no_pdb_required_for_release_or_mingw(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build = root / "build"
+            build.mkdir()
+            prefix = root / "prefix"
+            library_dir = prefix / "lib"
+            library_dir.mkdir(parents=True)
+            (library_dir / "nghttp2_static.lib").write_bytes(b"release archive")
+            (library_dir / "libnghttp3_static.a").write_bytes(b"MinGW archive")
+            deps.install_compile_pdbs(build, prefix)
+            self.assertEqual(len(list(library_dir.iterdir())), 2)
+
+    def test_ambiguous_symbols_do_not_replace_installed_symbols(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prefix = root / "prefix"
+            library_dir = prefix / "lib"
+            library_dir.mkdir(parents=True)
+            (library_dir / "nghttp2_static.lib").write_bytes(b"archive")
+            installed = library_dir / "nghttp2_static.pdb"
+            installed.write_bytes(b"previous symbols")
+            build = root / "build"
+            for config in ("Debug", "RelWithDebInfo"):
+                directory = build / config
+                directory.mkdir(parents=True)
+                (directory / installed.name).write_bytes(config.encode())
+            with self.assertRaisesRegex(ValueError, "Ambiguous compiler PDB"):
+                deps.install_compile_pdbs(build, prefix)
+            self.assertEqual(installed.read_bytes(), b"previous symbols")
+
+
 class ProtocolArchiveTests(unittest.TestCase):
     def test_rejects_unsafe_members_before_writing(self):
         root = "ngtcp2-test"

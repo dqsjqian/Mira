@@ -151,6 +151,26 @@ def run(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
+def install_compile_pdbs(build: Path, prefix: Path) -> None:
+    # The pinned projects give each MSVC compiler PDB the static target's name,
+    # but their install rules only copy the archive. Preserve those PDBs beside
+    # the installed .lib before the temporary build tree is removed, so LINK
+    # retains dependency debug information instead of reporting LNK4099.
+    # Release and MinGW archives do not necessarily have compiler PDBs.
+    library_dir = prefix / "lib"
+    copies = []
+    for archive in sorted(library_dir.glob("*_static.lib")):
+        filename = archive.with_suffix(".pdb").name
+        matches = sorted(build.rglob(filename))
+        if len(matches) > 1:
+            raise ValueError(f"Ambiguous compiler PDB for {archive.name}: {matches}")
+        if matches:
+            copies.append((matches[0], library_dir / filename))
+    for source, destination in copies:
+        shutil.copyfile(source, destination)
+        print(f"Installed compiler debug symbols: {destination}", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--path", type=Path, default=REPO / "build/protocol-deps",
@@ -226,6 +246,8 @@ def main() -> None:
                     raise ValueError("the ngtcp2 ossl backend requires SSL_set_quic_tls_cbs from OpenSSL 3.5+")
             run(["cmake", "--build", str(build), "--config", args.config, "--parallel", str(args.jobs)])
             run(["cmake", "--install", str(build), "--config", args.config])
+            if sys.platform == "win32":
+                install_compile_pdbs(build, prefix)
             license_dir = prefix / "share/licenses" / name
             license_dir.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source / "COPYING", license_dir / "COPYING")

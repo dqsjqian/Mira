@@ -37,12 +37,12 @@ and remaining acceptance work must be described separately.
 
 | Concern | Current foundation | Remaining acceptance work |
 |---|---|---|
-| Execution and ownership | Lazy, move-only `Task` and single-threaded `TaskScope`; reliable continuation posting separate from bounded application admission; `LoopGroup` owns independent thread-affine loops and bounded root tasks | Continued cross-layer join/drain validation; attached sockets cannot migrate between workers; loop destruction during dispatch is refused |
+| Execution and ownership | Lazy, move-only `Task` with constant-stack inline-completion loops and single-threaded `TaskScope`; reliable continuation posting separate from bounded application admission; `LoopGroup` owns independent thread-affine loops and bounded root tasks | Continued cross-layer join/drain validation; attached sockets cannot migrate between workers; loop destruction during dispatch is refused |
 | Cancellation and deadlines | `OperationOptions` on core/TCP/HTTP operations; TLS owns independent loop timers for each application request without rearming wire I/O; `BoundedStream` exposes cancellation support; registration is rolled back on allocation failure | Maintain runtime evidence for backend-specific completion races; a cancelled IOCP read may lose bytes, so that connection cannot be resumed; `stop()` is a stop-pumping request, not I/O cancellation |
 | Transport and composition | Completion-shaped TCP/UDP/local streams; `DatagramTransport` conformance assertions; bounded family-interleaved `tcp::dial`; separately composed HTTP/HTTPS client pools and grace-draining TCP serving | Maintain backend-specific teardown evidence; DNS is bounded system getaddrinfo, not independent asynchronous A/AAAA resolution |
 | Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered and streaming request bodies (`RequestBodyReader`), chunked trailers, connection-loop drain guarantees; request- and response-parser fuzzing in CI; curl interop exercised out-of-process against the example servers — HTTP/1.1 against the file server, real-nghttp2 HTTP/2 (prior knowledge, including concurrent streams) against `examples/h2_prior_knowledge_server`, native-QUIC HTTP/3 (ngtcp2 + nghttp3) against `examples/h3_server`; HTTP/1 `Expect: 100-continue` and duplex early responses; SOCKS5 against curl and independent Python peers; DoH against curl and Python peers; MQTT 3.1.1/5.0 against an independent Python broker and mosquitto | Protocol conformance evidence, slow-consumer backpressure bounds and bounded aggregate memory measurements |
 | Security and robustness | Duplex TLS with terminal cancellation, bounded parsers, shared accounting budgets, HTTP/WS/SOCKS/DNS/MQTT fuzzing, opt-in validated QUIC paths, explicit replay-safe raw-QUIC early data and HTTP/3 0-RTT with SETTINGS-bound ticket domains and automatic 425 for unsafe early requests | No complete anti-replay or process-RSS guarantee; longer exhaustion tests and mobile TLS runtime evidence remain open |
-| Engineering evidence | `d3424f0` desktop CI and full compression-inclusive Autobahn reports; snapshot-scoped sanitizer suites, real-network H2/H3 CONNECT tests and a 600-second H3 loopback soak | The historical 2026-09-28 Release/GCC/ASan+UBSan suites each passed 85/85, not a result for current source; new Windows H3/MinGW entry points await execution, iOS lacks signed device evidence, Android devices and multi-host/WAN remain unverified; no stable ABI promise |
+| Engineering evidence | Desktop CI, compression-inclusive Autobahn reports, sanitizer suites, Windows MSVC independent HTTP/3 curl and Retry checks, MinGW H2/H3 runtime tests; revision-specific results in the [audit record](AUDIT-2026-09-30.md) | iOS lacks signed device evidence; Android devices and multi-host/WAN remain unverified; local soak results apply only to their recorded snapshots; no stable ABI promise |
 
 Rejecting ambiguous or malformed input is part of protocol correctness, not a
 substitute for the other contracts. The HTTP parser rejects conflicting
@@ -240,6 +240,22 @@ left unread (or dropping the connection when the drain fails). HTTP/1 client
 uploads and H2/H3 outputs now also have incremental backpressure. These local
 contracts do not bound all caller buffers, third-party state or aggregate RSS;
 end-to-end slow-consumer and lifetime evidence remains configuration-specific.
+
+### `Task` — lazy execution and inline completion
+
+Awaiting a lazy `Task<T>` starts its body on the calling thread. If the body
+completes inline, `await_suspend` returns `false` and the awaiting coroutine
+continues without a nested continuation resume. Repeated inline completions
+therefore use constant native stack for a fixed await nesting depth, including
+GCC Debug builds that do not turn symmetric transfer into a tail call.
+This bounds stack growth across loop iterations, not arbitrary recursive nesting.
+
+An atomic completion handshake handles a task that completes on another thread
+before `await_suspend` finishes. If completion happens later, final suspension
+transfers to the awaiting continuation. This synchronization does not make
+`TaskScope`, event loops or attached I/O objects safe for concurrent use.
+Regression tests cover long inline loops, exceptions, external suspension and
+cross-thread completion races.
 
 ### `TaskScope` — implemented single-threaded child ownership
 
@@ -681,7 +697,14 @@ worker loops, not cross-worker transfer of already attached sockets.
 
 ## Verification snapshots and remaining evidence
 
-- 2026-09-29 phase source (HTTP/3 0-RTT, MQTT, documentation sync): local
+The [audit record](AUDIT-2026-09-30.md) records the latest tested revision and
+hosted CI results, including Windows MSVC independent HTTP/3 and Retry
+interoperability, MinGW H2/H3 runtime coverage and the Task stack regression.
+Linux and macOS protocol jobs also require independent HTTP/3 curl and Retry
+checks. The measurements below are historical development snapshots; they do
+not replace verification of a release candidate.
+
+- Historical 2026-09-29 phase source (HTTP/3 0-RTT, MQTT, documentation sync): local
   AppleClang Release, GCC 16 and ASan+UBSan each ran 97 tests, 95 passed and
   the 2 external HTTP/3 curl interop tests skipped (no HTTP3 curl locally), 0
   failed. GCC 13 base configuration 49/49 and GCC 14 full protocol configuration
@@ -699,7 +722,7 @@ worker loops, not cross-worker transfer of already attached sockets.
 - Commit `d3424f0`: CI 17/17 and official Autobahn 25.10.1 including compression,
   517 cases per role (514 OK + 3 INFORMATIONAL), 1,034 total (1,028 OK +
   6 INFORMATIONAL), zero failures/NON-STRICT/missing/excluded cases.
-- Final 2026-09-28 source including trust-bound ticket caching: local AppleClang
+- Historical 2026-09-28 source including trust-bound ticket caching: local AppleClang
   Release, GCC and ASan+UBSan each passed 85/85; installed-consumer and dependency
   isolation checks passed. macOS LeakSanitizer was not run. This is local evidence,
   not a substitute for this revision's remote cross-platform CI.
@@ -708,7 +731,7 @@ worker loops, not cross-worker transfer of already attached sockets.
   and ASan+UBSan. Tests cover same-path CA rotation with/without 0-RTT, an
   unchanged certificate with AUX serverAuth rejection, and uncached default
   system trust. macOS uses `detect_leaks=0`; this is not LeakSanitizer evidence.
-- Latest `ws.connect_network`: real TCP H2 and UDP H3, each with compression
+- `ws.connect_network`: real TCP H2 and UDP H3, each with compression
   off/on, four passing scenarios. This is same-library networking, not an
   independent CONNECT peer. The first-Initial-flight drop setting was removed;
   this test does not establish PTO recovery.
@@ -716,10 +739,10 @@ worker loops, not cross-worker transfer of already attached sockets.
   13,548/13,548 requests and 10,161/10,161 short streams completed during slow
   response overlap. Final connections/routes/tombstones/queued bytes/reserved
   payload bytes are all zero. One host, not multi-host/WAN or an RSS limit.
-- New Windows independent-H3/MinGW entry points have only 3/3 parameter unit
-  tests, not actual entry-point runs. iOS host smoke and unsigned cross-build
-  passed; a signing profile is missing for device execution. Android device
-  runs, multi-host/WAN and longer resource measurements remain without evidence.
+- iOS host smoke and unsigned cross-build passed; signed device execution has
+  not been validated. Android device runs, multi-host/WAN and longer resource
+  measurements remain without evidence. MinGW H2/H3 runtime tests do not establish
+  independent HTTP/3 curl interoperability on that toolchain.
 
 ## What CI found that local testing could not
 
@@ -790,7 +813,7 @@ work on Mira itself.
 | Decision | Choice | Why |
 |---|---|---|
 | **I/O model** | **completion-shaped public API** | A common operation contract for IOCP and reactor implementations |
-| Platform scope | Desktop runtime targets; iOS host smoke/unsigned cross-build and Android cross-build | Device execution is not yet evidenced; new Windows H3/MinGW entry points also need runs; BSD has no dedicated CI evidence |
+| Platform scope | Desktop runtime targets, including Windows MSVC independent H3/Retry and MinGW H2/H3; iOS host smoke/unsigned cross-build and Android cross-build | Mobile device execution is not yet evidenced; BSD has no dedicated CI evidence |
 | Readiness API | POSIX-only, behind an explicit macro | A platform extension, not part of the portable operation contract |
 | Execution model | Lazy `Task<T>`, single-threaded `TaskScope` spawn/join and independent-worker `LoopGroup` | Bounded root-task admission does not make one loop or its sockets multi-thread-safe; suspended tasks cannot be arbitrarily destroyed |
 | Library form | Compiled library with modular public headers | Keep implementation boundaries explicit; the [release guide](RELEASES.md) defines source compatibility and requires rebuilding consumers |

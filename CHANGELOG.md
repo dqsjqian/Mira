@@ -125,6 +125,11 @@ milestone entry is retained as history, not a separately published release.
 
 - Structured task retirement and event-loop shutdown now protect coroutine and
   continuation lifetimes during cancellation, reentrancy and allocation failure.
+- Immediately completing task loops use constant native stack even in GCC Debug
+  builds, with synchronized completion when an awaited task switches threads.
+- IOCP shutdown reuses its dispatch buffer to avoid allocating an empty vector's
+  container proxy under MSVC Debug STL. Allocation-failure tests emit fatal
+  diagnostics directly instead of waiting for a CRT dialog.
 - HTTP uploads, DoH and MQTT preserve terminal failures and release response or
   stream ownership safely. DoH accounts for HTTP cache age in DNS TTLs.
 - Protocol parsers, event queues and buffers enforce limits before allocation;
@@ -132,8 +137,8 @@ milestone entry is retained as history, not a separately published release.
 - Installed versions derive from CMake, with major-version source compatibility
   and exact-version/header consistency checks. CI test fixtures compile cleanly
   with MSVC's warnings-as-errors policy.
-
-
+- Protocol dependency builds retain MSVC compiler PDBs beside installed static
+  libraries so temporary build cleanup does not discard their debug information.
 - QUIC session tickets now bind the actually loaded CA trust material, including
   X509 AUX trusted/rejected purposes and CRLs, instead of relying on a file path.
   Same-path CA replacement no longer restores an old session or enables 0-RTT.
@@ -158,7 +163,8 @@ milestone entry is retained as history, not a separately published release.
 - Final 2026-09-28 source including trust-bound ticket caching: local AppleClang
   Release, GCC and ASan+UBSan each passed 85/85; installed-consumer and dependency
   isolation checks passed. macOS LeakSanitizer was not run. Remote `d3424f0` CI
-  passed 17/17; this new revision still requires its own cross-platform results.
+  passed 17/17. These are historical results; the audit and Release provide
+  later validation records.
 - Latest `ws.connect_network` passed four same-library real-network scenarios:
   H2 over TCP and H3 over UDP, each with compression disabled/enabled. The
   first-Initial-flight drop setting was removed; this test is not PTO recovery
@@ -167,10 +173,11 @@ milestone entry is retained as history, not a separately published release.
   13,548/13,548 requests, 10,161 short streams completing during slow-response
   overlap, and zero final connections/routes/tombstones/queued bytes/reserved
   payload bytes. This is one-machine evidence, not multi-host/WAN or an RSS cap.
-- Windows independent-H3/MinGW entry points have 3/3 parameter unit tests only,
-  not execution evidence. iOS host smoke and unsigned cross-compilation passed;
-  device execution lacks a signing profile. Android device runs and multi-host
-  validation have no evidence.
+- Windows MSVC independent HTTP/3 curl and Retry checks, and MinGW H2/H3
+  runtime tests, passed in the hosted audit follow-up. This does not establish
+  MinGW independent HTTP/3 curl interoperability. iOS host smoke and unsigned
+  cross-compilation passed; device execution lacks a signing profile. Android
+  device runs and multi-host validation have no evidence.
 
 ## [0.5.0] — 2026-09-28 (development milestone)
 

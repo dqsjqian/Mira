@@ -434,11 +434,14 @@ jobs:
       - name: Configure HTTP3 without HTTP2 or NGHTTP2 (Linux)
         if: runner.os == 'Linux'
         shell: bash
-        run: >
-          cmake -S . -B build/http3-only -DCMAKE_BUILD_TYPE=Debug
-          -DMIRA_ENABLE_HTTP3=ON -DMIRA_ENABLE_HTTP2=OFF -DMIRA_ENABLE_TLS=OFF
-          -DCMAKE_DISABLE_FIND_PACKAGE_NGHTTP2=TRUE
-          -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix"
+        run: |
+          cat > "$RUNNER_TEMP/mira-http3-only.cmake" <<'EOF'
+          set(CMAKE_DISABLE_FIND_PACKAGE_NGHTTP2 TRUE CACHE BOOL "Forbid NGHTTP2 discovery in the HTTP3-only build")
+          EOF
+          cmake -S . -B build/http3-only -C "$RUNNER_TEMP/mira-http3-only.cmake" \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DMIRA_ENABLE_HTTP3=ON -DMIRA_ENABLE_HTTP2=OFF -DMIRA_ENABLE_TLS=OFF \
+            -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix"
       - name: Build and test HTTP3-only (Linux)
         if: runner.os == 'Linux'
         run: |

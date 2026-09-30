@@ -9,6 +9,7 @@
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/dqsjqian/Mira/actions/workflows/ci.yml/badge.svg)](https://github.com/dqsjqian/Mira/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/dqsjqian/Mira)](https://github.com/dqsjqian/Mira/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-lightgrey.svg)](#-平台矩阵)
 
 [English](README.en.md) | 简体中文
@@ -148,6 +149,7 @@ Mira::Task<int> count_after_delay(Mira::EventLoop& loop) {
 - `join()` 只能调用一次，调用即关闭接纳；第一个子任务异常触发 `request_stop()`，join 收齐后重抛
 - 用过未 join 的 scope 析构会 `std::terminate()` —— 这是 fail-fast，不是隐式清理
 - await 空 `Task` 抛 `std::logic_error`；传空任务抛 `std::invalid_argument`
+- 循环等待立即完成的 `Task` 使用常量原生栈，包括 GCC Debug；任务切换线程时，完成与父协程恢复通过原子交汇同步
 </details>
 
 <details>
@@ -208,15 +210,15 @@ auto client = Mira::tls::Context::client({
 
 | 平台 | 后端 | 验证范围 |
 |---|---|---|
-| macOS | kqueue | 桌面运行测试，含 TLS / HTTPS |
-| Linux | epoll | 桌面运行 CI，独立 TLS 矩阵 |
-| Windows | IOCP | 桌面 loopback 运行 CI，独立 TLS 矩阵 |
+| macOS | kqueue | 基础/TLS/H2/H3 运行测试、ASan/UBSan、独立 HTTP/3 curl 与 Retry 互操作 |
+| Linux | epoll | GCC/Clang 运行测试、GCC ASan/UBSan、独立 HTTP/3 curl 与 Retry 互操作 |
+| Windows | IOCP | MSVC/MinGW 原生基础/TLS/H2/H3 测试；MSVC 独立 HTTP/3 curl 与 Retry 互操作 |
 | iOS | kqueue | 宿主 smoke 与无签名交叉编译通过；缺少签名 profile，未完成真机运行 |
-| Android | epoll | core / transport / HTTP1 交叉编译，需 **NDK 29+**；无真机运行证据 |
+| Android | epoll | 非 TLS 模块交叉编译，需 **NDK 29+**；无真机运行证据 |
 
-历史 CI 覆盖三桌面基础/TLS/WSS、MinGW H2、sanitizers、HTTP/WebSocket fuzz、Autobahn 双端及 Linux/macOS H2/H3；Windows MSVC 已实跑 QUIC/H3、多客户端与双工 TLS。Linux 使用固定源码构建的 HTTP/3 curl 做独立互操作；其它平台缺少 HTTP3 curl 时明确跳过，不计为通过。新增 Windows 独立 H3 / MinGW 验证入口仅有参数单测 3/3，通过不代表入口已实跑。
+CI 同时覆盖安装包消费与依赖隔离、协议模糊测试、MQTT/mosquitto 互操作，以及包含压缩的官方 Autobahn 客户端/服务端测试。Linux、macOS 和 Windows MSVC 的协议任务均要求独立 HTTP/3 与 Retry 互操作成功；sanitizer 和 MinGW 等配置缺少独立 HTTP3 curl 时的跳过项单独计数。
 
-验证按快照计量：2026-09-29 阶段源码（H3 0-RTT、MQTT 及文档同步）在本机 AppleClang Release / GCC 16 / ASan+UBSan 各 **97 项：95 通过、2 项外部 HTTP/3 curl 互操作因本机 curl 无 HTTP3 跳过、0 失败**；GCC 13 基础配置 49/49，GCC 14 协议全配置 95 通过 + 2 跳过，MinGW 交叉编译 MQTT 全部目标通过，安装消费与分层检查通过；MQTT 互操作 25 例（其中 mosquitto 2.1.2 8 例），MQTT 模糊测试 ASan+UBSan 91 秒 14.5 万次无崩溃。macOS 未运行 LeakSanitizer。历史提交 [`21322d6` 的 CI](https://github.com/dqsjqian/Mira/actions/runs/36537285723) 为 17/17；本轮新提交的跨平台结果须单独查看顶部 CI，不能借用旧结果。
+每个发布版本在 [Release](https://github.com/dqsjqian/Mira/releases) 中关联 CI 验证记录和源码校验和。修复与验证快照集中在[审核记录](docs/AUDIT-2026-09-30.md)，顶部 CI 徽章显示主线状态。macOS 未运行 LeakSanitizer；交叉编译不代表移动端真机验证。
 
 ## ✨ 能力全景
 
@@ -239,13 +241,13 @@ auto client = Mira::tls::Context::client({
 
 `stop()` 只请求 `run()` 返回；逐操作取消是 `OperationOptions` 的职责 —— 每一层职责清晰、互不越界。
 
-2026-09-30 的审核修复、逐项问题处置与本机验证结果见[审核记录](docs/AUDIT-2026-09-30.md)。历史版本测试数不替代当前源码的验证；Windows 交叉编译与原生运行分别记录。
+协议资源预算、取消与任务生命周期的修复及验证边界见[审核记录](docs/AUDIT-2026-09-30.md)。
 
 生产依赖应使用包含安全修复的 OpenSSL：截至 2026-09-30，3.5 LTS 为 **3.5.9**、3.6 分支为 **3.6.5**，也可使用已回移相应修复的供应商包。仅满足 API 最低版本不代表包含这些补丁；其中 [CVE-2026-35189](https://openssl-library.org/news/vulnerabilities/#CVE-2026-35189) 可由对端 TLS 证书触发。CI 源码构建已固定到带哈希校验的 3.5.9。
 
 ## 🚀 快速开始
 
-需要 **CMake 3.21+、C++23 编译器**。已验证配置使用 **GCC 14+ / Clang 19+（Linux）/ AppleClang / MSVC v143**；这不是当前工作区所有组合均通过的声明：
+需要 **CMake 3.21+、C++23 编译器**。CI 工具链包括 **GCC 14+ / Clang 19+（Linux）/ AppleClang / MSVC v143**：
 
 - **GCC 14+**：GCC 13 的协程优化器存在已知内部错误（GCC 14 修复）。
 - **Linux 上 Clang 19+**：clang-18 的 `__cpp_concepts` 宏版本过旧，libstdc++ 据此隐藏 `std::expected`。
@@ -367,7 +369,7 @@ WebSocket 用 `extended_connect_request` / `accept_extended_connect` / `validate
 
 `compression_parameters()` 返回 wire 协商结果；客户端仍在本地遵守 offer 中更小的窗口及 no-context 承诺。压缩会引入大小侧信道，不应在同一压缩上下文混合秘密与攻击者可控内容；敏感数据默认保持压缩关闭。启用 ws 构建需要 zlib，但基础模块和只用 Crypto 的安装消费不强制查找 zlib。
 
-独立 Python socket/zlib 双向互操作：`python3 tools/ci/check_ws_interop.py --extensions-peer build/ws/mira_ws_extensions_peer`。提交 `d3424f0` 的官方 Autobahn 25.10.1 全量（含压缩）已验：每端 517 项，514 OK + 3 INFORMATIONAL；双端 1,034 项 = 1,028 OK + 6 INFORMATIONAL，零失败、零 NON-STRICT、零缺项、零排除。信息项不冒充严格 OK；后续改动仍须重新验证。完整压缩模式以 `run_autobahn.py --compression` 启动。
+独立 Python socket/zlib 双向互操作：`python3 tools/ci/check_ws_interop.py --extensions-peer build/ws/mira_ws_extensions_peer`。官方 Autobahn 客户端/服务端完整压缩模式以 `run_autobahn.py --compression` 启动，CI 拒绝失败、NON-STRICT 和缺失用例。INFORMATIONAL 单独计数；具体提交的结果与完整报告见[审核记录](docs/AUDIT-2026-09-30.md)。
 
 ### HTTP/3 0-RTT
 
@@ -421,8 +423,8 @@ python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak 
 
 ## 接下来：仍需验证的边界
 
-1. iOS 已通过宿主 smoke 和无签名交叉编译，真机缺签名 profile；Android 真机尚无证据。Windows MSVC H3、WSS 全双工及 TLS 1.3 KeyUpdate 已有运行回归；新增 Windows 独立 H3 / MinGW 入口只有参数单测 3/3，仍待实跑。
-2. 本轮新提交的跨平台 CI、更长时故障注入、真实多机/WAN 与进程内存治理仍待验；2026-09-28 历史快照的三套本机矩阵曾各通过 85/85，此数字不代表当前源码。官方 Autobahn 全量含压缩仅有上述 `d3424f0` 的完整报告；可用 `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker --compression` 在 Linux 复现，完整报告由 CI 保存。
+1. iOS 已通过宿主 smoke 和无签名交叉编译，真机缺签名 profile；Android 真机尚无证据。MinGW 已有 H2/H3 原生运行测试，独立 HTTP/3 curl 互操作在 Windows 上由 MSVC 配置验证。
+2. 更长时故障注入、真实多机/WAN 与进程内存硬上限仍待验。单机 loopback 和有限时长的 fuzz/soak 不代表这些边界已覆盖。
 3. QUIC validated migration/NAT rebinding、显式原始 QUIC 0-RTT、HTTP/3 0-RTT 与 H2/H3 Extended CONNECT 已在主线实现，但完整防重放保证与第三方 Extended CONNECT 互操作未交付/未验证；HTTP/3 0-RTT 目前只有同库引擎与真实 UDP 证据，尚无第三方 0-RTT 互操作。Retry 不保证 token 一次性使用，listener 不是互联网抗洪泛防护系统。
 4. **2026-09-29 阶段已交付**：HTTP/3 0-RTT、HTTP/1 `Expect: 100-continue` / 提前响应双工，以及独立 SOCKS5、DNS/DoH、MQTT 模块。仍开放：0-RTT 防重放存储、客户端记忆服务端 SETTINGS、打包好的 DoH over H2/H3 查询、MQTT over WebSocket 与会话持久化。gRPC/Redis/WebRTC 保持生态层边界，不将专业子系统全部塞进网络内核。
 

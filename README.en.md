@@ -9,9 +9,10 @@ One completion-shaped I/O API across kqueue, epoll, and IOCP — so protocols ne
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/dqsjqian/Mira/actions/workflows/ci.yml/badge.svg)](https://github.com/dqsjqian/Mira/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/dqsjqian/Mira)](https://github.com/dqsjqian/Mira/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-lightgrey.svg)](#-platform-matrix)
 
-简体中文 | [English](README.en.md)
+[简体中文](README.md) | English
 
 </div>
 
@@ -148,6 +149,7 @@ Mira::Task<int> count_after_delay(Mira::EventLoop& loop) {
 - `join()` may be called once; calling it closes admission. The first child exception triggers `request_stop()`; join rethrows after collecting everyone.
 - Destroying a used-but-unjoined scope is `std::terminate()` — fail-fast, not implicit cleanup.
 - Awaiting an empty `Task` throws `std::logic_error`; spawning one throws `std::invalid_argument`.
+- Loops awaiting inline-completing tasks use constant native stack, including GCC Debug; an atomic rendezvous synchronizes completion and parent resumption when a task switches threads.
 </details>
 
 <details>
@@ -208,15 +210,15 @@ No 408 is sent: announcing it would require a second budget the caller never gra
 
 | Platform | Backend | Verification |
 |---|---|---|
-| macOS | kqueue | Desktop test runs, incl. TLS / HTTPS |
-| Linux | epoll | Desktop CI, dedicated TLS matrix |
-| Windows | IOCP | Desktop loopback CI, dedicated TLS matrix |
+| macOS | kqueue | Base/TLS/H2/H3 runtime tests, ASan/UBSan, independent HTTP/3 curl and Retry interoperability |
+| Linux | epoll | GCC/Clang runtime tests, GCC ASan/UBSan, independent HTTP/3 curl and Retry interoperability |
+| Windows | IOCP | Native MSVC/MinGW base/TLS/H2/H3 tests; MSVC independent HTTP/3 curl and Retry interoperability |
 | iOS | kqueue | Host smoke and unsigned cross-build passed; no device run without a signing profile |
-| Android | epoll | Core / transport / HTTP1 cross-build, **NDK 29+**; no device-runtime evidence |
+| Android | epoll | Non-TLS module cross-build, **NDK 29+**; no device-runtime evidence |
 
-Historical CI covers desktop base/TLS/WSS, MinGW H2, sanitizers, HTTP/WebSocket fuzzing, both Autobahn roles and Linux/macOS H2/H3. Windows MSVC has run QUIC/H3, multi-client and duplex TLS tests. Linux builds a pinned HTTP/3 curl for independent interoperability; elsewhere missing HTTP3 curl is explicitly skipped, not passed. New Windows independent-H3 / MinGW entry points have only 3/3 parameter unit tests; the entry points themselves have not been executed.
+CI also covers installed packages and dependency isolation, protocol fuzzing, MQTT/mosquitto interoperability, and official Autobahn client/server tests including compression. The Linux, macOS and Windows MSVC protocol jobs require independent HTTP/3 and Retry interoperability. Skips in configurations without an independent HTTP3 curl, including sanitizer and MinGW jobs, are counted separately.
 
-Evidence is snapshot-specific: the 2026-09-29 phase source (H3 0-RTT, MQTT and the documentation sync) ran **97 tests: 95 passed, 2 external HTTP/3 curl interop tests skipped because the local curl lacks HTTP3, 0 failed** in each of AppleClang Release / GCC 16 / ASan+UBSan. The GCC 13 base configuration passed 49/49, the GCC 14 full protocol configuration 95 passed + 2 skipped, every MQTT target cross-compiled with MinGW, and installed-consumer and layering checks passed. MQTT interop ran 25 cases (8 against mosquitto 2.1.2), and the MQTT fuzzer ran 145k inputs in 91 s under ASan+UBSan without a crash. LeakSanitizer was not run on macOS. The historical [CI for `21322d6`](https://github.com/dqsjqian/Mira/actions/runs/36537285723) passed 17/17; consult the CI link above for this new revision rather than borrowing the older result.
+Each [Release](https://github.com/dqsjqian/Mira/releases) links CI evidence and its source checksum. Repair and validation snapshots are kept in the [audit record](docs/AUDIT-2026-09-30.md); the CI badge above tracks main. LeakSanitizer was not run on macOS, and cross-builds do not establish mobile-device execution.
 
 ## ✨ Capability overview
 
@@ -239,9 +241,8 @@ Evidence is snapshot-specific: the 2026-09-29 phase source (H3 0-RTT, MQTT and t
 
 `stop()` only asks `run()` to return; per-operation cancellation is `OperationOptions`' job — every layer owns exactly one responsibility.
 
-The [2026-09-30 audit record](docs/AUDIT-2026-09-30.md) tracks repairs, individual
-findings and local validation. Historical test totals do not certify current
-source; Windows cross-compilation is recorded separately from native execution.
+The [audit record](docs/AUDIT-2026-09-30.md) covers protocol resource budgets,
+cancellation, task-lifetime repairs and their validation boundaries.
 
 Use security-patched OpenSSL packages in production. As of 2026-09-30, the 3.5
 LTS patch is **3.5.9** and the 3.6 patch is **3.6.5**; vendor packages with the
@@ -253,7 +254,7 @@ hash-verifies 3.5.9.
 
 ## 🚀 Quick start
 
-Requires **CMake 3.21+ and a C++23 compiler**. Verified configurations use **GCC 14+ / Clang 19+ (Linux) / AppleClang / MSVC v143**; this does not claim every current working-tree combination passes:
+Requires **CMake 3.21+ and a C++23 compiler**. CI toolchains include **GCC 14+ / Clang 19+ (Linux) / AppleClang / MSVC v143**:
 
 - **GCC 14+**: GCC 13's coroutine optimizer has a known internal compiler error; fixed in GCC 14.
 - **Clang 19+ on Linux**: clang-18 keeps `__cpp_concepts` outdated, so libstdc++ hides `std::expected` behind its feature-test.
@@ -375,7 +376,7 @@ Only `compression.enabled = true` offers/accepts RFC7692 permessage-deflate; it 
 
 `compression_parameters()` returns the wire agreement; clients still locally honor stricter window and no-context hints promised in their offer. Compression introduces size side channels: do not mix secrets and attacker-controlled content in one compression context; leave compression off for sensitive data. Building ws requires zlib, but base-module and Crypto-only installed consumers do not discover it.
 
-Independent Python socket/zlib interoperability: `python3 tools/ci/check_ws_interop.py --extensions-peer build/ws/mira_ws_extensions_peer`. Commit `d3424f0` passed official Autobahn 25.10.1 full coverage including compression: 517 cases per role, 514 OK + 3 INFORMATIONAL; 1,034 total = 1,028 OK + 6 INFORMATIONAL, zero failures, NON-STRICT results, missing or excluded cases. Informational cases are not strict OK verdicts; later revisions need their own verification. Run complete compression coverage with `run_autobahn.py --compression`.
+Independent Python socket/zlib interoperability: `python3 tools/ci/check_ws_interop.py --extensions-peer build/ws/mira_ws_extensions_peer`. Run official Autobahn client/server coverage including compression with `run_autobahn.py --compression`; CI rejects failures, NON-STRICT results and missing cases. INFORMATIONAL cases are counted separately. Revision-specific results and complete reports are linked from the [audit record](docs/AUDIT-2026-09-30.md).
 
 ### HTTP/3 0-RTT
 
@@ -429,8 +430,8 @@ Recorded 600-second report `build/all-main/sustained-600.json`: 13,548/13,548 re
 
 ## Next: remaining verification boundaries
 
-1. iOS host smoke and unsigned cross-compilation passed, but device execution lacks a signing profile; Android has no device evidence. Windows MSVC H3, WSS duplex and TLS 1.3 KeyUpdate regressions have run. New Windows independent-H3 / MinGW entry points have only 3/3 parameter unit tests and still await execution.
-2. Cross-platform CI for this revision, longer fault injection, multi-host/WAN load and process-memory governance remain unverified; the historical 2026-09-28 snapshot passed 85/85 in three local configurations, which does not certify the current source. Full official Autobahn coverage including compression has only the complete `d3424f0` report above. Reproduce on Linux with `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker --compression`; CI preserves the complete reports.
+1. iOS host smoke and unsigned cross-compilation passed, but device execution lacks a signing profile; Android has no device evidence. MinGW runs native H2/H3 tests; independent HTTP/3 curl interoperability on Windows is exercised by MSVC.
+2. Longer fault injection, multi-host/WAN load and hard process-memory limits remain unverified. Single-machine loopback and bounded fuzz/soak runs do not establish that coverage.
 3. Validated QUIC migration/NAT rebinding, explicit raw-QUIC 0-RTT, HTTP/3 0-RTT and H2/H3 Extended CONNECT are implemented on main. Comprehensive anti-replay guarantees and independent Extended CONNECT interoperability remain undelivered/unverified; HTTP/3 0-RTT has same-library engine and real-UDP evidence but no third-party 0-RTT interoperability yet. Retry tokens are not guaranteed single-use; the listener is not an Internet flood-protection system.
 4. **Delivered in the 2026-09-29 phase**: HTTP/3 0-RTT, HTTP/1 `Expect: 100-continue` with duplex early responses, and independent SOCKS5, DNS/DoH and MQTT modules. Still open: a 0-RTT anti-replay store, remembered server SETTINGS on the client, a packaged DoH query over H2/H3, MQTT over WebSocket and session persistence. Keep gRPC/Redis/WebRTC in the ecosystem layer, not bundled into the network core.
 
