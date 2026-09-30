@@ -20,6 +20,11 @@
 #else
     #include <windows.h>
 #endif
+#if defined(_MSC_VER)
+    #include <crtdbg.h>
+#endif
+#include <cstdio>
+#include <exception>
 
 namespace allocation_probe {
 
@@ -478,6 +483,22 @@ void test_waiter_allocations() {
 }  // namespace
 
 int main() {
+    // A CI hang must still say where it stopped: unbuffered progress, and on
+    // MSVC no modal Debug CRT dialog for abort/terminate/asserts — those wait
+    // for a click until the ctest timeout and discard everything printed.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+#if defined(_MSC_VER)
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    for (const int kind : {_CRT_WARN, _CRT_ERROR, _CRT_ASSERT}) {
+        _CrtSetReportMode(kind, _CRTDBG_MODE_FILE);
+        _CrtSetReportFile(kind, _CRTDBG_FILE_STDERR);
+    }
+    ::SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    std::set_terminate([] {
+        std::fputs("timer_allocation: std::terminate\n", stderr);
+        std::_Exit(3);
+    });
+#endif
     test_loop_creation_allocation_rollback();
     test_timer_allocations();
     test_timer_dispatch_without_allocation();

@@ -199,7 +199,11 @@ public:
         const detail::DispatchScope dispatching{dispatch_depth_};
         stop_requested_.store(true, std::memory_order_release);
 
-        std::vector<move_only_function<void()>> discarded_work;
+        // Reuse the idle dispatch buffer (shutdown never runs mid-dispatch):
+        // under MSVC's debug iterators even an empty local vector allocates,
+        // and an allocation failure here would terminate.
+        auto& discarded_work = to_run_;
+        discarded_work.clear();
         std::size_t kernel_backed = 0;
         {
             const std::lock_guard lock{mutex_};
