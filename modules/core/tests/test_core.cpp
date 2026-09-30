@@ -18,17 +18,24 @@
 
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <coroutine>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <functional>
+#include <future>
 #include <limits>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace Mira;
@@ -149,6 +156,242 @@ void test_task() {
     Task<int> sink = std::move(source);
     CHECK(!static_cast<bool>(source));
     CHECK(std::move(sink).sync_get() == 42);
+}
+
+// ── Task: native stack under long await chains ───────────────────────────────
+//
+// A loop whose awaits all complete without suspending must run in constant
+// native stack. Relying on symmetric transfer alone does not give that: GCC
+// emits it as a plain call at -O0/-O1, so each such await nested one more
+// resume pair, and an I/O-free QUIC pump loop overflowed under Debug ASan.
+
+std::uintptr_t stack_lowest = std::numeric_limits<std::uintptr_t>::max();
+std::uintptr_t stack_highest = 0;
+
+void reset_stack_samples() noexcept {
+    stack_lowest = std::numeric_limits<std::uintptr_t>::max();
+    stack_highest = 0;
+}
+
+#if defined(_MSC_VER) && !defined(__clang__)
+__declspec(noinline)
+#else
+[[gnu::noinline]]
+#endif
+void sample_stack() noexcept {
+    // ASan's fake stack can move locals off the native stack; a frame address
+    // cannot move.
+#if defined(__GNUC__) || defined(__clang__)
+    const auto here = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
+#else
+    volatile unsigned char local = 0;
+    const auto here = reinterpret_cast<std::uintptr_t>(&local);
+#endif
+    stack_lowest = (std::min)(stack_lowest, here);
+    stack_highest = (std::max)(stack_highest, here);
+}
+
+[[nodiscard]] std::uintptr_t stack_span() noexcept {
+    return stack_highest >= stack_lowest ? stack_highest - stack_lowest : 0;
+}
+
+// Far below what one leaked frame per await would reach at these counts.
+constexpr std::uintptr_t kMaxStackSpan = 64 * 1024;
+
+Task<int> sampled_leaf() {
+    sample_stack();
+    co_return 1;
+}
+
+Task<int> sampled_inner() {
+    co_return co_await sampled_leaf();
+}
+
+Task<void> sampled_void() {
+    sample_stack();
+    co_return;
+}
+
+Task<int> sampled_throw(int round) {
+    sample_stack();
+    if (round % 3 == 0) throw std::runtime_error("inline failure");
+    co_return 1;
+}
+
+Task<long> long_inline_chain(int rounds) {
+    long total = 0;
+    for (int i = 0; i < rounds; ++i) {
+        total += co_await sampled_inner();
+        co_await sampled_void();
+    }
+    co_return total;
+}
+
+Task<int> inline_failures(int rounds) {
+    int caught = 0;
+    for (int i = 0; i < rounds; ++i) {
+        try {
+            (void)co_await sampled_throw(i);
+        } catch (const std::runtime_error&) {
+            ++caught;
+        }
+    }
+    co_return caught;
+}
+
+/// Parks the awaiting frame until the test resumes it from outside.
+struct ExternalGate {
+    std::coroutine_handle<> waiter{};
+
+    [[nodiscard]] bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> handle) noexcept { waiter = handle; }
+    void await_resume() const noexcept {}
+};
+
+Task<int> gated_leaf(ExternalGate& gate) {
+    co_await gate;
+    sample_stack();
+    co_return 1;
+}
+
+Task<long> mixed_chain(ExternalGate& gate, int rounds, int& progress) {
+    long total = 0;
+    for (int i = 0; i < rounds; ++i) {
+        total += co_await sampled_inner();   // completes inline
+        total += co_await gated_leaf(gate);  // completes after an outside resume
+        total += co_await sampled_inner();   // inline again, after the async resume
+        ++progress;
+    }
+    co_return total;
+}
+
+/// One worker thread running posted closures in order.
+class ThreadExecutor {
+public:
+    ThreadExecutor() : worker_([this] { run(); }) {}
+    ThreadExecutor(const ThreadExecutor&) = delete;
+    ThreadExecutor& operator=(const ThreadExecutor&) = delete;
+
+    ~ThreadExecutor() {
+        {
+            const std::lock_guard lock{mutex_};
+            stopping_ = true;
+        }
+        ready_.notify_one();
+        worker_.join();
+    }
+
+    void post(std::function<void()> work) {
+        {
+            const std::lock_guard lock{mutex_};
+            queue_.push_back(std::move(work));
+        }
+        ready_.notify_one();
+    }
+
+private:
+    void run() {
+        for (;;) {
+            std::function<void()> work;
+            {
+                std::unique_lock lock{mutex_};
+                ready_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+                if (queue_.empty()) return;
+                work = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            work();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::deque<std::function<void()>> queue_;
+    bool stopping_ = false;
+    std::thread worker_;
+};
+
+static_assert(Executor<ThreadExecutor>);
+
+Task<int> hop_to(ThreadExecutor& target) {
+    co_await schedule_on(target);
+    co_return 1;
+}
+
+Task<int> cross_thread_chain(ThreadExecutor& left, ThreadExecutor& right, int rounds,
+                             std::promise<void>& finished) {
+    int total = 0;
+    for (int i = 0; i < rounds; ++i) {
+        // Alternating targets keeps the child finishing on a thread other than
+        // the one still inside await_suspend, racing the rendezvous both ways.
+        total += co_await hop_to(i % 2 == 0 ? left : right);
+        total += co_await answer() / 42;  // inline, on whichever thread won
+    }
+    finished.set_value();
+    co_return total;
+}
+
+void test_task_stack_depth() {
+    test::section("Task stack depth");
+
+    // Deep enough that one leaked native frame per await overflows any
+    // default thread stack, even without the span check below.
+    constexpr int kRounds = 100000;
+
+    reset_stack_samples();
+    CHECK(long_inline_chain(kRounds).sync_get() == kRounds);
+    CHECK(stack_span() < kMaxStackSpan);
+
+    // Exceptions thrown by inline-completing children surface at each await
+    // and leave the loop's stack where it was.
+    reset_stack_samples();
+    CHECK(inline_failures(kRounds).sync_get() == (kRounds + 2) / 3);
+    CHECK(stack_span() < kMaxStackSpan);
+
+    // Suspension outside the chain: resuming from here goes back through the
+    // final-suspend transfer, then continues inline again.
+    {
+        constexpr int kGatedRounds = 10000;
+        ExternalGate gate;
+        int progress = 0;
+        auto awaiter = mixed_chain(gate, kGatedRounds, progress).operator co_await();
+        reset_stack_samples();
+        CHECK(awaiter.await_suspend(std::noop_coroutine()));
+        CHECK(progress == 0);
+        int resumed = 0;
+        bool parked = true;
+        while (!awaiter.await_ready() && resumed <= kGatedRounds) {
+            parked = parked && gate.waiter && !gate.waiter.done();
+            if (!parked) break;
+            std::exchange(gate.waiter, {}).resume();
+            ++resumed;
+        }
+        CHECK(parked);
+        CHECK(resumed == kGatedRounds);
+        CHECK(progress == kGatedRounds);
+        CHECK(awaiter.await_resume() == 3L * kGatedRounds);
+        CHECK(stack_span() < kMaxStackSpan);
+    }
+
+    // Completion on another thread, racing the awaiter's rendezvous.
+    {
+        constexpr int kHops = 5000;
+        std::promise<void> finished;
+        auto done = finished.get_future();
+        std::optional<ThreadExecutor> left;
+        std::optional<ThreadExecutor> right;
+        left.emplace();
+        right.emplace();
+        auto awaiter = cross_thread_chain(*left, *right, kHops, finished).operator co_await();
+        (void)awaiter.await_suspend(std::noop_coroutine());
+        done.wait();
+        // Joining the workers waits out the closure that is still running the
+        // frame towards its final suspension.
+        left.reset();
+        right.reset();
+        CHECK(awaiter.await_ready());
+        CHECK(awaiter.await_resume() == 2 * kHops);
+    }
 }
 
 // ── Buffer ───────────────────────────────────────────────────────────────────
@@ -586,7 +829,9 @@ int run_contract_violation(std::string_view mode) {
         auto awaiter = std::move(task).operator co_await();
         // Start the body by hand so that it is genuinely suspended when the
         // awaiter — which lives in the awaiting frame — goes out of scope.
-        awaiter.await_suspend(std::noop_coroutine()).resume();
+        if (!awaiter.await_suspend(std::noop_coroutine())) {
+            return 3;  // the body cannot have completed inline
+        }
     } else {
         return 2;
     }
@@ -601,6 +846,7 @@ int main(int argc, char** argv) {
     }
     test_error_model();
     test_task();
+    test_task_stack_depth();
     test_buffer();
     test_backend_numeric_limits();
     test_stream_seam();

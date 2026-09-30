@@ -340,8 +340,9 @@ int main(int argc, char** argv) {
             scope.spawn(gated(gate, count, destroyed));
             {
                 auto waiter = scope.join().operator co_await();
-                auto next = waiter.await_suspend(std::noop_coroutine());
-                next.resume();
+                if (!waiter.await_suspend(std::noop_coroutine())) {
+                    return 3;  // the join cannot finish while a child is gated
+                }
             }
         } else if (mode == "unstarted-join") {
             Task<void> joining;

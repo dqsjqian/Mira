@@ -3,9 +3,14 @@
 // Mira/core/task.hpp — the coroutine type every Mira speaks.
 //
 // `Task<T>` is a *lazy* coroutine: the body does not start until the task is
-// awaited (or driven by `sync_get()`). Awaiting resumes the awaited task on the
-// current thread via symmetric transfer, so a chain of `co_await`s costs no
-// extra stack frames and no allocation beyond the coroutine frames themselves.
+// awaited (or driven by `sync_get()`). Awaiting starts the awaited task on the
+// current thread. When it finishes before suspending, the awaiting frame
+// continues from `await_suspend` returning false, not from a nested resume, so
+// a loop over synchronously completing tasks runs in constant native stack.
+// That must not depend on the compiler turning symmetric transfer into a tail
+// call: GCC does not at -O0/-O1, which grew the stack by one resume pair per
+// await until a long I/O-free loop overflowed. Symmetric transfer remains only
+// on the asynchronous path, where depth is bounded by the static await nesting.
 //
 // Ownership: `Task<T>` is move-only and owns its coroutine frame. Awaiting a
 // task consumes it (`operator co_await() &&` moves the handle into the
@@ -20,6 +25,7 @@
 // Per-operation cancellation lives on the event loop (`OperationOptions`),
 // not on `Task`: a task does not know which operation it is suspended on.
 
+#include <atomic>
 #include <coroutine>
 #include <cstdio>
 #include <exception>
@@ -77,12 +83,25 @@ struct TaskPromiseBase {
     /// "suspended mid-flight, someone else may hold it".
     bool started{false};
 
+    /// Rendezvous between `Task::Awaiter::await_suspend`, which runs the body
+    /// inline, and this frame's final suspension. Whichever arrives second
+    /// continues the awaiting frame: the final suspension when the body
+    /// completed after suspending elsewhere, or the awaiter when it completed
+    /// inline. Atomic because a body may finish on another thread (for
+    /// example after `schedule_on`) before `await_suspend` has returned.
+    std::atomic<bool> rendezvous{false};
+
     struct FinalAwaiter {
         [[nodiscard]] bool await_ready() const noexcept { return false; }
 
         template<typename Promise>
         std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> self) noexcept {
             TaskPromiseBase& base = self.promise();
+            if (!base.rendezvous.exchange(true, std::memory_order_acq_rel)) {
+                // First to arrive: the awaiter is still inside its resume()
+                // call and continues the awaiting frame once that returns.
+                return std::noop_coroutine();
+            }
             return base.continuation ? base.continuation : std::noop_coroutine();
         }
 
@@ -213,10 +232,17 @@ public:
 
             [[nodiscard]] bool await_ready() const noexcept { return !handle_ || handle_.done(); }
 
-            std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting) noexcept {
-                handle_.promise().continuation = awaiting;
-                handle_.promise().started = true;  // before the symmetric transfer
-                return handle_;
+            bool await_suspend(std::coroutine_handle<> awaiting) noexcept {
+                auto& promise = handle_.promise();
+                promise.continuation = awaiting;
+                promise.started = true;  // before the body runs
+                handle_.resume();
+                // Second to arrive means the body already reached its final
+                // suspension: decline to suspend, so the awaiting frame goes
+                // on in this stack frame instead of one nested beneath it.
+                // Nothing may touch `this` after the exchange: once it lands
+                // first, another thread may resume and destroy this frame.
+                return !promise.rendezvous.exchange(true, std::memory_order_acq_rel);
             }
 
             decltype(auto) await_resume() {
