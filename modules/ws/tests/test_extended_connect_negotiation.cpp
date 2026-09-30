@@ -46,6 +46,12 @@ void basic_fields() {
     CHECK(accepted->fields.size() == 1 && value(accepted->fields, ":status") == "200");
     CHECK(accepted->negotiated.subprotocol.empty() && !accepted->negotiated.compression.enabled);
     CHECK(validate_extended_connect(accepted->fields).has_value());
+    auto cookies = accepted->fields;
+    cookies.push_back({"set-cookie", "one=1"});
+    cookies.push_back({"set-cookie", "two=2"});
+    CHECK(validate_extended_connect(cookies).has_value());
+    cookies.push_back({":status", "200"});
+    invalid(validate_extended_connect(cookies));
     auto offer = extended_connect_offer();
     CHECK(offer && offer->size() == 1);
     if (offer) {

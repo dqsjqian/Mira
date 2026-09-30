@@ -100,6 +100,7 @@ struct Peer {
     std::map<std::int64_t, std::size_t> body;
     std::map<std::int64_t, bool> ended;
     std::vector<std::int64_t> finished;  // Request ends (server) in arrival order.
+    std::vector<std::int64_t> allowed_resets;
 };
 void observe(http3::Engine& engine, Peer& peer) {
     for (auto& event : engine.take_events()) {
@@ -119,6 +120,8 @@ void observe(http3::Engine& engine, Peer& peer) {
             peer.finished.push_back(id);
             break;
         case http3::Event::Kind::reset:
+            if (std::find(peer.allowed_resets.begin(), peer.allowed_resets.end(), id) !=
+                peer.allowed_resets.end()) break;
             throw std::runtime_error("unexpected reset on stream " + std::to_string(id));
         case http3::Event::Kind::goaway:
             break;
@@ -261,6 +264,67 @@ void rejected(Setup& s) {
     std::cout << "rejected 0-RTT resubmitted on the same stream IDs\n";
 }
 
+void rejected_with_gaps_and_lower_limit(Setup& s, bool cancel_waiting) {
+    auto refusing = s.server;
+    refusing.early_data = quic::EarlyDataPolicy::disabled;
+    refusing.max_streams = 1;
+    // A redeployment also changes the ticket key, so the peer must safely
+    // recover when resumption itself is rejected and its stream limit shrinks.
+    refusing.server_context.reset();
+    refusing.server_context = require(quic::ServerContext::create(refusing), "replacement context");
+    auto client = require(http3::Engine::create(
+        require(quic::Engine::client(s.client, s.now), "client"), false, s.limits), "h3 client");
+    check(client.early_ready(), "no ticket for reduced-limit replay");
+    const auto first_id = require(client.request(get("/first")), "first early request");
+    const auto gap = require(client.transport().open_early_stream(), "reserved unused stream ID");
+    const auto waiting = require(client.request(get("/waiting"), quic::Bytes(700, std::byte{2})),
+                                 "second early request");
+    const auto last = require(client.request(get("/last")), "third early request");
+    check(first_id == 0 && gap == 4 && waiting == 8 && last == 12, "replay gap not constructed");
+    auto first = flight(client, s.now);
+    auto server = require(http3::Engine::create(
+        require(quic::Engine::accept(refusing, first.front(), s.now), "accept replacement"),
+        true, s.limits), "replacement h3 server");
+    deliver(server, {first.begin() + 1, first.end()}, s.now);
+    deliver(client, flight(server, s.now), s.now);
+    check(client.ready() && client.transport().early_data_status() == quic::EarlyDataStatus::rejected,
+          "rejected client not ready with queued replays");
+    const auto overtaking = client.request(get("/cannot-overtake"));
+    check(!overtaking && overtaking.error() == Errc::would_block,
+          "new request consumed an ID reserved for replay");
+    if (cancel_waiting) {
+        require(client.cancel(waiting), "cancel queued replay");
+        check(client.queued_body_bytes() == 0, "cancelled replay retained its body");
+    }
+    Peer cp, sp;
+    sp.allowed_resets = {gap, waiting};
+    cp.allowed_resets = {gap, waiting};
+    const quic::Bytes response(7, std::byte{0x52});
+    drive(s, client, server, cp, sp, response, [&] {
+        return cp.ended[first_id] && cp.ended[last] && (cancel_waiting || cp.ended[waiting]);
+    });
+    check(sp.heads[first_id] == 1 && sp.heads[last] == 1 && sp.heads[gap] == 0,
+          "ID gap corrupted replay delivery");
+    check(sp.heads[waiting] == (cancel_waiting ? 0 : 1) &&
+          sp.body[waiting] == (cancel_waiting ? 0U : 700U), "queued replay body/cancel lost");
+    check(client.ready() && !client.closed() && !server.closed(), "replay killed connection");
+    std::cout << "rejected 0-RTT preserved gaps under lower concurrency, cancel=" << cancel_waiting << '\n';
+}
+
+void admission_preserves_stream_ids(Setup& s) {
+    auto limits = s.limits;
+    limits.max_events = 1;
+    auto client = require(http3::Engine::create(
+        require(quic::Engine::client(s.client, s.now), "client"), false, limits), "h3 client");
+    check(client.early_ready(), "no ticket for admission test");
+    const quic::Bytes body(1, std::byte{1});
+    check(require(client.request(get("/one"), body), "first admission") == 0, "first stream ID");
+    const auto blocked = client.request(get("/blocked"), body);
+    check(!blocked && blocked.error() == Errc::would_block, "chunk budget was not enforced");
+    check(require(client.request(get("/empty")), "empty admission") == 4,
+          "failed body admission consumed a stream ID");
+}
+
 // A hand-built HTTP/3 client sends an unsafe POST in 0-RTT; our own client refuses to.
 void too_early(Setup& s) {
     auto raw = require(quic::Engine::client(s.client, s.now), "raw client");
@@ -342,9 +406,15 @@ int main(int argc, char** argv) {
         configuration(s);
         full_handshake(s);
         accepted(s);
+        for (const bool cancel_waiting : {false, true}) {
+            auto isolated = make_setup(argv[1], argv[2]);
+            full_handshake(isolated);
+            rejected_with_gaps_and_lower_limit(isolated, cancel_waiting);
+        }
         rejected(s);
         too_early(s);
         accepted(s);
+        admission_preserves_stream_ids(s);
         std::cout << "HTTP/3 0-RTT accepted/rejected/425/SETTINGS binding passed\n";
         return 0;
     } catch (const std::exception& error) {

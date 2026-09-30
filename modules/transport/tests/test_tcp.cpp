@@ -6,8 +6,8 @@
 // never actually run. A loopback TCP connection works on all three backends,
 // so from here on "Windows is supported" is a claim with evidence behind it.
 //
-// Nothing here branches on the platform. If a test needed a `#if`, that would
-// mean the public API leaked a platform detail.
+// Behavioral tests use the public API; descriptor-inheritance checks also
+// inspect the POSIX-only close-on-exec flag.
 
 #include "check.hpp"
 #include "mira/core/stream.hpp"
@@ -21,12 +21,17 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <future>
 #include <memory>
 #include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <thread>
+#if MIRA_HAS_READINESS_API
+#include <fcntl.h>
+#endif
 
 using namespace Mira;
 using namespace Mira::transport;
@@ -454,7 +459,7 @@ void test_socket_move_and_close() {
     moved.close();
 }
 
-void test_pending_accept_close(bool destroy_owner) {
+void test_pending_accept_close(bool destroy_owner, bool move_assign = false) {
     test::section(destroy_owner ? "pending accept close / destroy owner"
                                 : "pending accept close / reentrant close");
 
@@ -501,7 +506,13 @@ void test_pending_accept_close(bool destroy_owner) {
     Accept::run(listener, destroy_owner, failure, done);
     CHECK(done.load() == 0);
     CHECK(loop.outstanding() == 1);
-    listener->close();
+    if (move_assign) {
+        auto replacement = tcp::Listener::bind(loop, Endpoint::loopback(0));
+        CHECK(replacement.has_value());
+        if (!replacement) std::terminate();
+        replacement->close();
+        *listener = std::move(*replacement);
+    } else listener->close();
     const bool completed = pump_until(loop, done, 1);
     CHECK(completed);
     if (!completed) {
@@ -512,6 +523,75 @@ void test_pending_accept_close(bool destroy_owner) {
     CHECK(loop.run_once(0ms).has_value());
     CHECK(done.load() == 1);
     CHECK(destroy_owner ? !listener : listener->native_handle() == invalid_handle);
+}
+
+void test_accept_batch_destroys_sibling() {
+    test::section("one queued accept completion may destroy another listener");
+    auto created = EventLoop::create();
+    CHECK(created.has_value());
+    if (!created) return;
+    auto one = tcp::Listener::bind(*created, Endpoint::loopback(0));
+    auto two = tcp::Listener::bind(*created, Endpoint::loopback(0));
+    CHECK(one && two);
+    if (!one || !two) return;
+    const auto endpoint_one = one->local_endpoint();
+    const auto endpoint_two = two->local_endpoint();
+    auto first = std::make_unique<tcp::Listener>(std::move(*one));
+    auto second = std::make_unique<tcp::Listener>(std::move(*two));
+    std::atomic<int> done{0};
+    int accepted = 0, cancelled = 0;
+    struct Accept {
+        static DetachedTask run(tcp::Listener& listener, std::unique_ptr<tcp::Listener>& sibling,
+                                std::atomic<int>& done, int& accepted, int& cancelled) {
+            const auto result = co_await listener.accept();
+            if (result) {
+                ++accepted;
+                sibling.reset();
+            } else {
+                CHECK(result.error() == Errc::cancelled);
+                ++cancelled;
+            }
+            ++done;
+        }
+        static Task<void> connect_both(EventLoop& loop, Endpoint first_endpoint, Endpoint second_endpoint,
+                                       tcp::Socket& first_socket, tcp::Socket& second_socket) {
+            auto result = co_await tcp::connect(loop, first_endpoint, {}, {.deadline = Clock::now() + 5s});
+            if (!result) co_return;
+            first_socket = std::move(*result);
+            result = co_await tcp::connect(loop, second_endpoint, {}, {.deadline = Clock::now() + 5s});
+            if (result) second_socket = std::move(*result);
+        }
+    };
+    Accept::run(*first, second, done, accepted, cancelled);
+    Accept::run(*second, first, done, accepted, cancelled);
+    std::promise<bool> ready;
+    auto ready_result = ready.get_future();
+    std::promise<void> release;
+    auto released = release.get_future();
+    std::thread clients([&] {
+        auto loop = EventLoop::create();
+        tcp::Socket a, b;
+        bool success = false;
+        if (loop) success = loop->run_until_complete(
+            Accept::connect_both(*loop, endpoint_one, endpoint_two, a, b)).has_value() && a.valid() && b.valid();
+        ready.set_value(success);
+        released.wait();
+    });
+    // Both connections are established before this loop dequeues anything;
+    // on IOCP, both AcceptEx completions are now eligible for the same batch.
+    const bool connected = ready_result.get();
+    CHECK(connected);
+    if (!connected) {
+        first.reset();
+        second.reset();
+    }
+    const bool completed = pump_until(*created, done, 2);
+    release.set_value();
+    clients.join();
+    CHECK(completed);
+    if (!completed) std::terminate();
+    if (connected) CHECK(accepted == 1 && cancelled == 1);
+    CHECK(created->outstanding() == 0);
 }
 
 struct LoopbackPair {
@@ -554,11 +634,17 @@ struct LoopbackPair {
             // destroyed local state.
             std::terminate();
         }
+#if MIRA_HAS_READINESS_API
+        for (const auto handle : {listener->native_handle(), server.native_handle(), client.native_handle()}) {
+            const auto flags = ::fcntl(handle, F_GETFD, 0);
+            CHECK(flags >= 0 && (flags & FD_CLOEXEC) != 0);
+        }
+#endif
         return server.valid() && client.valid();
     }
 };
 
-void test_pending_read_close(bool destroy_owner) {
+void test_pending_read_close(bool destroy_owner, bool move_assign = false) {
     test::section(destroy_owner ? "pending read close / destroy owner"
                                 : "pending read close / reentrant close");
 
@@ -607,7 +693,8 @@ void test_pending_read_close(bool destroy_owner) {
     Read::run(socket, destroy_owner, failure, done);
     CHECK(done.load() == 0);
     CHECK(loop.outstanding() == 1);
-    socket->close();
+    if (move_assign) *socket = tcp::Socket{};
+    else socket->close();
     const bool completed = pump_until(loop, done, 1);
     CHECK(completed);
     if (!completed) {
@@ -880,8 +967,11 @@ int main() {
     test_socket_move_and_close();
     test_pending_accept_close(false);
     test_pending_accept_close(true);
+    test_pending_accept_close(true, true);
+    test_accept_batch_destroys_sibling();
     test_pending_read_close(false);
     test_pending_read_close(true);
+    test_pending_read_close(true, true);
     test_loop_destruction_pending_accept();
     test_loop_destruction_pending_read();
     test_socket_forwards_options();

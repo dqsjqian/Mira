@@ -17,6 +17,10 @@ namespace {
     return std::string_view{reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
 
+std::size_t partial_line_size(std::span<const std::byte> window) noexcept {
+    return window.size() - (!window.empty() && window.back() == std::byte{'\r'} ? 1u : 0u);
+}
+
 /// A line located inside the buffer, plus how many bytes to consume for it.
 struct Line {
     std::string_view text;    // without the terminator
@@ -285,7 +289,7 @@ Result<bool> RequestParser::parse_start_line(Buffer& input) {
     }
     if (!located->has_value()) {
         // Refuse to buffer an unbounded start line while waiting for its end.
-        if (input.size() > limits_.max_start_line) {
+        if (partial_line_size(input.readable()) > limits_.max_start_line) {
             return fail(ParseError::limit_exceeded);
         }
         return false;
@@ -342,6 +346,7 @@ Result<bool> RequestParser::parse_start_line(Buffer& input) {
     }
 
     request_.method = method_from_token(method);
+    request_.method_token.assign(method);
     request_.target.assign(target);
 
     input.consume(line.consumed);
@@ -355,7 +360,7 @@ Result<bool> RequestParser::parse_headers(Buffer& input) {
             return fail(located.error());
         }
         if (!located->has_value()) {
-            if (input.size() > limits_.max_header_line) {
+            if (partial_line_size(input.readable()) > limits_.max_header_line) {
                 return fail(ParseError::limit_exceeded);
             }
             return false;
@@ -383,6 +388,21 @@ Result<bool> RequestParser::parse_headers(Buffer& input) {
             if (request_.headers.empty()) {
                 return fail(ParseError::malformed_header);
             }
+            for (const char c : line.text) {
+                if (!grammar::is_field_vchar(static_cast<unsigned char>(c)))
+                    return fail(ParseError::malformed_header);
+            }
+            if (line.text.size() > limits_.max_headers_total - headers_total_)
+                return fail(ParseError::limit_exceeded);
+            auto& previous = request_.headers.entries_.back();
+            const auto continuation = grammar::trim_ows(line.text);
+            const auto current = previous.first.size() + 1 + previous.second.size();
+            if (current >= limits_.max_header_line ||
+                continuation.size() > limits_.max_header_line - current - 1)
+                return fail(ParseError::limit_exceeded);
+            previous.second.push_back(' ');
+            previous.second.append(continuation);
+            headers_total_ += line.text.size();
             input.consume(line.consumed);
             continue;
         }
@@ -415,13 +435,11 @@ Result<bool> RequestParser::parse_headers(Buffer& input) {
         }
         const std::string_view value = grammar::trim_ows(raw_value);
 
-        if (request_.headers.size() + 1 > limits_.max_header_count) {
+        if (request_.headers.size() >= limits_.max_header_count ||
+            line.text.size() > limits_.max_headers_total - headers_total_) {
             return fail(ParseError::limit_exceeded);
         }
         headers_total_ += line.text.size();
-        if (headers_total_ > limits_.max_headers_total) {
-            return fail(ParseError::limit_exceeded);
-        }
 
         request_.headers.append(std::string{name}, std::string{value});
         input.consume(line.consumed);
@@ -481,10 +499,13 @@ Result<void> RequestParser::decide_framing() {
     if (cl_count > 0) {
         const std::vector<std::string_view> values = request_.headers.get_all("Content-Length");
         std::optional<std::uint64_t> agreed;
-        for (const std::string_view field : values) {
-            // A single field may itself be a list: "Content-Length: 5, 5".
-            for (const std::string_view item : grammar::split_list(field)) {
-                const std::optional<std::uint64_t> parsed = parse_decimal(item);
+        for (std::string_view field : values) {
+            // Accept only identical decimal list members. Empty members must
+            // not disappear here: response parsing applies the same rule.
+            for (;;) {
+                const auto comma = field.find(',');
+                const std::optional<std::uint64_t> parsed =
+                    parse_decimal(grammar::trim_ows(field.substr(0, comma)));
                 if (!parsed) {
                     return fail(ParseError::malformed_content_length);
                 }
@@ -492,6 +513,8 @@ Result<void> RequestParser::decide_framing() {
                     return fail(ParseError::inconsistent_content_length);
                 }
                 agreed = parsed;
+                if (comma == std::string_view::npos) break;
+                field.remove_prefix(comma + 1);
             }
         }
         if (!agreed) {
@@ -536,7 +559,8 @@ Result<RequestParser::Progress> RequestParser::read_chunk_header(Buffer& input) 
         return fail(located.error());
     }
     if (!located->has_value()) {
-        if (input.size() > limits_.max_chunk_extension + 32) {
+        const auto size = partial_line_size(input.readable());
+        if (size > 32 && size - 32 > limits_.max_chunk_extension) {
             return fail(ParseError::limit_exceeded);
         }
         return Progress::need_data;
@@ -544,6 +568,10 @@ Result<RequestParser::Progress> RequestParser::read_chunk_header(Buffer& input) 
 
     const Line line = **located;
 
+    // Bound the complete line exactly as an incomplete one; packet boundaries
+    // must not decide whether a long run of leading zeroes is accepted.
+    if (line.text.size() > 32 && line.text.size() - 32 > limits_.max_chunk_extension)
+        return fail(ParseError::limit_exceeded);
     // chunk-size [ chunk-ext ] CRLF
     const std::size_t semicolon = line.text.find(';');
     const std::string_view size_text = line.text.substr(0, semicolon);
@@ -551,6 +579,10 @@ Result<RequestParser::Progress> RequestParser::read_chunk_header(Buffer& input) 
         const std::string_view extension = line.text.substr(semicolon + 1);
         if (extension.size() > limits_.max_chunk_extension) {
             return fail(ParseError::limit_exceeded);
+        }
+        for (const char c : extension) {
+            if (!grammar::is_field_vchar(static_cast<unsigned char>(c)))
+                return fail(ParseError::malformed_chunk);
         }
     }
 
@@ -562,7 +594,7 @@ Result<RequestParser::Progress> RequestParser::read_chunk_header(Buffer& input) 
     if (*size > limits_.max_chunk_size) {
         return fail(ParseError::limit_exceeded);
     }
-    if (body_seen_ + *size > limits_.max_body_size) {
+    if (*size > limits_.max_body_size - body_seen_) {
         return fail(ParseError::limit_exceeded);
     }
 
@@ -628,7 +660,7 @@ Result<RequestParser::Progress> RequestParser::read_chunk_trailer(Buffer& input)
             return fail(located.error());
         }
         if (!located->has_value()) {
-            if (input.size() > limits_.max_header_line) {
+            if (partial_line_size(input.readable()) > limits_.max_header_line) {
                 return fail(ParseError::limit_exceeded);
             }
             return Progress::need_data;
@@ -659,11 +691,17 @@ Result<RequestParser::Progress> RequestParser::read_chunk_trailer(Buffer& input)
             }
         }
 
-        if (trailers_.size() + 1 > limits_.max_header_count) {
+        if (trailers_.size() >= limits_.max_header_count - request_.headers.size() ||
+            line.text.size() > limits_.max_headers_total - headers_total_) {
             return fail(ParseError::limit_exceeded);
         }
-
-        trailers_.append(std::string{name}, std::string{grammar::trim_ows(line.text.substr(colon + 1))});
+        const auto value = grammar::trim_ows(line.text.substr(colon + 1));
+        for (const char c : value) {
+            if (!grammar::is_field_vchar(static_cast<unsigned char>(c)))
+                return fail(ParseError::malformed_header);
+        }
+        headers_total_ += line.text.size();
+        trailers_.append(std::string{name}, std::string{value});
         input.consume(line.consumed);
         return Progress::advanced;
     }

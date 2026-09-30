@@ -114,11 +114,13 @@ def rejected_socket(client):
         pass
 
 
-def h2(server, cert, curl):
+def h2(server, cert, curl, upload_size=0):
     completed = subprocess.run(
         [curl, "--http2", "--noproxy", "*", "--cacert", str(cert),
          "--resolve", f"localhost:{server.port}:127.0.0.1", "-fsS", "--max-time", "5",
-         f"https://localhost:{server.port}/", "-w", "\n%{http_version} %{http_code}"],
+         f"https://localhost:{server.port}/", "-w", "\n%{http_version} %{http_code}",
+         *(["--data-binary", "@-"] if upload_size else [])],
+        input="x" * upload_size if upload_size else None,
         capture_output=True, text=True, timeout=10,
     )
     assert completed.returncode == 0, completed.stderr
@@ -213,8 +215,11 @@ def verify_pending_handshake_shutdown(executable, cert, key):
 def certificate(openssl, directory, name):
     cert = directory / f"{name}.pem"
     key = directory / f"{name}.key"
+    config = directory / "openssl.cnf"
+    config.write_text("[req]\ndistinguished_name=dn\n[dn]\n", encoding="ascii")
     result = subprocess.run(
-        [openssl, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+        [openssl, "req", "-config", str(config), "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+         "-pkeyopt", "ec_param_enc:named_curve",
          "-nodes", "-days", "1", "-subj", "/CN=localhost",
          "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
          "-keyout", str(key), "-out", str(cert)],
@@ -262,9 +267,11 @@ def main():
             h1(server, trusted)
             if curl:
                 h2(server, cert, curl)
+                h2(server, cert, curl, 65535)
+                h2(server, cert, curl, 65536)
             invalid_clients(server, trusted, untrusted, unsupported, no_alpn)
             stats = server.finish()
-            assert stats["h1"] == 1 and stats["h2"] == (1 if curl else 0), stats
+            assert stats["h1"] == 1 and stats["h2"] == (3 if curl else 0), stats
             assert stats["alpn_rejected"] == 1 and stats["failed"] >= 3, stats
         verify_handshake_limit(args.executable, cert, key, trusted)
         verify_connection_limit(args.executable, cert, key, trusted)

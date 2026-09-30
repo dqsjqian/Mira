@@ -36,8 +36,8 @@ struct Entry {
     dns::Rdata data;
 };
 std::vector<Entry> zone;
-Mira::EventLoop* event_loop = nullptr;
 #if MIRA_EXAMPLE_TLS
+Mira::EventLoop* event_loop = nullptr;
 std::optional<Mira::tls::Context> tls_context;
 #endif
 
@@ -174,7 +174,9 @@ int main(int argc, char** argv) {
 #endif
     auto loop = Mira::EventLoop::create();
     if (!loop) return 1;
+#if MIRA_EXAMPLE_TLS
     event_loop = &*loop;
+#endif
     if (files.size() == 2) {
 #if MIRA_EXAMPLE_TLS
         auto context = Mira::tls::Context::server(files[0], files[1], "http/1.1");

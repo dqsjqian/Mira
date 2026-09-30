@@ -482,7 +482,7 @@ void run_exchange(const Certificates& certificates,
         CHECK(exchange.target == "/secure");
         CHECK(exchange.body == exchange.payload);
         const std::string expected = "HTTP/1.1 200 OK\r\n"
-                                     "Content-Type: application/octet-stream\r\nContent-Length: " +
+                                     "Content-Type: application/octet-stream\r\nConnection: close\r\nContent-Length: " +
                                      std::to_string(exchange.payload.size()) + "\r\n\r\n" +
                                      exchange.payload;
         CHECK(exchange.response == expected);
@@ -1799,6 +1799,28 @@ void test_key_update(const Certificates& certificates) {
     CHECK(loop->outstanding() == 0);
 }
 
+void test_sni_names(const Certificates& certificates) {
+    test::section("IP SAN verification omits SNI while DNS names retain SNI");
+    auto loop = EventLoop::create();
+    auto client = tls::Context::client(certificates.ca);
+    CHECK(loop && client);
+    if (!loop || !client) return;
+    for (const auto name : {"localhost", "127.0.0.1"}) {
+        KeyUpdateTransport transport{*loop, certificates};
+        auto stream = tls::Stream<KeyUpdateTransport>::create(*loop, transport, *client, name);
+        CHECK(stream.has_value());
+        if (!stream) continue;
+        auto handshake = [&]() -> Task<void> {
+            CHECK((co_await stream->handshake({.deadline = Clock::now() + 2s})).has_value());
+        };
+        CHECK(loop->run_until_complete(handshake()).has_value());
+        const auto sni = SSL_get_servername(transport.peer.get(), TLSEXT_NAMETYPE_host_name);
+        if (std::string_view{name} == "localhost") CHECK(sni && std::string_view{sni} == "localhost");
+        else CHECK(sni == nullptr);
+        CHECK(loop->outstanding() == 0);
+    }
+}
+
 void test_configuration(const Certificates& certificates) {
     test::section("TLS configuration errors and error domains");
     const auto missing = (certificates.directory / "does-not-exist.pem").string();
@@ -1843,6 +1865,7 @@ int main(int argc, char** argv) {
         Certificates certificates;
         certificates.create();
         test_configuration(certificates);
+        test_sni_names(certificates);
         test_duplex(certificates);
         test_deterministic_scheduling(certificates);
         test_key_update(certificates);

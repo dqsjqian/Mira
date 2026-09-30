@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <map>
+#include <deque>
 #include <set>
 #include <utility>
 
@@ -23,6 +24,10 @@ struct Session::Impl {
     SessionState state = SessionState::idle;
     Bytes input, output;
     std::vector<Event> events;
+    std::size_t external_events = 0;
+    std::deque<std::uint16_t> pending_resends;
+    std::deque<std::uint16_t> pending_releases;
+    std::size_t active_publishes = 0;
 
     std::uint16_t server_receive_max = 65535;
     std::size_t server_max_packet = max_packet_size;
@@ -36,6 +41,7 @@ struct Session::Impl {
         Publish publish;
         Stage stage;
         std::uint64_t order;
+        bool sent_on_connection = true;
     };
     std::map<std::uint16_t, Outgoing> outgoing;
     struct Request {
@@ -56,6 +62,8 @@ struct Session::Impl {
     Result<void> queue(const Packet& packet) {
         auto bytes = encode(packet, options.version);
         if (!bytes) return fail(bytes.error());
+        if (state == SessionState::connected && bytes->size() > server_max_packet)
+            return fail(MqttError::packet_too_large);
         if (bytes->size() > options.max_output || output.size() > options.max_output - bytes->size())
             return fail(Errc::limit_exceeded);
         output.insert(output.end(), bytes->begin(), bytes->end());
@@ -69,14 +77,20 @@ struct Session::Impl {
         return fail(error);
     }
 
+    bool room_for_events(std::size_t count) const {
+        return external_events <= options.max_events &&
+               events.size() <= options.max_events - external_events &&
+               count <= options.max_events - external_events - events.size();
+    }
+
     Result<void> push(Event event) {
-        if (events.size() >= options.max_events)
+        if (!room_for_events(1))
             return close_with(make_error_code(Errc::limit_exceeded), reason::implementation_specific_error);
         events.push_back(std::move(event));
         return {};
     }
 
-    // Abandonment notices are bounded by the state they report.
+    // Callers reserve capacity for the complete abandonment batch first.
     void discard(Event::Kind kind, std::uint16_t id) {
         Event event{kind};
         event.packet_id = id;
@@ -91,6 +105,9 @@ struct Session::Impl {
         std::sort(lost.begin(), lost.end());
         for (const auto& [unused, id] : lost) discard(Event::Kind::published, id);
         outgoing.clear();
+        active_publishes = 0;
+        pending_resends.clear();
+        pending_releases.clear();
         releasing.clear();
     }
 
@@ -111,12 +128,17 @@ struct Session::Impl {
         event.session_present = c.session_present;
         event.properties = c.properties;
         if (failure(options.version, c.reason)) {
-            events.push_back(std::move(event));
+            auto result = push(std::move(event));
             state = SessionState::closed;
+            if (!result) return result;
             return fail(MqttError::refused);
         }
+        if (v5() && c.properties.authentication_method != options.properties.authentication_method)
+            return close_with(make_error_code(MqttError::protocol_error), reason::protocol_error);
         if (c.session_present && options.clean_start)
             return close_with(make_error_code(MqttError::protocol_error), reason::protocol_error);
+        if (!room_for_events(1 + (c.session_present ? 0 : outgoing.size())))
+            return close_with(make_error_code(Errc::limit_exceeded), reason::implementation_specific_error);
         const auto& p = c.properties;
         server_receive_max = p.receive_maximum.value_or(65535);
         server_max_packet = p.maximum_packet_size.value_or(static_cast<std::uint32_t>(max_packet_size));
@@ -134,17 +156,58 @@ struct Session::Impl {
             std::vector<std::pair<std::uint64_t, std::uint16_t>> resend;
             for (const auto& [id, entry] : outgoing) resend.emplace_back(entry.order, id);
             std::sort(resend.begin(), resend.end());
+            // Validate the complete replay set before emitting any retransmit.
+            // Oversized retained messages stay retained and fail this connection.
+            pending_resends.clear();
+            pending_releases.clear();
             for (const auto& [unused, id] : resend) {
                 auto& entry = outgoing.at(id);
-                Packet packet = Ack{PacketType::pubrel, id, reason::success, {}};
-                if (entry.stage != Stage::pubcomp) {
-                    entry.publish.dup = true;
-                    packet = entry.publish;
-                }
-                if (auto r = queue(packet); !r) return close_with(r.error(), reason::implementation_specific_error);
+                entry.sent_on_connection = false;
+                if (entry.stage != Stage::pubcomp) entry.publish.dup = true;
+                auto packet = resend_packet(id, entry);
+                auto bytes = encode(packet, options.version);
+                if (!bytes) return close_with(bytes.error(), reason::implementation_specific_error);
+                if (bytes->size() > server_max_packet)
+                    return close_with(make_error_code(MqttError::packet_too_large), reason::packet_too_large);
+                if (bytes->size() > options.max_output)
+                    return close_with(make_error_code(Errc::limit_exceeded), reason::implementation_specific_error);
+                (entry.stage == Stage::pubcomp ? pending_releases : pending_resends).push_back(id);
             }
+            if (auto r = resume_output(); !r) return r;
         }
         return push(std::move(event));
+    }
+
+    Packet resend_packet(std::uint16_t id, const Outgoing& entry) const {
+        if (entry.stage == Stage::pubcomp) return Ack{PacketType::pubrel, id, reason::success, {}};
+        return entry.publish;
+    }
+    std::size_t sent_count() const { return active_publishes; }
+    Result<void> resume_output() {
+        // Separate queues avoid scanning every blocked PUBLISH on each ACK.
+        // Merge by original order while allowing controls past a full quota.
+        for (;;) {
+            while (!pending_resends.empty() && !outgoing.contains(pending_resends.front()))
+                pending_resends.pop_front();
+            while (!pending_releases.empty() && !outgoing.contains(pending_releases.front()))
+                pending_releases.pop_front();
+            const bool publish_ready = !pending_resends.empty() &&
+                (sent_count() < server_receive_max || outgoing.at(pending_resends.front()).stage == Stage::pubcomp);
+            if (!publish_ready && pending_releases.empty()) break;
+            const bool release_first = !pending_releases.empty() && (!publish_ready ||
+                outgoing.at(pending_releases.front()).order < outgoing.at(pending_resends.front()).order);
+            auto& pending = release_first ? pending_releases : pending_resends;
+            const auto id = pending.front();
+            auto it = outgoing.find(id);
+            auto& entry = it->second;
+            auto sent = submit(resend_packet(id, entry));
+            if (!sent && sent.error() == Errc::would_block) break;
+            if (!sent) return close_with(sent.error(), reason::implementation_specific_error);
+            entry.sent_on_connection = entry.stage != Stage::pubcomp;
+            if (entry.sent_on_connection) ++active_publishes;
+            pending.pop_front();
+        }
+        return {};
     }
 
     Result<void> publish_in(Publish p) {
@@ -176,12 +239,15 @@ struct Session::Impl {
     }
 
     Result<void> finished(std::uint16_t id, const Ack& a) {
+        const auto it = outgoing.find(id);
+        if (it != outgoing.end() && it->second.sent_on_connection) --active_publishes;
         outgoing.erase(id);
         Event event{Event::Kind::published};
         event.packet_id = id;
         event.reason = a.reason;
         event.properties = a.properties;
-        return push(std::move(event));
+        if (auto result = push(std::move(event)); !result) return result;
+        return resume_output();
     }
 
     Result<void> ack(const Ack& a) {
@@ -247,11 +313,16 @@ struct Session::Impl {
             Event event{Event::Kind::disconnected};
             event.reason = d->reason;
             event.properties = std::move(d->properties);
-            events.push_back(std::move(event));
+            auto result = push(std::move(event));
             state = SessionState::closed;
-            return {};
+            return result;
         }
         if (auto* au = std::get_if<Auth>(&packet)) {
+            if (!options.properties.authentication_method ||
+                au->properties.authentication_method != options.properties.authentication_method ||
+                au->reason == reason::reauthenticate ||
+                (state == SessionState::connecting && au->reason != reason::continue_authentication))
+                return close_with(make_error_code(MqttError::protocol_error), reason::protocol_error);
             Event event{Event::Kind::auth};
             event.reason = au->reason;
             event.properties = std::move(au->properties);
@@ -300,8 +371,15 @@ Result<Session> Session::create(ClientOptions options) {
     return session;
 }
 
-Result<void> Session::connect(std::uint64_t now) {
+Result<void> Session::connect(std::uint64_t now, std::size_t externally_buffered_events) {
     auto& s = *impl_;
+    // Drain prior events before reconnecting if all abandonment notices would
+    // not fit. Refusal is atomic, so the caller can consume and retry.
+    const auto notice_count = s.requests.size() + (s.options.clean_start ? s.outgoing.size() : 0);
+    if (externally_buffered_events > s.options.max_events ||
+        !s.room_for_events(externally_buffered_events) ||
+        notice_count > s.options.max_events - externally_buffered_events - s.events.size())
+        return fail(Errc::would_block);
     // Any state: a new CONNECT always means a new transport, whatever the old one knew.
     for (const auto& [id, request] : s.requests)
         s.discard(request.type == PacketType::subscribe ? Event::Kind::subscribed : Event::Kind::unsubscribed, id);
@@ -309,8 +387,14 @@ Result<void> Session::connect(std::uint64_t now) {
     if (s.options.clean_start) s.discard_session();
     s.input.clear();
     s.output.clear();
+    s.pending_resends.clear();
+    s.pending_releases.clear();
+    s.active_publishes = 0;
+    for (auto& [id, entry] : s.outgoing) { static_cast<void>(id); entry.sent_on_connection = false; }
     s.aliases.clear();
     s.ping_sent.reset();
+    s.state = SessionState::idle;
+    s.server_max_packet = max_packet_size;
     Connect c;
     c.version = s.options.version;
     c.client_id = s.options.client_id;
@@ -332,11 +416,17 @@ Result<void> Session::connect(std::uint64_t now) {
     return {};
 }
 
-Result<void> Session::receive(std::span<const std::byte> bytes, std::uint64_t now) {
+Result<void> Session::receive(std::span<const std::byte> bytes, std::uint64_t now,
+                              std::size_t externally_buffered_events) {
     auto& s = *impl_;
     static_cast<void>(now);
     if (s.state != SessionState::connecting && s.state != SessionState::connected)
         return fail(s.state == SessionState::closed ? Errc::eof : Errc::invalid_argument);
+    s.external_events = externally_buffered_events;
+    struct ResetExternalEvents {
+        std::size_t& count;
+        ~ResetExternalEvents() { count = 0; }
+    } reset{s.external_events};
     s.input.insert(s.input.end(), bytes.begin(), bytes.end());
     std::size_t offset = 0;
     Result<void> outcome;
@@ -352,7 +442,12 @@ Result<void> Session::receive(std::span<const std::byte> bytes, std::uint64_t no
         }
         if (!decoded->packet) break;
         offset += decoded->consumed;
-        if (outcome = s.handle(std::move(*decoded->packet)); !outcome) break;
+        if (outcome = s.handle(std::move(*decoded->packet)); !outcome) {
+            if (s.state != SessionState::closed)
+                outcome = s.close_with(outcome.error(), outcome.error() == MqttError::packet_too_large
+                    ? reason::packet_too_large : reason::implementation_specific_error);
+            break;
+        }
     }
     s.input.erase(s.input.begin(), s.input.begin() + static_cast<std::ptrdiff_t>(offset));
     return outcome;
@@ -368,7 +463,7 @@ Result<std::uint16_t> Session::publish(Publish message) {
     message.dup = false;
     message.packet_id = 0;
     if (message.qos != QoS::at_most_once) {
-        if (s.outgoing.size() >= s.server_receive_max) return fail(Errc::would_block);
+        if (!s.pending_resends.empty() || s.sent_count() >= s.server_receive_max) return fail(Errc::would_block);
         message.packet_id = s.allocate();
         if (!message.packet_id) return fail(Errc::would_block);
     }
@@ -377,6 +472,7 @@ Result<std::uint16_t> Session::publish(Publish message) {
     if (id) {
         const auto stage = message.qos == QoS::at_least_once ? Impl::Stage::puback : Impl::Stage::pubrec;
         s.outgoing.emplace(id, Impl::Outgoing{std::move(message), stage, s.order++});
+        ++s.active_publishes;
     }
     return id;
 }
@@ -421,6 +517,11 @@ Result<void> Session::auth(std::uint8_t code, Properties properties) {
     auto& s = *impl_;
     if (!s.v5() || (s.state != SessionState::connected && s.state != SessionState::connecting))
         return fail(Errc::invalid_argument);
+    if (!s.options.properties.authentication_method ||
+        properties.authentication_method != s.options.properties.authentication_method ||
+        (code != reason::continue_authentication && code != reason::reauthenticate) ||
+        (s.state == SessionState::connecting && code != reason::continue_authentication))
+        return fail(Errc::invalid_argument);
     if (auto r = s.queue(Auth{code, std::move(properties)}); !r)
         return fail(r.error() == Errc::limit_exceeded ? make_error_code(Errc::would_block) : r.error());
     return {};
@@ -450,7 +551,9 @@ std::uint64_t Session::next_timer() const noexcept {
 Bytes Session::take_output(std::uint64_t now) {
     auto& s = *impl_;
     if (!s.output.empty()) s.last_sent = std::max(s.last_sent, now);
-    return std::exchange(s.output, {});
+    auto bytes = std::exchange(s.output, {});
+    if (s.state == SessionState::connected) static_cast<void>(s.resume_output());
+    return bytes;
 }
 
 bool Session::has_output() const noexcept { return !impl_->output.empty(); }

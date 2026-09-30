@@ -10,6 +10,11 @@ Only the sources of these three dependencies are pinned; byte-for-byte
 identical outputs across different compilers/OpenSSL are not guaranteed.
 By default all writes stay inside the repository's build/protocol-deps; the
 system OpenSSL is neither installed nor modified.
+
+Fresh CMake builds inherit CC/CXX, CFLAGS/CXXFLAGS and LDFLAGS. Sanitizer or
+libFuzzer users must use the same compiler/runtime as their consumer and a
+separate --path (and therefore prefix), so instrumented archives never replace
+the ordinary SDK. Include matching sanitizer flags in LDFLAGS for CMake probes.
 """
 
 from __future__ import annotations

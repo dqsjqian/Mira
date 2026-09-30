@@ -13,6 +13,7 @@
 #include "mira/core/resource_budget.hpp"
 
 #include <chrono>
+#include <algorithm>
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
@@ -20,7 +21,9 @@
 #include <exception>
 #include "mira/core/functional.hpp"  // mira::move_only_function
 #include <map>
+#include <limits>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <utility>
 #include <vector>
@@ -28,6 +31,32 @@
 namespace Mira::detail {
 
 using Clock = std::chrono::steady_clock;
+
+/// Relative waits must not overflow into the past. Nonpositive delays are
+/// already due; excessively large positive delays wait until the clock limit.
+inline Clock::time_point deadline_after(Clock::time_point now, Clock::duration delay) noexcept {
+    if (delay <= Clock::duration::zero()) return now;
+    if (now > Clock::time_point::max() - delay) return Clock::time_point::max();
+    return now + delay;
+}
+
+/// Describe only a representable prefix of a scatter write. In particular,
+/// if one piece is shortened, subsequent pieces must wait for the next write.
+/// Otherwise writev_all would mistake later-piece bytes for the missing prefix.
+template<class Visitor>
+std::size_t visit_scatter_prefix(std::span<const std::span<const std::byte>> pieces,
+                                std::size_t max_bytes, std::size_t max_pieces,
+                                Visitor&& visit) {
+    std::size_t count = 0;
+    for (const auto piece : pieces) {
+        if (max_bytes == 0 || count == max_pieces) break;
+        if (piece.empty()) continue;
+        const auto length = (std::min)(piece.size(), max_bytes);
+        visit(count++, piece.first(length));
+        max_bytes -= length;
+    }
+    return count;
+}
 
 /// Stable identity for one in-flight operation.
 ///
@@ -113,11 +142,13 @@ public:
     /// front "on purpose". That was wrong: it also reordered a deadline that
     /// had genuinely expired first, turning a timed-out sleep into a
     /// successful one.
-    void extract_expired(Clock::time_point now, std::vector<TimerTarget>& out) {
-        while (!timers_.empty() && timers_.begin()->first.deadline <= now) {
-            out.push_back(timers_.begin()->second);
+    std::size_t extract_expired(Clock::time_point now, std::span<TimerTarget> out) noexcept {
+        std::size_t count = 0;
+        while (count < out.size() && !timers_.empty() && timers_.begin()->first.deadline <= now) {
+            out[count++] = timers_.begin()->second;
             timers_.erase(timers_.begin());
         }
+        return count;
     }
 
 private:
@@ -152,17 +183,21 @@ private:
         return 0;
     }
 
+    const auto bounded_ms = [](Clock::duration duration) {
+        if (duration <= Clock::duration::zero()) return 0;
+        const auto rounded = ceil<milliseconds>(duration).count();
+        const auto maximum = (std::numeric_limits<int>::max)();
+        return rounded > maximum ? maximum : static_cast<int>(rounded);
+    };
     int limit = -1;
     if (caller_timeout != Clock::duration::min()) {
-        const auto rounded = ceil<milliseconds>(caller_timeout).count();
-        limit = rounded <= 0 ? 0 : static_cast<int>(rounded);
+        limit = bounded_ms(caller_timeout);
     }
 
     if (earliest_deadline != Clock::time_point::max()) {
-        const Clock::duration remaining = earliest_deadline - Clock::now();
-        const int until_deadline = remaining <= Clock::duration::zero()
-                                       ? 0
-                                       : static_cast<int>(ceil<milliseconds>(remaining).count());
+        const auto now = Clock::now();
+        const int until_deadline = earliest_deadline <= now
+                                       ? 0 : bounded_ms(earliest_deadline - now);
         limit = limit < 0 ? until_deadline : (until_deadline < limit ? until_deadline : limit);
     }
 

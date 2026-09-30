@@ -48,7 +48,7 @@ struct ClientOptions {
     std::uint16_t receive_maximum = 64;
     /// Inbound topic aliases accepted (5.0); 0 refuses aliases.
     std::uint16_t topic_alias_maximum = 0;
-    /// Undelivered events.
+    /// Undelivered events, including connection and abandonment notices.
     std::size_t max_events = 4096;
     /// Unwritten output bytes.
     std::size_t max_output = 4 * 1024 * 1024;
@@ -101,8 +101,11 @@ public:
 
     /// Queue CONNECT for a new transport, discarding anything unsent on the old
     /// one. After a transport loss, call it again to resume (clean_start = false).
-    Result<void> connect(std::uint64_t now);
-    Result<void> receive(std::span<const std::byte> bytes, std::uint64_t now);
+    /// Returns would_block without changing state if abandonment notices will
+    /// not fit; consume prior events before retrying.
+    Result<void> connect(std::uint64_t now, std::size_t externally_buffered_events = 0);
+    Result<void> receive(std::span<const std::byte> bytes, std::uint64_t now,
+                         std::size_t externally_buffered_events = 0);
 
     /// Assigns the packet identifier (returned; 0 for QoS 0) and clears DUP.
     Result<std::uint16_t> publish(Publish message);

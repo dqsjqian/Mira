@@ -232,7 +232,9 @@ def main() -> int:
         else:
             with tempfile.TemporaryDirectory() as directory:
                 cert, key = Path(directory) / "cert.pem", Path(directory) / "key.pem"
-                subprocess.run([openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key),
+                config = Path(directory) / "openssl.cnf"
+                config.write_text("[req]\ndistinguished_name=dn\n[dn]\n", encoding="ascii")
+                subprocess.run([openssl, "req", "-config", str(config), "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key),
                                 "-out", str(cert), "-days", "2", "-subj", "/CN=localhost",
                                 "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
                                check=True, capture_output=True, timeout=60)

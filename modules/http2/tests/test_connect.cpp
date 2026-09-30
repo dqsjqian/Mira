@@ -215,6 +215,44 @@ void wire_validation() {
         check(server.state() == http2::State::open, "malformed stream killed connection");
     }
 }
+void rejected_streaming_length() {
+    auto c = session(http2::Role::client, true), s = session(http2::Role::server, true);
+    Driver d{c, s}; d.drive();
+    const auto id = require(c.request_stream(request_headers())); d.drive();
+    require(s.respond_stream(id, {{":status", "403"}, {"content-length", "3"}}));
+    require(s.write_body(id, bytes("ab"))); d.drive();
+    check(!s.write_body(id, bytes("cd")), "rejected CONNECT exceeded content-length");
+    require(s.write_body(id, bytes("c"), true)); d.drive();
+    check(c.stream(id)->remote_end && !c.stream(id)->error && c.stream(id)->body == bytes("abc"),
+          "rejected CONNECT lost incremental body");
+    const auto limited = require(c.request_stream(request_headers())); d.drive();
+    require(s.respond_stream(limited, {{":status", "403"}}));
+    const Bytes block(8192, std::byte{'x'});
+    require(s.write_body(limited, block)); d.drive();
+    require(c.take_body(limited));
+    require(s.write_body(limited, block)); d.drive();
+    const auto exceeded = s.write_body(limited, bytes("x"));
+    check(!exceeded && exceeded.error() == Errc::limit_exceeded,
+          "rejected CONNECT bypassed cumulative body limit");
+}
+
+void rejected_wire_length() {
+    for (const std::string payload : {"ab", "abcd"}) {
+        auto c = session(http2::Role::client, true), s = session(http2::Role::server, true);
+        Driver d{c, s}; d.drive();
+        check(require(c.request_stream(request_headers())) == 1, "first stream ID"); d.drive();
+        auto head = raw_headers({{":status", "403"}, {"content-length", "3"}});
+        require(c.receive(head));
+        Bytes data(9);
+        data[2] = static_cast<std::byte>(payload.size());
+        data[3] = std::byte{NGHTTP2_DATA}; data[4] = std::byte{NGHTTP2_FLAG_END_STREAM};
+        data[8] = std::byte{1};
+        const auto body = bytes(payload); data.insert(data.end(), body.begin(), body.end());
+        require(c.receive(data)); require(c.output());
+        check(c.stream(1)->error && c.state() == http2::State::open,
+              "malformed rejected CONNECT body did not reset only the stream");
+    }
+}
 struct WaitingDriver {
     EventLoop& loop;
     Driver& wire;
@@ -259,6 +297,7 @@ int main() {
     try {
         websocket_roundtrip(false); websocket_roundtrip(true);
         lifecycle_and_validation(); wire_validation();
+        rejected_streaming_length(); rejected_wire_length();
         auto loop = require(EventLoop::create()); require(loop.run_until_complete(async_lifecycle(loop)));
         std::cout << "HTTP/2 Extended CONNECT passed\n";
     } catch (const std::exception& error) {

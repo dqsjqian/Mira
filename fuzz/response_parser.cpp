@@ -14,7 +14,7 @@
 //   * a parse either fails with a named error or makes progress;
 //   * one message never reports a second head;
 //   * a body step never reports zero bytes;
-//   * a 1xx completes without done(); the documented reset loop continues.
+//   * each informational response resets before the final response is parsed.
 //
 // Build with -DMIRA_BUILD_FUZZERS=ON and a clang that ships libFuzzer.
 // Seeds live in fuzz/corpus/response_parser/ — a compact tour of the
@@ -38,8 +38,8 @@ using Mira::http::ParseStep;
 using Mira::http::ResponseParser;
 
 /// Feed `data` to a fresh parser one slice at a time, with slice boundaries
-/// derived from the data itself. After a complete-but-not-done message
-/// (a 1xx), the documented reset loop runs so state-machine reuse across
+/// independent of the wire's first byte. After an informational message
+/// (except protocol-switching 101), reset runs so state-machine reuse across
 /// messages is exercised too.
 ///
 /// Returns true when every observable behaviour was legal; false marks a
@@ -81,12 +81,13 @@ bool drive(std::string_view data, std::uint8_t strategy) {
                 if (parser.body().empty()) return false;  // a body step with no bytes lies
                 continue;
             case ParseStep::complete:
-                if (parser.done()) {
-                    return true;  // well-formed; a pipelined tail is next-message business
+                if (parser.response().status < 100 || parser.response().status >= 200 ||
+                    parser.response().status == 101) {
+                    return true;  // a final response or protocol switch ends this exchange
                 }
-                // Informational (1xx) completes without done(): the parser's
-                // documented protocol is reset-then-continue. Bound the
-                // chain, because a response can legally have at most a few.
+                // Each 1xx is a complete message. Reset even though done() is
+                // true, retaining unread bytes of the following response.
+                // Cap work for fuzzing without imposing a protocol chain limit.
                 parser.reset(method);
                 heads = 0;
                 if (++informational > 16) return true;  // pathological 1xx storm
@@ -118,11 +119,10 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         return 0;  // the parser's limits are unit-tested; fuzz the grammar
     }
     const std::string_view payload{reinterpret_cast<const char*>(data), size};
-    const std::uint8_t strategy = static_cast<std::uint8_t>(payload[0] % 5);
-
-    if (!drive(payload, strategy)) {
-        // Invariant broken: abort so libFuzzer records the input.
-        std::abort();
+    // Exercise every request-method context without consuming a selector from
+    // the HTTP wire; existing literal HTTP corpus entries remain effective.
+    for (std::uint8_t strategy = 0; strategy < 4; ++strategy) {
+        if (!drive(payload, strategy)) std::abort();
     }
     return 0;
 }

@@ -287,6 +287,29 @@ int main(int argc, char** argv) {
             }
         }
         if (!head_done) throw std::runtime_error("HEAD streaming finish lost");
+        // Content-Length is representation metadata for HEAD and 304 even
+        // when the whole-body API has no actual response payload.
+        for (const bool cached : {false, true}) {
+            const auto metadata = require(client.request(cached ? get : head_headers));
+            bool metadata_done = false;
+            for (int i = 0; i < 3000 && !metadata_done; ++i) {
+                drive();
+                for (auto& e : server.take_events()) {
+                    if (e.stream_id != metadata || e.kind != http3::Event::Kind::end) continue;
+                    const http3::Headers fields{{":status", cached ? "304" : "200"}, {"content-length", "9"}};
+                    if (cached && server.respond(metadata, fields, one))
+                        throw std::runtime_error("304 body accepted");
+                    require(server.respond(metadata, fields));
+                }
+                for (auto& e : client.take_events()) {
+                    if (e.stream_id != metadata) continue;
+                    if (e.kind == http3::Event::Kind::body || e.kind == http3::Event::Kind::reset)
+                        throw std::runtime_error("bodyless representation metadata rejected");
+                    if (e.kind == http3::Event::Kind::end) metadata_done = true;
+                }
+            }
+            if (!metadata_done) throw std::runtime_error("bodyless metadata response lost");
+        }
         auto tiny_stream = require(client.request_stream(get));
         std::size_t tiny_received = 0;
         bool tiny_done = false;

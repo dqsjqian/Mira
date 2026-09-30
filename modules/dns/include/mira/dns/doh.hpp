@@ -18,6 +18,7 @@
 #include "mira/http/message.hpp"
 
 #include <cstddef>
+#include <algorithm>
 #include <span>
 #include <string>
 #include <string_view>
@@ -37,7 +38,8 @@ inline constexpr std::string_view media_type = "application/dns-message";
 /// POST head; send the encoded query as the body.
 [[nodiscard]] Result<http::Request> make_post(std::string_view authority, std::string_view path);
 
-/// 2xx, application/dns-message, bounded body, then decode.
+/// 2xx, application/dns-message, bounded body, then decode. Record TTLs are
+/// reduced by the HTTP Age field (saturating at zero) before being returned.
 [[nodiscard]] Result<Message> parse_response(const http::Response& response,
                                              std::span<const std::byte> body,
                                              const Limits& limits = {});
@@ -60,6 +62,7 @@ template<BoundedStream Stream>
                                           std::string_view authority, std::string_view path,
                                           Message question, Method method = Method::get,
                                           OperationOptions io = {}, Limits limits = {}) {
+    limits.max_message_size = (std::min)(limits.max_message_size, std::size_t{65535});
     question.header.id = 0;
     auto wire = encode(question);
     if (!wire) co_return fail(wire.error());
@@ -69,13 +72,25 @@ template<BoundedStream Stream>
         method == Method::post ? std::span<const std::byte>{*wire} : std::span<const std::byte>{};
     auto started = co_await connection.start(*request, body, io);
     if (!started) co_return fail(started.error());
+    // HTTP guards cover its own operations, but collecting a body or creating
+    // the next read task can throw between them. End the idle exchange on all
+    // such exits so the borrowed connection remains safe to destroy.
+    struct ResponseGuard {
+        http::ClientConnection<Stream>& connection;
+        bool drained = false;
+        ~ResponseGuard() noexcept {
+            if (!drained) static_cast<void>(connection.abandon());
+        }
+    } guard{connection};
     std::vector<std::byte> received;
     for (;;) {
         auto chunk = co_await connection.read_body();
         if (!chunk) co_return fail(chunk.error());
-        if (chunk->empty()) break;
+        if (chunk->empty()) {
+            guard.drained = true;
+            break;
+        }
         if (chunk->size() > limits.max_message_size - received.size()) {
-            static_cast<void>(connection.abandon());
             co_return fail(DnsError::too_large);
         }
         received.insert(received.end(), chunk->begin(), chunk->end());

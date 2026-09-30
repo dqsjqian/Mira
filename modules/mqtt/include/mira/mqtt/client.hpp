@@ -29,6 +29,8 @@
 #include <array>
 #include <chrono>
 #include <deque>
+#include <exception>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <utility>
@@ -46,6 +48,7 @@ inline std::uint64_t now_ns() noexcept {
 template<BoundedStream Stream>
 class Client {
 public:
+    using AuthHandler = std::function<Task<Result<Auth>>(const Event&, OperationOptions)>;
     Client(Client&&) noexcept = default;
     Client& operator=(Client&&) noexcept = default;
     Client(const Client&) = delete;
@@ -54,11 +57,14 @@ public:
     /// Send CONNECT on `stream` and wait for CONNACK. A refusal fails with
     /// `MqttError::refused`; `last_connack()` then holds the reason.
     [[nodiscard]] static Task<Result<Client>> connect(Stream& stream, ClientOptions options,
-                                                      OperationOptions io = {}) {
+                                                      OperationOptions io = {}, AuthHandler auth_handler = {}) {
+        const auto event_limit = options.max_events;
         auto session = Session::create(std::move(options));
         if (!session) co_return fail(session.error());
         Client client{stream, std::move(*session)};
-        auto connected = co_await client.handshake(io);
+        client.max_events_ = event_limit;
+        client.auth_handler_ = std::move(auth_handler);
+        auto connected = co_await client.handshake(stream, io);
         if (!connected) co_return fail(connected.error());
         co_return std::move(client);
     }
@@ -68,9 +74,7 @@ public:
     /// resent; otherwise they are reported as discarded events.
     [[nodiscard]] Task<Result<void>> reconnect(Stream& stream, OperationOptions io = {}) {
         if (reading_ || writing_) co_return fail(Errc::invalid_argument);
-        stream_ = &stream;
-        error_ = {};
-        co_return co_await handshake(io);
+        co_return co_await handshake(stream, io);
     }
 
     /// Returns the packet identifier (0 for QoS 0); completion arrives as a
@@ -80,6 +84,7 @@ public:
                                                       QoS qos = QoS::at_most_once, bool retain = false,
                                                       Properties properties = {}, OperationOptions io = {}) {
         if (error_) co_return fail(error_);
+        const FailureGuard failure_guard{*this};
         Publish message;
         message.topic = std::move(topic);
         message.payload = std::move(payload);
@@ -96,6 +101,7 @@ public:
     [[nodiscard]] Task<Result<std::uint16_t>> subscribe(std::vector<Subscription> subscriptions,
                                                         Properties properties = {}, OperationOptions io = {}) {
         if (error_) co_return fail(error_);
+        const FailureGuard failure_guard{*this};
         auto id = session_.subscribe(std::move(subscriptions), std::move(properties));
         if (!id) co_return fail(id.error());
         auto flushed = co_await flush(io);
@@ -106,6 +112,7 @@ public:
     [[nodiscard]] Task<Result<std::uint16_t>> unsubscribe(std::vector<std::string> filters,
                                                           Properties properties = {}, OperationOptions io = {}) {
         if (error_) co_return fail(error_);
+        const FailureGuard failure_guard{*this};
         auto id = session_.unsubscribe(std::move(filters), std::move(properties));
         if (!id) co_return fail(id.error());
         auto flushed = co_await flush(io);
@@ -117,6 +124,7 @@ public:
     [[nodiscard]] Task<Result<void>> auth(std::uint8_t reason_code, Properties properties,
                                           OperationOptions io = {}) {
         if (error_) co_return fail(error_);
+        const FailureGuard failure_guard{*this};
         auto sent = session_.auth(reason_code, std::move(properties));
         if (!sent) co_return fail(sent.error());
         co_return co_await flush(io);
@@ -126,6 +134,7 @@ public:
     [[nodiscard]] Task<Result<void>> disconnect(std::uint8_t reason_code = reason::success,
                                                 Properties properties = {}, OperationOptions io = {}) {
         if (error_) co_return fail(error_);
+        const FailureGuard failure_guard{*this};
         auto closed = session_.disconnect(reason_code, std::move(properties));
         if (!closed) co_return fail(closed.error());
         co_return co_await flush(io);
@@ -135,10 +144,12 @@ public:
     /// Fails with `eof` once the session is closed and nothing is buffered.
     [[nodiscard]] Task<Result<std::vector<Event>>> receive(OperationOptions io = {}) {
         if (reading_) co_return fail(Errc::invalid_argument);
+        const FailureGuard failure_guard{*this};
         reading_ = true;
         const Guard guard{reading_};
         while (events_.empty()) {
-            if (session_.state() == SessionState::closed) co_return fail(error_ ? error_ : make_error_code(Errc::eof));
+            if (error_) co_return fail(error_);
+            if (session_.state() == SessionState::closed) co_return fail(Errc::eof);
             auto read = co_await read_once(io);
             if (!read) co_return fail(read.error());
         }
@@ -151,16 +162,20 @@ public:
     /// `packet_id`. Other events stay buffered for `receive`.
     [[nodiscard]] Task<Result<Event>> wait_for(std::uint16_t packet_id, OperationOptions io = {}) {
         if (reading_ || !packet_id) co_return fail(Errc::invalid_argument);
+        const FailureGuard failure_guard{*this};
         reading_ = true;
         const Guard guard{reading_};
+        std::size_t examined = 0;
         for (;;) {
-            for (auto it = events_.begin(); it != events_.end(); ++it) {
-                if (it->packet_id != packet_id || it->kind == Event::Kind::message) continue;
-                Event event = std::move(*it);
-                events_.erase(it);
+            for (; examined < events_.size(); ++examined) {
+                auto& candidate = events_[examined];
+                if (candidate.packet_id != packet_id || candidate.kind == Event::Kind::message) continue;
+                Event event = std::move(candidate);
+                events_.erase(events_.begin() + static_cast<std::ptrdiff_t>(examined));
                 co_return event;
             }
-            if (session_.state() == SessionState::closed) co_return fail(error_ ? error_ : make_error_code(Errc::eof));
+            if (error_) co_return fail(error_);
+            if (session_.state() == SessionState::closed) co_return fail(Errc::eof);
             auto read = co_await read_once(io);
             if (!read) co_return fail(read.error());
         }
@@ -170,6 +185,7 @@ public:
     /// PINGRESP is overdue. Runs until the session closes, `io` stops it, or a
     /// failure; with keep-alive 0 it returns at once.
     [[nodiscard]] Task<Result<void>> keep_alive(EventLoop& loop, OperationOptions io = {}) {
+        const FailureGuard failure_guard{*this};
         for (;;) {
             if (error_) co_return fail(error_);
             const auto due = session_.next_timer();
@@ -195,6 +211,18 @@ public:
     [[nodiscard]] const Event& last_connack() const noexcept { return connack_; }
 
 private:
+    // Once a stream or allocation throws, some wire bytes or protocol state
+    // may already have been consumed. Preserve the exception for its caller,
+    // but reject further I/O until a fresh transport completes reconnect.
+    struct FailureGuard {
+        Client& client;
+        int exceptions = std::uncaught_exceptions();
+        ~FailureGuard() {
+            if (std::uncaught_exceptions() > exceptions && !client.error_)
+                client.error_ = make_error_code(Errc::internal);
+        }
+    };
+
     struct Guard {
         bool& flag;
         ~Guard() { flag = false; }
@@ -202,19 +230,36 @@ private:
 
     Client(Stream& stream, Session session) : stream_(&stream), session_(std::move(session)) {}
 
-    Task<Result<void>> handshake(OperationOptions io) {
-        if (auto started = session_.connect(detail::now_ns()); !started) co_return fail(started.error());
+    Task<Result<void>> handshake(Stream& stream, OperationOptions io) {
+        const FailureGuard failure_guard{*this};
+        if (auto started = session_.connect(detail::now_ns(), events_.size()); !started) co_return fail(started.error());
+        // Capacity rejection above leaves the previous transport/error intact.
+        stream_ = &stream;
+        error_ = {};
         auto flushed = co_await flush(io);
         if (!flushed) co_return fail(flushed.error());
         reading_ = true;
         const Guard guard{reading_};
         for (;;) {
+            bool answered_auth = false;
             for (auto it = events_.begin(); it != events_.end(); ++it) {
+                if (it->kind == Event::Kind::auth) {
+                    if (!auth_handler_) co_return fail(Errc::not_supported);
+                    Event challenge = std::move(*it);
+                    events_.erase(it);
+                    auto answer = co_await auth_handler_(challenge, io);
+                    if (!answer) co_return fail(answer.error());
+                    auto sent = co_await auth(answer->reason, std::move(answer->properties), io);
+                    if (!sent) co_return sent;
+                    answered_auth = true;
+                    break;
+                }
                 if (it->kind != Event::Kind::connected) continue;
                 connack_ = std::move(*it);
                 events_.erase(it);
                 co_return Result<void>{};
             }
+            if (answered_auth) continue;
             if (session_.state() == SessionState::closed) co_return fail(error_ ? error_ : make_error_code(Errc::eof));
             auto read = co_await read_once(io);
             if (!read) {
@@ -234,22 +279,34 @@ private:
     Task<Result<void>> flush(OperationOptions io) {
         if (error_) co_return fail(error_);
         if (writing_) co_return Result<void>{};
+        const FailureGuard failure_guard{*this};
         writing_ = true;
         const Guard guard{writing_};
         while (session_.has_output()) {
+            if (error_) co_return fail(error_);
             const auto bytes = session_.take_output(detail::now_ns());
-            auto written = co_await write_all(*stream_, std::span<const std::byte>{bytes}, io);
-            if (!written) {
-                error_ = written.error();
-                co_return fail(written.error());
+            std::span<const std::byte> remaining{bytes};
+            while (!remaining.empty()) {
+                auto written = co_await stream_->write_some(remaining, io);
+                // The reader may have failed while this short write awaited.
+                // Its terminal error wins, and no later fragment is submitted.
+                if (error_) co_return fail(error_);
+                if (!written) error_ = written.error();
+                else if (*written == 0) error_ = make_error_code(Errc::eof);
+                else if (*written > remaining.size()) error_ = make_error_code(Errc::invalid_argument);
+                if (error_) co_return fail(error_);
+                remaining = remaining.subspan(*written);
             }
         }
         co_return Result<void>{};
     }
 
     Task<Result<void>> read_once(OperationOptions io) {
+        if (error_) co_return fail(error_);
+        const FailureGuard failure_guard{*this};
         std::array<std::byte, 16384> buffer{};
         auto count = co_await stream_->read_some(std::span<std::byte>{buffer}, io);
+        if (error_) co_return fail(error_);
         if (!count) {
             // Cancellation and deadlines belong to this call; anything else ends the connection.
             if (count.error() != Errc::cancelled && count.error() != Errc::timed_out) error_ = count.error();
@@ -259,8 +316,17 @@ private:
             error_ = make_error_code(Errc::eof);
             co_return fail(error_);
         }
-        auto fed = session_.receive(std::span<const std::byte>{buffer.data(), *count}, detail::now_ns());
-        for (auto& event : session_.take_events()) events_.push_back(std::move(event));
+        if (*count > buffer.size()) {
+            error_ = make_error_code(Errc::invalid_argument);
+            co_return fail(error_);
+        }
+        auto fed = session_.receive(std::span<const std::byte>{buffer.data(), *count}, detail::now_ns(), events_.size());
+        auto incoming = session_.take_events();
+        if (events_.size() > max_events_ || incoming.size() > max_events_ - events_.size()) {
+            error_ = make_error_code(Errc::limit_exceeded);
+            co_return fail(error_);
+        }
+        for (auto& event : incoming) events_.push_back(std::move(event));
         // Acknowledgements, and a DISCONNECT explaining a violation, go out before failing.
         auto flushed = co_await flush(io);
         if (!fed) {
@@ -274,6 +340,8 @@ private:
     Stream* stream_;
     Session session_;
     std::deque<Event> events_;
+    std::size_t max_events_ = 4096;
+    AuthHandler auth_handler_;
     Event connack_{Event::Kind::connected};
     Error error_;
     bool reading_ = false;

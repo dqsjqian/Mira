@@ -14,14 +14,17 @@
 #include "mira/core/connection_pool.hpp"
 #include <thread>
 #include "mira/core/task.hpp"
+#include "../src/loop_common.hpp"
 
 #include <algorithm>
+#include <array>
 #include <coroutine>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -193,6 +196,54 @@ void test_buffer() {
     }
     CHECK(reused.empty());
     CHECK(reused.capacity() <= steady_capacity * 4);
+
+    Buffer limits;
+    limits.append(bytes_of("abcd"));
+    limits.consume(2);
+    CHECK_THROWS(limits.prepare((std::numeric_limits<std::size_t>::max)()), std::length_error);
+    CHECK(to_string(limits.readable()) == "cd");
+    Buffer moved{std::move(limits)};
+    CHECK(limits.empty());
+    CHECK(limits.readable().empty());
+    limits.append(bytes_of("reused"));
+    CHECK(to_string(limits.readable()) == "reused");
+    CHECK(to_string(moved.readable()) == "cd");
+    auto pending = moved.prepare(4);
+    std::memcpy(pending.data(), "tail", 4);
+    limits = std::move(moved);
+    limits.commit(2);
+    CHECK(to_string(limits.readable()) == "cdta");
+    CHECK(moved.empty());
+    moved.prepare(1).front() = std::byte{'x'};
+    moved.commit(1);
+    CHECK(to_string(moved.readable()) == "x");
+}
+
+void test_backend_numeric_limits() {
+    test::section("backend timeout saturation and ordered scatter prefix");
+    using namespace std::chrono_literals;
+    const auto never = detail::Clock::time_point::max();
+    const auto maximum = (std::numeric_limits<int>::max)();
+    CHECK(detail::resolve_timeout_ms(24h * 30, never, false) == maximum);
+    CHECK(detail::resolve_timeout_ms(detail::Clock::duration::max(), never, false) == maximum);
+    CHECK(detail::resolve_timeout_ms(detail::Clock::duration::min(), never, false) == -1);
+    CHECK(detail::resolve_timeout_ms(1ns, never, false) == 1);
+    CHECK(detail::resolve_timeout_ms(-1ns, never, false) == 0);
+    CHECK(detail::resolve_timeout_ms(24h * 30, never, true) == 0);
+    CHECK(detail::resolve_timeout_ms(detail::Clock::duration::min(),
+          detail::Clock::now() + 24h * 30, false) == maximum);
+    const std::array pieces{bytes_of("ab"), bytes_of(""), bytes_of("cdef"), bytes_of("gh")};
+    std::string prefix;
+    const auto count = detail::visit_scatter_prefix(pieces, 5, 16,
+        [&prefix](std::size_t, auto piece) { prefix += to_string(piece); });
+    CHECK(count == 2);
+    CHECK(prefix == "abcde");
+    prefix.clear();
+    CHECK(detail::visit_scatter_prefix(pieces, 100, 1,
+        [&prefix](std::size_t, auto piece) { prefix += to_string(piece); }) == 1);
+    CHECK(prefix == "ab");
+    CHECK(detail::visit_scatter_prefix(pieces, 0, 16,
+        [](std::size_t, auto) { CHECK(false); }) == 0);
 }
 
 // ── stream seam ──────────────────────────────────────────────────────────────
@@ -551,6 +602,7 @@ int main(int argc, char** argv) {
     test_error_model();
     test_task();
     test_buffer();
+    test_backend_numeric_limits();
     test_stream_seam();
     test_vector_writes();
     test_resource_budget();

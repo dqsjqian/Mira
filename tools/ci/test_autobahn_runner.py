@@ -88,7 +88,8 @@ class SummaryTests(TemporaryFiles):
 
 class MainTests(TemporaryFiles):
     def run_fixture(self, *, cases=None, catalog=("1.1.1", "1.1.2", "12.1.1", "13.1.1"),
-                    verdict="OK", omit_client=False, compression=False, unexpected=None, failed_case=None):
+                    verdict="OK", omit_client=False, compression=False, unexpected=None, failed_case=None,
+                    fail_non_strict=False):
         output = self.directory / "results"
         binary = self.directory / "harness"
         binary.touch()
@@ -98,6 +99,8 @@ class MainTests(TemporaryFiles):
             arguments += ["--cases", *cases]
         if compression:
             arguments.append("--compression")
+        if fail_non_strict:
+            arguments.append("--fail-non-strict")
         runtime = mock.Mock(docker=False, image=runner.IMAGE)
         runtime.path.side_effect = str
         runtime.command.side_effect = lambda arguments: arguments
@@ -216,6 +219,16 @@ class MainTests(TemporaryFiles):
         self.assertEqual(printed["non_strict_count"], 8)
         self.assertEqual(summary["excluded_count"], 0)
         self.assertFalse(printed["strict_passed"])
+
+    def test_non_strict_gate_fails_without_hiding_informational(self):
+        code, summary, _ = self.run_fixture(verdict="NON-STRICT", fail_non_strict=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["status"], "failed")
+        self.assertTrue(summary["fail_non_strict"])
+        self.assertEqual(summary["non_strict_count"], 4)
+        code, summary, _ = self.run_fixture(verdict="INFORMATIONAL", fail_non_strict=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["informational_count"], 4)
 
     def test_unexpected_cases_fail_in_both_modes(self):
         for compression in (False, True):

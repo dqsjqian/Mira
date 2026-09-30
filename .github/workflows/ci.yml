@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -15,7 +18,7 @@ jobs:
   discipline:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Layering, framework-independence, platform-fencing
         run: python3 tools/ci/check_layering.py
       - name: Verification runner invariants
@@ -54,7 +57,7 @@ jobs:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install clang
         if: matrix.cxx
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.cc }}
@@ -63,7 +66,7 @@ jobs:
       - name: Build
         run: cmake --build build --parallel --config Debug
       - name: Test
-        run: ctest --test-dir build --output-on-failure --build-config Debug
+        run: ctest --no-tests=error --test-dir build --output-on-failure --build-config Debug
       - name: Installed package consumer
         run: python tools/ci/check_install_consumer.py --build-dir build --config Debug
 
@@ -77,7 +80,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         std: [23]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install OpenSSL on Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
@@ -119,7 +122,7 @@ jobs:
       - name: Build TLS
         run: cmake --build build/tls --parallel --config Debug
       - name: Test TLS and HTTPS
-        run: ctest --test-dir build/tls --output-on-failure --build-config Debug
+        run: ctest --no-tests=error --test-dir build/tls --output-on-failure --build-config Debug
       - name: Require independent Windows HTTP3 and Retry interoperability
         if: runner.os == 'Windows'
         shell: pwsh
@@ -145,9 +148,9 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install the UCRT64 toolchain
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           msystem: UCRT64
           update: false
@@ -166,7 +169,7 @@ jobs:
       - name: Build
         run: cmake --build build/mingw --parallel
       - name: Test
-        run: ctest --test-dir build/mingw --output-on-failure
+        run: ctest --no-tests=error --test-dir build/mingw --output-on-failure
 
   # Coroutine frame lifetime is the easiest thing here to get subtly wrong and
   # the hardest to notice without a sanitizer. The event loop raises the
@@ -178,12 +181,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - { os: ubuntu-latest, cc: gcc-14, cxx: g++-14 }
+          - { os: macos-latest, cc: clang, cxx: clang++ }
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install OpenSSL on Linux
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
+        run: sudo apt-get update && sudo apt-get install -y g++-14 libssl-dev zlib1g-dev
       - name: Locate OpenSSL on macOS
         if: runner.os == 'macOS'
         shell: bash
@@ -192,17 +201,36 @@ jobs:
           echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
           brew list mosquitto >/dev/null 2>&1 || brew install mosquitto
           echo "MIRA_REQUIRE_MOSQUITTO=1" >> "$GITHUB_ENV"
-      - name: Configure with ASan + UBSan and TLS
+      - name: Build hash-verified OpenSSL for QUIC on Linux
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL -o openssl.tar.gz https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+          echo '603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a  openssl.tar.gz' | sha256sum --check --strict
+          tar xzf openssl.tar.gz
+          cd openssl-3.5.9
+          ./Configure --prefix="$RUNNER_TEMP/openssl35" --libdir=lib no-shared no-tests
+          make -j"$(nproc)"
+          make install_sw
+          echo "OPENSSL_ROOT_DIR=$RUNNER_TEMP/openssl35" >> "$GITHUB_ENV"
+      - name: Build instrumented protocol dependencies in an isolated prefix
+        env:
+          CFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+          CXXFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+          LDFLAGS: -fsanitize=address,undefined
+        run: >
+          python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
+          --path build/asan-protocol-deps --config Debug
+      - name: Configure all protocols with ASan and UBSan
         run: >
           cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=Debug
           -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON
+          -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON
+          -DCMAKE_PREFIX_PATH="$PWD/build/asan-protocol-deps/prefix"
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
       - name: Build
         run: cmake --build build/asan --parallel
       - name: Test
-        env:
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: ctest --test-dir build/asan --output-on-failure
+        run: ctest --no-tests=error --test-dir build/asan --output-on-failure
 
   # The negative space of the parsers gets explored continuously, not just
   # when a maintainer remembers to run the fuzzer. A short, capped smoke pass
@@ -211,8 +239,12 @@ jobs:
   fuzz:
     needs: discipline
     runs-on: ubuntu-latest
+    env:
+      CC: clang-19
+      CXX: clang++-19
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install clang 19
         # clang-19 minimum on Linux (see the epoll-clang entry in build). No
         # -stdlib=libc++: LLVM 19's libc++ still hides std::stop_token behind
@@ -220,16 +252,38 @@ jobs:
         # 19; the android job describes the same gate), while libstdc++ ships
         # the complete library — exactly what epoll-clang already validates.
         run: sudo apt-get update && sudo apt-get install -y clang-19 libssl-dev zlib1g-dev
+      - name: Build hash-verified OpenSSL for QUIC fuzzing
+        run: |
+          curl -fsSL -o openssl.tar.gz https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+          echo '603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a  openssl.tar.gz' | sha256sum --check --strict
+          tar xzf openssl.tar.gz
+          cd openssl-3.5.9
+          ./Configure --prefix="$RUNNER_TEMP/openssl35" --libdir=lib no-shared no-tests
+          make -j"$(nproc)"
+          make install_sw
+          echo "OPENSSL_ROOT_DIR=$RUNNER_TEMP/openssl35" >> "$GITHUB_ENV"
+      - name: Build protocol dependencies with sanitizer and fuzz coverage
+        # Instrument HPACK, QPACK and QUIC internals as well as Mira's wrappers.
+        # Link flags also apply to upstream CMake's compiler and symbol probes.
+        env:
+          CFLAGS: -fsanitize=address,undefined,fuzzer-no-link -fno-omit-frame-pointer
+          CXXFLAGS: -fsanitize=address,undefined,fuzzer-no-link -fno-omit-frame-pointer
+          LDFLAGS: -fsanitize=address,undefined,fuzzer-no-link
+        run: >
+          python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
+          --path build/fuzz-protocol-deps --config Debug
       - name: Configure with libFuzzer
         run: >
           cmake -S . -B build/fuzz -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_CXX_COMPILER=clang++-19
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"
           -DMIRA_BUILD_FUZZERS=ON -DMIRA_ENABLE_WEBSOCKET=ON
+          -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON
+          -DCMAKE_PREFIX_PATH="$PWD/build/fuzz-protocol-deps/prefix"
       - name: Build
         run: cmake --build build/fuzz --parallel
       - name: Ordinary tests with instrumented parser libraries
-        run: ctest --test-dir build/fuzz --output-on-failure
+        run: ctest --no-tests=error --test-dir build/fuzz --output-on-failure
       - name: Smoke fuzz (60s cap per harness)
         run: >
           ./build/fuzz/fuzz/fuzz_http_parser
@@ -245,7 +299,15 @@ jobs:
           ./build/fuzz/fuzz/fuzz_ws_compression
           -max_total_time=60 -max_len=4096 -rss_limit_mb=2560 &&
           ./build/fuzz/fuzz/fuzz_mqtt_packet
-          -max_total_time=60 -max_len=4096 -rss_limit_mb=2560
+          -max_total_time=60 -max_len=4096 -rss_limit_mb=2560 &&
+          ./build/fuzz/fuzz/fuzz_socks_handshake
+          -max_total_time=60 -max_len=4096 -rss_limit_mb=2560 &&
+          ./build/fuzz/fuzz/fuzz_dns_message
+          -max_total_time=60 -max_len=4096 -rss_limit_mb=2560 &&
+          ./build/fuzz/fuzz/fuzz_http2_session
+          -max_total_time=60 -max_len=16384 -rss_limit_mb=2560 fuzz/corpus/http2_session &&
+          ./build/fuzz/fuzz/fuzz_http3_engine
+          -max_total_time=60 -max_len=8192 -rss_limit_mb=2560 fuzz/corpus/http3_engine
 
   # Run the official RFC6455 and RFC7692 corpus against both roles.
   websocket-conformance:
@@ -253,7 +315,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install WebSocket build dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
       - name: Configure and build both conformance harnesses
@@ -265,10 +327,10 @@ jobs:
           python3 tools/ci/run_autobahn.py
           --server build/autobahn/mira_ws_autobahn_server
           --client build/autobahn/mira_ws_autobahn_client
-          --runtime docker --compression --output build/autobahn-results --timeout 2400
+          --runtime docker --compression --fail-non-strict --output build/autobahn-results --timeout 2400
       - name: Preserve complete conformance evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: websocket-autobahn-results
           path: build/autobahn-results
@@ -276,8 +338,8 @@ jobs:
 
   # Optional protocol engines (nghttp2 / ngtcp2 / nghttp3) with their
   # dependencies built from pinned, hash-verified sources by the same
-  # script a developer would run locally. POSIX only for now: the
-  # dependency script has not been validated on Windows.
+  # script a developer would run locally. This job covers POSIX; the TLS
+  # and MinGW jobs above exercise the Windows H2/H3 dependency builds.
   protocols:
     needs: discipline
     runs-on: ${{ matrix.os }}
@@ -286,7 +348,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install protocol toolchain on Linux
         if: runner.os == 'Linux'
         run: |
@@ -305,9 +367,10 @@ jobs:
         run: |
           set -eux
           curl -fsSL -o openssl.tar.gz \
-            https://github.com/openssl/openssl/releases/download/openssl-3.5.1/openssl-3.5.1.tar.gz
+            https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+          echo "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a  openssl.tar.gz" | sha256sum --check --strict
           tar xzf openssl.tar.gz
-          cd openssl-3.5.1
+          cd openssl-3.5.9
           ./Configure --prefix="$RUNNER_TEMP/openssl35" --libdir=lib no-shared no-tests
           make -j"$(nproc)"
           make install_sw
@@ -335,6 +398,7 @@ jobs:
           -DMIRA_ENABLE_HTTP2=ON
           -DMIRA_ENABLE_HTTP3=ON -DMIRA_BUILD_BENCH=ON
           -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix"
+          -DCMAKE_INSTALL_INCLUDEDIR=include/Mira-0.5
       - name: Build
         run: cmake --build build/protocols --parallel
       - name: Report external HTTP/3 interoperability capability
@@ -346,7 +410,7 @@ jobs:
             echo 'External HTTP/3 interoperability: SKIPPED (curl lacks HTTP3). Native Mira client/server tests still run.' >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Test POSIX protocols (Windows H2/H3 are not runtime-validated here)
-        run: ctest --test-dir build/protocols --output-on-failure
+        run: ctest --no-tests=error --test-dir build/protocols --output-on-failure
       - name: Require independent HTTP3 interoperability (Linux)
         if: runner.os == 'Linux'
         run: >
@@ -368,7 +432,7 @@ jobs:
           --output build/h3-fault-smoke.json
       - name: Preserve fault-smoke measurements
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: h3-fault-smoke-${{ matrix.os }}
           path: build/h3-fault-smoke.json
@@ -387,7 +451,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cmake --build build/http3-only --parallel
-          ctest --test-dir build/http3-only --output-on-failure
+          ctest --no-tests=error --test-dir build/http3-only --output-on-failure
           python3 tools/ci/check_install_consumer.py --build-dir build/http3-only --expect-http3-only
 
   # Mobile targets cross-compile only; no runner executes them. Keeping them in
@@ -397,7 +461,7 @@ jobs:
     needs: discipline
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure for iOS
         run: >
           cmake -S . -B build/ios -G Xcode
@@ -418,7 +482,7 @@ jobs:
       # requirement rather than an incidental detail.
       MIRA_NDK_VERSION: 29.0.14206865
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install the pinned NDK
         run: >
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager

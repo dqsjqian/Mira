@@ -4,6 +4,13 @@
 # Official source: https://github.com/ngtcp2/nghttp3/releases/download/v1.15.0/nghttp3-1.15.0.tar.xz
 find_path(MIRA_NGHTTP3_INCLUDE_DIR nghttp3/nghttp3.h REQUIRED)
 find_library(MIRA_NGHTTP3_LIBRARY NAMES nghttp3 nghttp3_static NAMES_PER_DIR REQUIRED)
+file(STRINGS "${MIRA_NGHTTP3_INCLUDE_DIR}/nghttp3/version.h" _mira_nghttp3_version_line
+    REGEX "^#define NGHTTP3_VERSION \"")
+string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" MIRA_NGHTTP3_VERSION "${_mira_nghttp3_version_line}")
+if(NOT MIRA_NGHTTP3_VERSION OR MIRA_NGHTTP3_VERSION VERSION_LESS "1.15.0")
+    message(FATAL_ERROR "Mira HTTP/3 requires nghttp3 >= 1.15.0; found '${MIRA_NGHTTP3_VERSION}'")
+endif()
+unset(_mira_nghttp3_version_line)
 if(NOT TARGET mira_nghttp3)
     add_library(mira_nghttp3 UNKNOWN IMPORTED GLOBAL)
     set_target_properties(mira_nghttp3 PROPERTIES IMPORTED_LOCATION "${MIRA_NGHTTP3_LIBRARY}" INTERFACE_INCLUDE_DIRECTORIES "${MIRA_NGHTTP3_INCLUDE_DIR}")
@@ -13,7 +20,7 @@ if(NOT TARGET mira_nghttp3)
 endif()
 add_library(mira_http3 src/engine.cpp)
 add_library(Mira::http3 ALIAS mira_http3)
-target_include_directories(mira_http3 PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
+target_include_directories(mira_http3 PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_compile_features(mira_http3 PUBLIC cxx_std_23)
 # The cryptographic random source comes from Mira::quic; this module does not
 # depend on the TLS backend directly. Field-section types are shared through

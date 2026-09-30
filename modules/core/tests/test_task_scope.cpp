@@ -165,6 +165,18 @@ Detached destroy_after_join(std::unique_ptr<TaskScope>& scope, bool& done) {
     scope.reset();
     done = true;
 }
+Task<void> join_from_synchronous_child(std::unique_ptr<TaskScope>& scope, bool& done) {
+    destroy_after_join(scope, done);
+    co_return;
+}
+void synchronous_child_can_release_scope() {
+    test::section("synchronous completion may join and destroy the scope during spawn");
+    auto scope = std::make_unique<TaskScope>();
+    bool done = false;
+    scope->spawn(join_from_synchronous_child(scope, done));
+    CHECK(done);
+    CHECK(!scope);
+}
 void last_child_can_release_scope() {
     test::section("last completion may destroy the scope");
     auto scope = std::make_unique<TaskScope>();
@@ -349,6 +361,7 @@ int main(int argc, char** argv) {
     lazy_join_gap();
     exception_and_stop();
     last_child_can_release_scope();
+    synchronous_child_can_release_scope();
     stop_can_destroy_scope();
     failure_cancels_sibling_and_releases_scope();
     parameters_released_before_join();

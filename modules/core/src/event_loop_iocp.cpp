@@ -163,6 +163,7 @@ public:
         /// `detach` ran: the caller is about to close the handle, so never
         /// query Winsock with it and never `CancelIoEx` on it again.
         bool handle_closed{false};
+        bool cancel_pending{false};
 
         /// The answer, decided before the operation could be resolved.
         ///
@@ -189,26 +190,20 @@ public:
     ~Impl() { shutdown(); }
 
     void shutdown() noexcept {
-        // The flag is set before the dispatch check so that shutdown's own
-        // `finalize` calls, which raise the depth themselves, are not mistaken
-        // for a coroutine destroying the loop it is being resumed by.
-        if (shutting_down_.exchange(true, std::memory_order_acq_rel)) {
-            return;
-        }
+        // Idempotence cannot permit destruction from a continuation that this
+        // shutdown is still dispatching: finalize still owns Impl state.
         if (dispatch_depth_ != 0) {
             detail::report_dispatch_violation("destroyed or replaced while dispatching");
         }
+        if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
+        const detail::DispatchScope dispatching{dispatch_depth_};
         stop_requested_.store(true, std::memory_order_release);
 
-        std::vector<std::pair<detail::OperationId, Error>> orphans;
-        std::vector<std::pair<SOCKET, OVERLAPPED*>> to_cancel;
         std::vector<move_only_function<void()>> discarded_work;
         std::size_t kernel_backed = 0;
         {
             const std::lock_guard lock{mutex_};
             posted_.drain_into(discarded_work);
-            pending_cancels_.clear();
-            orphans.reserve(operations_.size());
             for (auto& entry : operations_) {
                 Operation& operation = *entry.second;
                 // An operation already cut short keeps the reason it was given:
@@ -217,13 +212,14 @@ public:
                 if (!operation.fixed_reason) {
                     operation.fixed_reason = make_error_code(Errc::cancelled);
                 }
-                orphans.emplace_back(operation.id, *operation.fixed_reason);
                 if (!operation.kernel_backed()) {
                     continue;
                 }
                 ++kernel_backed;
                 if (!operation.handle_closed) {
-                    to_cancel.emplace_back(operation.socket, &operation.overlapped);
+                    // CancelIoEx only queues completion; it does not resume
+                    // user code, so no snapshot allocation is needed here.
+                    ::CancelIoEx(reinterpret_cast<HANDLE>(operation.socket), &operation.overlapped);
                 }
             }
         }
@@ -231,18 +227,15 @@ public:
         // CancelIoEx only *asks*. Until the completion packet is dequeued the
         // kernel may still write into the OVERLAPPED, the AcceptEx address
         // buffer, and the caller's read or write buffer.
-        for (const auto& [socket, overlapped] : to_cancel) {
-            ::CancelIoEx(reinterpret_cast<HANDLE>(socket), overlapped);
-        }
 
         // Even when a cancel reports ERROR_NOT_FOUND the operation may have
         // completed without being dequeued. Drain every kernel-backed one
         // before releasing a buffer or resuming a coroutine that might.
         //
-        // The count is exact because an operation leaves `operations_` at the
-        // moment its packet is dequeued, so "still in the table and
-        // kernel-backed" is the same set as "packet not yet dequeued". Timers
-        // are excluded: counting them would wait for a packet that never comes.
+        // Shutdown is forbidden during dispatch; after run_once returns every
+        // dequeued operation has been finalized. Each remaining kernel-backed
+        // operation therefore still owes exactly one packet. Timers are
+        // excluded: counting them would wait for a packet that never comes.
         while (kernel_backed != 0) {
             DWORD transferred = 0;
             ULONG_PTR key = 0;
@@ -266,7 +259,16 @@ public:
 
         // The kernel has let go; only now may a coroutine that reclaims a
         // buffer run. The shutdown flag stops any of them re-submitting.
-        for (const auto& [id, reason] : orphans) {
+        for (;;) {
+            detail::OperationId id;
+            Error reason;
+            {
+                const std::lock_guard lock{mutex_};
+                if (operations_.empty()) break;
+                const auto& operation = *operations_.begin()->second;
+                id = operation.id;
+                reason = *operation.fixed_reason;
+            }
             finalize(id, fail(reason));
         }
         discarded_work.clear();
@@ -333,7 +335,8 @@ public:
         operation->size_result = result;
         operation->socket = static_cast<SOCKET>(handle);
         operation->buffer.buf = reinterpret_cast<CHAR*>(destination.data());
-        operation->buffer.len = static_cast<ULONG>(destination.size());
+        operation->buffer.len = static_cast<ULONG>((std::min)(
+            destination.size(), static_cast<std::size_t>((std::numeric_limits<ULONG>::max)())));
 
         DWORD flags = 0;
         const int status = ::WSARecv(static_cast<SOCKET>(handle),
@@ -372,7 +375,8 @@ public:
         operation->size_result = result;
         operation->socket = static_cast<SOCKET>(handle);
         operation->buffer.buf = const_cast<CHAR*>(reinterpret_cast<const CHAR*>(source.data()));
-        operation->buffer.len = static_cast<ULONG>(source.size());
+        operation->buffer.len = static_cast<ULONG>((std::min)(
+            source.size(), static_cast<std::size_t>((std::numeric_limits<ULONG>::max)())));
 
         const int status = ::WSASend(static_cast<SOCKET>(handle),
                                      &operation->buffer,
@@ -402,17 +406,7 @@ public:
         if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
             return fail(*rejected);
         }
-        std::size_t total = 0;
-        DWORD count = 0;
-        for (const std::span<const std::byte> piece : pieces) {
-            if (piece.empty() || count == Operation::kMaxScatter) {
-                continue;
-            }
-            // The pieces are borrowed for the duration of the operation — the
-            // same contract the single-buffer form has always had.
-            total += piece.size();
-        }
-        if (total == 0) {
+        if (std::none_of(pieces.begin(), pieces.end(), [](auto piece) { return !piece.empty(); })) {
             return fail(Errc::invalid_argument);
         }
 
@@ -421,16 +415,15 @@ public:
         Operation* operation = acquired.operation;
         operation->size_result = result;
         operation->socket = static_cast<SOCKET>(handle);
-        for (const std::span<const std::byte> piece : pieces) {
-            if (piece.empty() || operation->scatter_count == Operation::kMaxScatter) {
-                continue;
-            }
-            operation->scatter[operation->scatter_count].buf =
-                const_cast<CHAR*>(reinterpret_cast<const CHAR*>(piece.data()));
-            operation->scatter[operation->scatter_count].len =
-                static_cast<ULONG>(piece.size());
-            ++operation->scatter_count;
-        }
+        // IOCP reports a DWORD byte count for the entire submission, not
+        // just for each WSABUF. Bound the complete prefix to that width.
+        operation->scatter_count = static_cast<DWORD>(detail::visit_scatter_prefix(
+            pieces, (std::numeric_limits<ULONG>::max)(), Operation::kMaxScatter,
+            [operation](std::size_t index, std::span<const std::byte> piece) {
+                operation->scatter[index].buf =
+                    const_cast<CHAR*>(reinterpret_cast<const CHAR*>(piece.data()));
+                operation->scatter[index].len = static_cast<ULONG>(piece.size());
+            }));
 
         const int status = ::WSASend(static_cast<SOCKET>(handle),
                                      operation->scatter.data(),
@@ -655,7 +648,10 @@ public:
         if (fixed.resolve_now) {
             {
                 const std::lock_guard lock{mutex_};
-                pending_cancels_.push_back(id);
+                if (auto operation = operations_.find(id); operation != operations_.end()) {
+                    operation->second->cancel_pending = true;
+                    ++pending_cancels_;
+                }
             }
             wake();
         }
@@ -710,7 +706,7 @@ public:
             // pending, so it is never what guarantees progress — leaving
             // `pending_cancels_` out would let the loop block with a
             // cancellation sitting in it.
-            const bool queued = !posted_.empty() || !pending_cancels_.empty() || stopped();
+            const bool queued = !posted_.empty() || pending_cancels_ != 0 || stopped();
             timeout_ms = detail::resolve_timeout_ms(timeout, timers_.earliest(), queued);
         }
 
@@ -731,21 +727,16 @@ public:
             removed = 0;
         }
 
-        // `(id, outcome)` rather than `Operation*`: by the time these are
-        // delivered, an earlier resumption may already have resolved one of
-        // them, and a stale id resolves to nothing. Members, not locals, so
-        // a high completion rate does not pay per-turn heap allocations;
-        // reentrancy is impossible (run_once from a resumed coroutine
-        // terminates by contract).
-        resolved_.clear();
-        expired_.clear();
-        cancels_.clear();
+        // Dequeue is irreversible: fixed batches cannot throw an allocation
+        // failure after the kernel has given up its completion packets.
+        std::array<std::pair<detail::OperationId, Result<std::size_t>>, 2 * kEventBatch> resolved{};
+        std::array<detail::TimerTarget, kEventBatch> expired{};
+        std::array<detail::OperationId, kEventBatch> cancels{};
+        std::size_t resolved_count = 0;
+        std::size_t expired_count = 0;
+        std::size_t cancel_count = 0;
         to_run_.clear();
-        auto& resolved = resolved_;
-        auto& expired = expired_;
-        auto& cancels = cancels_;
         auto& to_run = to_run_;
-        resolved.reserve(removed);
 
         for (ULONG i = 0; i < removed; ++i) {
             const OVERLAPPED_ENTRY& entry = entries[i];
@@ -754,9 +745,8 @@ public:
             }
 
             auto* operation = reinterpret_cast<Operation*>(entry.lpOverlapped);
-            // An operation leaves `operations_` exactly when its packet is
-            // dequeued, which is happening right now, so this memory is
-            // necessarily still alive.
+            // Kernel-backed operations stay owned until their packet is
+            // dequeued and finalized below, so this memory is still alive.
             const detail::OperationId id = operation->id;
             Result<std::size_t> outcome = classify(*operation, entry);
             // A reason fixed earlier wins over what the packet reports,
@@ -768,13 +758,21 @@ public:
             if (const std::optional<Error> fixed = fixed_reason_of(id)) {
                 outcome = fail(*fixed);
             }
-            resolved.emplace_back(id, outcome);
+            resolved[resolved_count++] = {id, outcome};
         }
 
         {
             const std::lock_guard lock{mutex_};
-            timers_.extract_expired(detail::Clock::now(), expired);
-            cancels.swap(pending_cancels_);
+            expired_count = timers_.extract_expired(detail::Clock::now(), expired);
+            if (pending_cancels_ != 0) {
+                for (auto& [id, operation] : operations_) {
+                    if (!operation->cancel_pending) continue;
+                    cancels[cancel_count++] = id;
+                    operation->cancel_pending = false;
+                    --pending_cancels_;
+                    if (cancel_count == cancels.size()) break;
+                }
+            }
             posted_.drain_into(to_run);
             wake_pending_.store(false, std::memory_order_release);
         }
@@ -783,9 +781,9 @@ public:
         // that genuinely finished in this batch is reported as finished even
         // if its deadline expired in the same instant; `finalize` is by id, so
         // the later mention of it does nothing.
-        for (const detail::TimerTarget& target : expired) {
+        for (const auto& target : std::span(expired).first(expired_count)) {
             if (!target.is_deadline) {
-                resolved.emplace_back(target.operation, std::size_t{0});
+                resolved[resolved_count++] = {target.operation, std::size_t{0}};
                 continue;
             }
             // A deadline cannot resolve a kernel-backed operation by itself:
@@ -797,21 +795,17 @@ public:
             }
             cancel_io(fixed);
             if (fixed.resolve_now) {
-                resolved.emplace_back(target.operation, fail(Errc::timed_out));
+                resolved[resolved_count++] = {target.operation, fail(Errc::timed_out)};
             }
         }
-        for (const detail::OperationId id : cancels) {
-            // Only operations that owe no packet reach here; the rest were
-            // left for their completion to resolve.
-            if (const std::optional<Error> fixed = fixed_reason_of(id)) {
-                resolved.emplace_back(id, fail(*fixed));
-            }
-        }
-
         // Everything below runs outside the lock: resumed coroutines may
         // submit more I/O, post work, or stop the loop.
-        for (const auto& [id, outcome] : resolved) {
+        for (const auto& [id, outcome] : std::span(resolved).first(resolved_count)) {
             finalize(id, outcome);
+        }
+        for (const auto id : std::span(cancels).first(cancel_count)) {
+            // Only timers reach this queue; kernel I/O waits for its packet.
+            if (const auto fixed = fixed_reason_of(id)) finalize(id, fail(*fixed));
         }
         detail::dispatch_posts(to_run);
 
@@ -1026,6 +1020,11 @@ private:
         if (!owned) {
             return;
         }
+        // Another completion in this batch may have destroyed the listener
+        // after classification. Never deliver its pre-created socket then.
+        if (owned->kind == Kind::accept && owned->handle_closed) {
+            outcome = fail(Errc::cancelled);
+        }
         // An accept that did not succeed must not leak the socket AcceptEx
         // required it to pre-create. On success the socket travels back to the
         // caller, which owns it from then on.
@@ -1055,6 +1054,7 @@ private:
                 return {};
             }
             owned = std::move(it->second);
+            if (owned->cancel_pending) --pending_cancels_;
             operations_.erase(it);
             timers_.cancel(owned->wake);
             timers_.cancel(owned->deadline);
@@ -1075,18 +1075,14 @@ private:
     std::unordered_map<detail::OperationId, std::unique_ptr<Operation>> operations_{};
     detail::TimerQueue timers_{};
     detail::PostQueue posted_{};
-    std::vector<detail::OperationId> pending_cancels_{};
+    std::size_t pending_cancels_{0};
     detail::OperationId next_id_{detail::kNoOperation};
 
     /// Non-zero while a batch is being delivered. Loop thread only, which is
     /// the same restriction `run_once` and destroying the loop already carry.
     std::atomic<int> dispatch_depth_{0};
 
-    // Scratch batches for `run_once`, cleared and refilled every turn —
-    // see the comment at their use site.
-    std::vector<std::pair<detail::OperationId, Result<std::size_t>>> resolved_{};
-    std::vector<detail::TimerTarget> expired_{};
-    std::vector<detail::OperationId> cancels_{};
+    // Swapped with producer queues without allocating while dispatching.
     std::vector<move_only_function<void()>> to_run_{};
 
     LPFN_ACCEPTEX accept_ex_{nullptr};
@@ -1129,7 +1125,12 @@ Result<EventLoop> EventLoop::create() {
     if (port == nullptr) {
         return fail(last_os_error());
     }
-    return EventLoop{std::make_unique<Impl>(port)};
+    try {
+        return EventLoop{std::make_unique<Impl>(port)};
+    } catch (...) {
+        ::CloseHandle(port);
+        throw;
+    }
 }
 
 Result<void> EventLoop::attach(NativeHandle handle) {
@@ -1225,11 +1226,7 @@ Task<Result<std::size_t>> EventLoop::writev(NativeHandle handle,
     if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
         co_return fail(*rejected);
     }
-    std::size_t total = 0;
-    for (const std::span<const std::byte> piece : pieces) {
-        total += piece.size();
-    }
-    if (total == 0) {
+    if (std::none_of(pieces.begin(), pieces.end(), [](const auto piece) { return !piece.empty(); })) {
         co_return std::size_t{0};
     }
     Impl* impl = impl_.get();
@@ -1348,7 +1345,7 @@ Task<Result<void>> EventLoop::sleep_until(Clock::time_point deadline, OperationO
 }
 
 Task<Result<void>> EventLoop::sleep_for(Duration delay, OperationOptions options) {
-    return sleep_until(Clock::now() + delay, std::move(options));
+    return sleep_until(detail::deadline_after(Clock::now(), delay), std::move(options));
 }
 
 Task<void> EventLoop::yield() {

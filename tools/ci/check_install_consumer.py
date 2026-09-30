@@ -90,6 +90,9 @@ def main():
         prefix = root / 'prefix'
         run(['cmake', '--install', str(build), '--prefix', str(prefix),
              '--config', args.config])
+        data_dir = cache.get('CMAKE_INSTALL_DATADIR') or cache.get('CMAKE_INSTALL_DATAROOTDIR') or 'share'
+        if not (prefix / data_dir / 'licenses' / 'Mira' / 'LICENSE').is_file():
+            raise RuntimeError('Installed SDK is missing its LICENSE')
         common = ['-G', cache['CMAKE_GENERATOR'],
                   '-DCMAKE_BUILD_TYPE=' + args.config,
                   '-DCMAKE_CONFIGURATION_TYPES=' + args.config]
@@ -134,7 +137,7 @@ def main():
             if source and success:
                 run(['cmake', '--build', str(directory / 'build'), '--config', args.config])
                 run(['ctest', '--test-dir', str(directory / 'build'),
-                     '--build-config', args.config, '--output-on-failure'])
+                     '--build-config', args.config, '--output-on-failure', '--no-tests=error'])
 
         case('base', 'COMPONENTS core transport http', source=BASE_SOURCE, hidden=True,
              checks='''
@@ -154,6 +157,18 @@ endforeach()
             f'  message(FATAL_ERROR "Installed component not loaded {component}")\nendif()'
             for component in installed)
         case('all', '', source=BASE_SOURCE, checks=checks)
+        if 'http2' in installed:
+            case('h2-link', 'COMPONENTS http2', links='http2', source='''
+#include <mira/http2/session.hpp>
+int main() {
+    auto session = Mira::http2::Session::create(Mira::http2::Role::client);
+    if (!session) return 1;
+    auto stream = session->request({{":method", "GET"}, {":scheme", "https"},
+                                    {":authority", "localhost"}, {":path", "/"}});
+    auto output = session->output();
+    return stream && output && !output->empty() ? 0 : 2;
+}
+''')
         case('optional-unknown', 'COMPONENTS core OPTIONAL_COMPONENTS unknown',
              checks='if(Mira_unknown_FOUND)\n  message(FATAL_ERROR "Unknown component unexpectedly found")\nendif()')
         for component in ('tls', 'ws', 'http2'):

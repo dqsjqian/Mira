@@ -181,6 +181,7 @@ void test_http_over_tcp() {
     // The client got a well-formed response off the wire.
     CHECK(client_response == "HTTP/1.1 200 OK\r\n"
                              "Content-Type: text/plain\r\n"
+                             "Connection: close\r\n"
                              "Content-Length: 4\r\n"
                              "\r\n"
                              "pong");

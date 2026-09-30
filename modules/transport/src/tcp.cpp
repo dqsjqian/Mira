@@ -168,10 +168,8 @@ Task<Result<Socket>> Listener::accept(OperationOptions options) {
     }
 
     Socket socket{*loop, *accepted};
-    // Completion may already have been queued when close requested cancellation.
-    if (handle_ != listening || loop_ != loop) {
-        co_return fail(Errc::cancelled);
-    }
+    // The loop rejects an accept whose listener was detached before delivery.
+    // The wrapper itself may already have been destroyed by another callback.
 
     // Per-connection options are applied here rather than inherited: Windows
     // does not propagate all listener options to accepted sockets, so relying

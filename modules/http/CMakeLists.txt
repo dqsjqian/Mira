@@ -15,7 +15,7 @@ add_library(Mira::http ALIAS mira_http)
 
 target_include_directories(mira_http PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_compile_features(mira_http PUBLIC cxx_std_23)

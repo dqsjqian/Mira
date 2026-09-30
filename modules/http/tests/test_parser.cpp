@@ -565,6 +565,81 @@ void test_limits_enforced() {
     CHECK(step.error() == ParseError::limit_exceeded);
 }
 
+void test_audit_request_boundaries() {
+    test::section("request limits include trailers and folded fields");
+    const std::string chunked = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: a\r\n\r\n";
+    Limits limits;
+    limits.max_header_count = 1;
+    CHECK(parse_all(chunked, limits).error == ParseError::limit_exceeded);
+    limits.max_header_count = 2;
+    limits.max_headers_total = std::string_view{"Transfer-Encoding: chunked"}.size() + 3;
+    CHECK(parse_all(chunked, limits).error == ParseError::limit_exceeded);
+    ++limits.max_headers_total;
+    CHECK(parse_all(chunked, limits).complete);
+    limits = {};
+    limits.max_body_size = 1;
+    limits.max_chunk_size = UINT64_MAX;
+    CHECK(parse_all("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    "1\r\na\r\nffffffffffffffff\r\n", limits).error == ParseError::limit_exceeded);
+    limits = {};
+    limits.allow_obsolete_line_folding = true;
+    CHECK(!parse_all("POST / HTTP/1.1\r\nContent-Length: 0\r\n 9\r\n\r\n", limits).ok);
+    RequestParser parser{limits};
+    Buffer buffer;
+    feed(buffer, "PROPFIND / HTTP/1.1\r\nX: one\r\n two\r\n\r\n");
+    CHECK(drive(parser, buffer).complete);
+    CHECK(parser.request().method == Method::other);
+    CHECK(parser.request().method_token == "PROPFIND");
+    CHECK(parser.request().headers.get("X") == "one two");
+    for (const auto value : {"0,", ",0", "0,,0", "0\r\nContent-Length: "}) {
+        CHECK(parse_all(std::string{"POST / HTTP/1.1\r\nContent-Length: "} + value + "\r\n\r\n").error ==
+              ParseError::malformed_content_length);
+    }
+    const std::string control_chunk = std::string{"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1;x="} +
+                                      '\0' + "\r\na\r\n0\r\n\r\n";
+    CHECK(parse_all(control_chunk).error == ParseError::malformed_chunk);
+    Limits chunk_limits;
+    chunk_limits.max_chunk_extension = 0;
+    const auto long_chunk = std::string{"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"} +
+                            std::string(33, '0') + "\r\n\r\n";
+    CHECK(parse_all(long_chunk, chunk_limits).error == ParseError::limit_exceeded);
+    CHECK(parse_byte_by_byte(long_chunk, chunk_limits).error == ParseError::limit_exceeded);
+    chunk_limits.max_chunk_extension = SIZE_MAX;
+    CHECK(parse_byte_by_byte("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                             chunk_limits).complete);
+    limits.max_headers_total = 8;
+    CHECK(parse_all("GET / HTTP/1.1\r\nX: one\r\n two\r\n\r\n", limits).error == ParseError::limit_exceeded);
+
+    test::section("every packet split preserves exact line limits");
+    const std::string wire = "GET / HTTP/1.1\r\nX: abcdefghijklmnopqrstuvw\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nY: abcdefghijklmnopqrstuvw\r\n\r\n";
+    limits = {};
+    limits.max_start_line = 14;
+    limits.max_header_line = 26; // Transfer-Encoding: chunked is the longest line.
+    for (std::size_t split = 0; split <= wire.size(); ++split) {
+        RequestParser split_parser{limits};
+        Buffer input;
+        bool failed = false, complete = false;
+        auto consume = [&] {
+            for (;;) {
+                auto result = split_parser.parse(input);
+                if (!result) { failed = true; break; }
+                if (*result == ParseStep::complete) { complete = true; break; }
+                if (*result == ParseStep::need_more) break;
+            }
+        };
+        feed(input, std::string_view{wire}.substr(0, split));
+        consume();
+        if (!complete && !failed) {
+            feed(input, std::string_view{wire}.substr(split));
+            consume();
+        }
+        CHECK(!failed && complete);
+    }
+    limits.max_start_line = 13;
+    CHECK(parse_all(wire, limits).error == ParseError::limit_exceeded);
+    CHECK(parse_byte_by_byte(wire, limits).error == ParseError::limit_exceeded);
+}
+
 void test_error_reporting() {
     test::section("error reporting");
 
@@ -604,6 +679,7 @@ int main() {
     test_malformed_chunks();
     test_limits_enforced();
     test_error_reporting();
+    test_audit_request_boundaries();
 
     return test::summary();
 }

@@ -13,6 +13,7 @@
 #include <array>
 #include <optional>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -254,7 +255,254 @@ Task<void> refusal(EventLoop& loop) {
     co_await scope.join();
 }
 
+struct IoGate {
+    std::coroutine_handle<> waiter;
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> handle) noexcept { waiter = handle; }
+    void await_resume() const noexcept {}
+    void release() { std::exchange(waiter, {}).resume(); }
+};
+
+struct ScriptedBroker {
+    std::deque<Bytes> input;
+    Bytes output;
+    std::optional<std::size_t> write_budget;
+    bool throw_write = false;
+    bool throw_read = false;
+    std::size_t reads = 0;
+    std::size_t writes = 0;
+    IoGate* read_gate = nullptr;
+    IoGate* write_gate = nullptr;
+    Task<Result<std::size_t>> read_some(std::span<std::byte> out, OperationOptions = {}) {
+        ++reads;
+        if (read_gate) co_await *read_gate;
+        if (throw_read) throw std::runtime_error("scripted read failure");
+        if (input.empty()) co_return fail(Errc::timed_out);
+        const auto n = std::min(out.size(), input.front().size());
+        std::copy_n(input.front().begin(), n, out.begin());
+        input.front().erase(input.front().begin(), input.front().begin() + static_cast<std::ptrdiff_t>(n));
+        if (input.front().empty()) input.pop_front();
+        co_return n;
+    }
+    Task<Result<std::size_t>> write_some(std::span<const std::byte> bytes, OperationOptions = {}) {
+        ++writes;
+        if (write_gate) co_await *write_gate;
+        if (write_budget) {
+            if (*write_budget == 0) {
+                if (throw_write) throw std::runtime_error("scripted write failure");
+                co_return fail(Errc::timed_out);
+            }
+            bytes = bytes.first(std::min(bytes.size(), *write_budget));
+            *write_budget -= bytes.size();
+        }
+        output.insert(output.end(), bytes.begin(), bytes.end());
+        co_return bytes.size();
+    }
+};
+Task<void> bounded_events_and_auth() {
+    ScriptedBroker broker;
+    broker.input.push_back(*encode(Connack{}, Version::v5));
+    ClientOptions options;
+    options.client_id = "bounded";
+    options.max_events = 1;
+    auto client = co_await Client<ScriptedBroker>::connect(broker, options);
+    CHECK(client.has_value());
+    if (!client) co_return;
+    Publish message;
+    message.topic = "flood";
+    message.payload = text("x");
+    for (int i = 0; i < 1000; ++i) broker.input.push_back(*encode(message, Version::v5));
+    auto wait = co_await client->wait_for(42);
+    CHECK(!wait && wait.error() == Errc::limit_exceeded);
+    CHECK(client->closed());
+    auto buffered = co_await client->receive();
+    CHECK(buffered && buffered->size() == 1);
+
+    ScriptedBroker authenticated;
+    Auth challenge;
+    challenge.reason = 0x18;
+    challenge.properties.authentication_method = "test";
+    authenticated.input.push_back(*encode(challenge, Version::v5));
+    Connack authenticated_ack;
+    authenticated_ack.properties.authentication_method = "test";
+    authenticated.input.push_back(*encode(authenticated_ack, Version::v5));
+    options.max_events = 4;
+    options.properties.authentication_method = "test";
+    bool called = false;
+    auto answer = [&called](const Event& event, OperationOptions) -> Task<Result<Auth>> {
+        called = true;
+        CHECK(event.kind == Event::Kind::auth && event.reason == 0x18);
+        Auth response;
+        response.reason = 0x18;
+        response.properties.authentication_method = "test";
+        response.properties.authentication_data = text("proof");
+        co_return response;
+    };
+    auto connected = co_await Client<ScriptedBroker>::connect(authenticated, options, {}, answer);
+    CHECK(connected.has_value() && called);
+    auto first = decode(authenticated.output, Version::v5, Role::server);
+    CHECK(first && first->packet && std::holds_alternative<Connect>(*first->packet));
+    if (first) {
+        auto second_packet = decode(std::span<const std::byte>(authenticated.output).subspan(first->consumed),
+                                    Version::v5, Role::server);
+        CHECK(second_packet && second_packet->packet && std::holds_alternative<Auth>(*second_packet->packet));
+    }
+
+    // Reconnect must account for already buffered client events before it
+    // clears outstanding publishes or writes CONNECT to the fresh transport.
+    ScriptedBroker previous;
+    previous.input.push_back(*encode(Connack{}, Version::v5));
+    ClientOptions reconnect_options;
+    reconnect_options.client_id = "reconnect-budget";
+    reconnect_options.max_events = 1;
+    auto pending = co_await Client<ScriptedBroker>::connect(previous, reconnect_options);
+    CHECK(pending.has_value());
+    if (!pending) co_return;
+    CHECK((co_await pending->publish("pending", text("payload"), QoS::at_least_once)).has_value());
+    previous.input.push_back(*encode(message, Version::v5));
+    CHECK(!(co_await pending->wait_for(42)));
+    ScriptedBroker fresh;
+    fresh.input.push_back(*encode(Connack{}, Version::v5));
+    auto retried = co_await pending->reconnect(fresh);
+    CHECK(!retried && retried.error() == Errc::would_block);
+    CHECK(fresh.output.empty() && pending->session().inflight() == 1);
+    auto preserved = co_await pending->receive();
+    CHECK(preserved && preserved->size() == 1 && preserved->front().kind == Event::Kind::message);
+    const auto old_size = previous.output.size();
+    auto original_transport = co_await pending->publish("still-original", text("x"));
+    CHECK(original_transport.has_value());
+    CHECK(previous.output.size() > old_size && fresh.output.empty());
+}
+
+Task<void> transport_failure_state() {
+    test::section("MQTT transport errors are sticky, exceptions preserve resume state");
+    for (bool throwing : {false, true}) {
+        ScriptedBroker old;
+        old.input.push_back(*encode(Connack{}, Version::v5));
+        ClientOptions options;
+        options.client_id = "failure-state";
+        options.clean_start = false;
+        auto client = co_await Client<ScriptedBroker>::connect(old, options);
+        CHECK(client.has_value());
+        if (!client) continue;
+        old.write_budget = 1;  // Accept the fixed-header byte, then fail.
+        old.throw_write = throwing;
+        bool caught = false;
+        try {
+            auto sent = co_await client->publish("resume", text("payload"), QoS::at_least_once);
+            CHECK(!sent && sent.error() == Errc::timed_out && !throwing);
+        } catch (const std::runtime_error&) {
+            caught = true;
+        }
+        CHECK(caught == throwing);
+        CHECK(client->closed());
+        const auto reads_before = old.reads;
+        const auto expected = throwing ? Errc::internal : Errc::timed_out;
+        auto read = co_await client->receive();
+        CHECK(!read && read.error() == expected);
+        auto wait = co_await client->wait_for(1);
+        CHECK(!wait && wait.error() == expected);
+        CHECK(old.reads == reads_before);
+        old.write_budget.reset();
+        const auto bytes_before = old.output.size();
+        auto rejected = co_await client->publish("later", text("x"));
+        CHECK(!rejected && rejected.error() == expected);
+        CHECK(old.output.size() == bytes_before);
+
+        ScriptedBroker fresh;
+        Connack resumed;
+        resumed.session_present = true;
+        fresh.input.push_back(*encode(resumed, Version::v5));
+        auto recovered = co_await client->reconnect(fresh);
+        CHECK(recovered.has_value());
+        auto connect_packet = decode(fresh.output, Version::v5, Role::server);
+        CHECK(connect_packet && connect_packet->packet);
+        if (connect_packet && connect_packet->packet) {
+            auto replay = decode(std::span<const std::byte>{fresh.output}.subspan(connect_packet->consumed),
+                                 Version::v5, Role::server);
+            CHECK(replay && replay->packet && std::holds_alternative<Publish>(*replay->packet));
+            if (replay && replay->packet && std::holds_alternative<Publish>(*replay->packet)) {
+                const auto& p = std::get<Publish>(*replay->packet);
+                CHECK(p.dup && p.topic == "resume" && str(p.payload) == "payload");
+            }
+        }
+    }
+    ScriptedBroker old;
+    old.input.push_back(*encode(Connack{}, Version::v5));
+    ClientOptions options;
+    options.client_id = "read-failure";
+    auto client = co_await Client<ScriptedBroker>::connect(old, options);
+    CHECK(client.has_value());
+    if (!client) co_return;
+    old.throw_read = true;
+    bool caught = false;
+    try { static_cast<void>(co_await client->receive()); }
+    catch (const std::runtime_error&) { caught = true; }
+    CHECK(caught && client->closed());
+    old.throw_read = false;
+    const auto reads_before = old.reads;
+    auto read = co_await client->receive();
+    CHECK(!read && read.error() == Errc::internal && old.reads == reads_before);
+}
+
+Task<void> duplex_failure_state() {
+    test::section("MQTT late I/O completion cannot revive a failed connection");
+    for (const bool reading_first : {true, false}) {
+        ScriptedBroker broker;
+        broker.input.push_back(*encode(Connack{}, Version::v5));
+        ClientOptions options;
+        options.client_id = "duplex-failure";
+        auto client = co_await Client<ScriptedBroker>::connect(broker, options);
+        CHECK(client.has_value());
+        if (!client) continue;
+        TaskScope scope;
+        IoGate gate;
+        Result<std::vector<Event>> read;
+        Result<std::uint16_t> sent;
+        auto reader = [&]() -> Task<void> { read = co_await client->receive(); };
+        auto writer = [&]() -> Task<void> { sent = co_await client->publish("late", text("payload")); };
+        if (reading_first) {
+            Publish inbound;
+            inbound.topic = "late-inbound";
+            inbound.payload = text("payload");
+            broker.input.push_back(*encode(inbound, Version::v5));
+            broker.read_gate = &gate;
+            scope.spawn(reader());
+            broker.write_budget = 0;
+            broker.throw_write = true;
+            bool caught = false;
+            try { static_cast<void>(co_await client->publish("fail", text("x"))); }
+            catch (const std::runtime_error&) { caught = true; }
+            CHECK(caught);
+            broker.read_gate = nullptr;
+            gate.release();
+            co_await scope.join();
+            CHECK(!read && read.error() == Errc::internal);
+            auto next = co_await client->receive();
+            CHECK(!next && next.error() == Errc::internal);  // No late message surfaced.
+        } else {
+            broker.write_gate = &gate;
+            broker.write_budget = 1;
+            const auto writes_before = broker.writes;
+            scope.spawn(writer());
+            broker.throw_read = true;
+            bool caught = false;
+            try { static_cast<void>(co_await client->receive()); }
+            catch (const std::runtime_error&) { caught = true; }
+            CHECK(caught);
+            broker.write_gate = nullptr;
+            gate.release();
+            co_await scope.join();
+            CHECK(!sent && sent.error() == Errc::internal);
+            CHECK(broker.writes == writes_before + 1);  // No second short-write submission.
+        }
+    }
+}
+
 Task<void> run(EventLoop& loop) {
+    co_await bounded_events_and_auth();
+    co_await transport_failure_state();
+    co_await duplex_failure_state();
     co_await exchange(loop, Version::v5);
     co_await exchange(loop, Version::v311);
     co_await keep_alive(loop);

@@ -1,4 +1,4 @@
-# modules/transport — TCP
+# modules/transport — TCP, UDP, local streams
 
 `Socket` models `Mira::AsyncStream`, so a protocol written against the
 concept accepts one without naming it. Implemented here:
@@ -35,10 +35,17 @@ exposes the *intent*, and each platform implements that intent with whatever
 combination of socket options actually produces it. `tcp.hpp` carries the full
 reasoning; this is a summary, not the specification.
 
-## Not here, and why
+## Additional transports and composition
 
-**UDP and Unix-domain sockets.** A datagram is not a byte stream, so it needs
-its own contract rather than being forced through `AsyncStream` — see the
-transport section of `docs/ARCHITECTURE.md`. Writing those before that contract
-exists is how a library ends up with a stream abstraction that quietly lies
-about one of its transports.
+- `udp::Socket` preserves message boundaries with bounded send/receive,
+  truncation reporting, stop tokens and deadlines. `DatagramTransport` is a
+  separate concept: a UDP datagram is never represented as an `AsyncStream`.
+- `local::Socket` and `local::Listener` implement Unix-domain streams on
+  supported POSIX platforms.
+- The resolver and `tcp::dial` compose bounded system name resolution with
+  family-interleaved connection attempts. DNS/DoH wire codecs live in `dns`.
+- `tcp::serve` adds connection admission, structured handlers and staged
+  shutdown. Resource reservations are accounting limits, not process-RSS caps.
+
+Core backend tests exercise real loopback I/O on desktop CI; mobile builds are
+cross-compilation evidence unless a device run is explicitly recorded.

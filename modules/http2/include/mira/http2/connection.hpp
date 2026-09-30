@@ -79,6 +79,8 @@ private:
     }
 
     Task<Result<void>> read_locked(OperationOptions options) {
+        if (session_.state() == State::closed || session_.state() == State::failed)
+            co_return fail(session_.error() ? session_.error() : make_error_code(Errc::eof));
         std::array<std::byte, 16384> bytes{};
         auto result = co_await transport_->read_some(bytes, options);
         if (!result || *result == 0) {

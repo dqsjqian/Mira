@@ -3,6 +3,7 @@
 #include <cstring>
 #include <cerrno>
 #if !MIRA_PLATFORM_WINDOWS
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -20,14 +21,32 @@ Result<sockaddr_un> address(const std::string& path) {
     return result;
 }
 Error os_error() { return std::error_code(errno, std::generic_category()); }
+Result<int> create_socket() {
+#if defined(SOCK_CLOEXEC)
+    const int handle = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#else
+    const int handle = ::socket(AF_UNIX, SOCK_STREAM, 0);
+#endif
+    if (handle < 0) return fail(os_error());
+#if !defined(SOCK_CLOEXEC)
+    const int flags = ::fcntl(handle, F_GETFD, 0);
+    if (flags < 0 || ::fcntl(handle, F_SETFD, flags | FD_CLOEXEC) < 0) {
+        const auto error = os_error();
+        ::close(handle);
+        return fail(error);
+    }
+#endif
+    return handle;
+}
 }
 #endif
 Result<Listener> Listener::bind(EventLoop& loop, std::string path, int backlog) {
 #if !MIRA_PLATFORM_WINDOWS
     auto endpoint = address(path);
     if (!endpoint || backlog <= 0) return fail(Errc::invalid_argument);
-    const int handle = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (handle < 0) return fail(os_error());
+    const auto created = create_socket();
+    if (!created) return fail(created.error());
+    const int handle = *created;
     if (::bind(handle, reinterpret_cast<const sockaddr*>(&*endpoint), sizeof(*endpoint)) != 0 ||
         ::listen(handle, backlog) != 0) {
         const auto error = os_error();
@@ -69,8 +88,9 @@ Task<Result<Socket>> connect(EventLoop& loop, std::string path, OperationOptions
 #if !MIRA_PLATFORM_WINDOWS
     auto endpoint = address(path);
     if (!endpoint) co_return fail(endpoint.error());
-    const int handle = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (handle < 0) co_return fail(os_error());
+    const auto created = create_socket();
+    if (!created) co_return fail(created.error());
+    const int handle = *created;
     auto attached = loop.attach(handle);
     if (!attached) { ::close(handle); co_return fail(attached.error()); }
     Socket socket{loop, handle};

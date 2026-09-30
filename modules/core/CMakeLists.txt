@@ -60,7 +60,7 @@ configure_file(
 target_include_directories(mira_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${MIRA_GENERATED_INCLUDE}>
-    $<INSTALL_INTERFACE:include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 # Internal headers (poller.hpp, loop_common.hpp) are visible to this target

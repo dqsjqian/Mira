@@ -25,6 +25,7 @@ public:
     }
     void close() noexcept { stream_.close(); }
     bool valid() const noexcept { return stream_.valid(); }
+    NativeHandle native_handle() const noexcept { return stream_.native_handle(); }
 private:
     tcp::Socket stream_;
 };
@@ -38,9 +39,10 @@ public:
         : loop_(std::exchange(other.loop_, nullptr)), handle_(std::exchange(other.handle_, invalid_handle)) {}
     Listener& operator=(Listener&& other) noexcept {
         if (this != &other) {
-            close();
+            auto previous = std::move(*this);
             loop_ = std::exchange(other.loop_, nullptr);
             handle_ = std::exchange(other.handle_, invalid_handle);
+            return *this;
         }
         return *this;
     }
@@ -49,6 +51,7 @@ public:
     ~Listener() { close(); }
     Task<Result<Socket>> accept(OperationOptions io = {});
     void close() noexcept;
+    NativeHandle native_handle() const noexcept { return handle_; }
 private:
     Listener(EventLoop& loop, NativeHandle handle) : loop_(&loop), handle_(handle) {}
     EventLoop* loop_;

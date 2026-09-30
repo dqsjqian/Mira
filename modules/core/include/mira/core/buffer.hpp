@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <span>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace Mira {
@@ -34,6 +36,24 @@ public:
 
     /// Construct with `capacity` bytes reserved up front.
     explicit Buffer(std::size_t capacity) { storage_.reserve(capacity); }
+
+    Buffer(const Buffer&) = default;
+    Buffer& operator=(const Buffer&) = default;
+    Buffer(Buffer&& other) noexcept
+        : storage_(std::move(other.storage_)),
+          read_pos_(std::exchange(other.read_pos_, 0)),
+          pending_(std::exchange(other.pending_, 0)) {
+        other.storage_.clear();
+    }
+    Buffer& operator=(Buffer&& other) noexcept {
+        if (this != &other) {
+            storage_ = std::move(other.storage_);
+            read_pos_ = std::exchange(other.read_pos_, 0);
+            pending_ = std::exchange(other.pending_, 0);
+            other.storage_.clear();
+        }
+        return *this;
+    }
 
     /// Bytes available to the reader.
     [[nodiscard]] std::size_t size() const noexcept { return storage_.size() - read_pos_; }
@@ -54,6 +74,9 @@ public:
     /// Reclaims the consumed prefix first, so a steady read/consume loop
     /// settles into reusing the same allocation.
     [[nodiscard]] std::span<std::byte> prepare(std::size_t n) {
+        if (n > storage_.max_size() - size()) {
+            throw std::length_error("Mira::Buffer::prepare: size exceeds max_size");
+        }
         reclaim_if_worthwhile(n);
         const std::size_t write_pos = storage_.size();
         storage_.resize(write_pos + n);
@@ -109,7 +132,7 @@ private:
         if (read_pos_ == 0) {
             return;
         }
-        const bool would_grow = storage_.size() + incoming > storage_.capacity();
+        const bool would_grow = incoming > storage_.capacity() - storage_.size();
         if (!would_grow) {
             return;
         }

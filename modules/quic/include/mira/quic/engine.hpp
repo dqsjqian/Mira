@@ -260,6 +260,7 @@ public:
     /// Requires a completed handshake, except that a server which accepted 0-RTT may open
     /// streams for 0.5-RTT responses (still bounded by anti-amplification).
     Result<std::int64_t> open_stream(bool unidirectional = false);
+    [[nodiscard]] std::uint64_t available_bidi_streams() const noexcept;
     /// Copies and holds data until ACK or stream_close. Backpressure bounds both
     /// total send bytes and 4096 queued chunks across all streams.
     Result<void> write(std::int64_t stream, std::span<const std::byte> bytes, bool fin);

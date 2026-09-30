@@ -6,6 +6,7 @@
 #include "mira/transport/tcp.hpp"
 
 #include <string>
+#include <limits>
 #include <vector>
 
 #define CHECK_VALUE(expr) CHECK(static_cast<bool>(expr))
@@ -109,6 +110,59 @@ void mapping() {
     posted = *post;
     const auto oversize = doh::decode_request(posted, std::vector<std::byte>(70000));
     CHECK(!oversize && doh::http_status(oversize.error()) == 413);
+
+    // Raising a local limit cannot enlarge the media type's wire limit, and
+    // must not wrap the encoded-size calculation and reject ordinary queries.
+    Limits large;
+    large.max_message_size = std::numeric_limits<std::size_t>::max() / 4 + 1;
+    CHECK(doh::decode_request(*get, {}, large) == *query);
+    const std::vector<std::byte> maximum_wire(65535);
+    CHECK(doh::decode_request(posted, maximum_wire, large) == maximum_wire);
+    const std::vector<std::byte> too_large_wire(65536);
+    const auto large_post = doh::decode_request(posted, too_large_wire, large);
+    CHECK(!large_post && large_post.error() == make_error_code(DnsError::too_large));
+    mixed.target = "/dns-query?dns=" + doh::base64url_encode(too_large_wire);
+    large.max_message_size = std::numeric_limits<std::size_t>::max();
+    const auto large_get = doh::decode_request(mixed, {}, large);
+    CHECK(!large_get && large_get.error() == make_error_code(DnsError::too_large));
+}
+
+void response_age() {
+    test::section("DoH HTTP cache age reduces DNS TTLs without underflow");
+    Message answer;
+    answer.header.qr = true;
+    answer.answers.push_back({*Name::parse("cached.test"), type::a, class_in, 600, AData{{127, 0, 0, 1}}});
+    SoaData soa;
+    soa.minimum = 60;
+    answer.authorities.push_back({*Name::parse("test"), type::soa, class_in, 60, soa});
+    answer.additionals.push_back({*Name::parse("ns.test"), type::a, class_in, 120, AData{{127, 0, 0, 2}}});
+    answer.edns = Edns{};
+    answer.edns->dnssec_ok = true;
+    const auto wire = encode(answer);
+    CHECK_VALUE(wire);
+    if (!wire) return;
+    http::Response response;
+    response.headers.append("Content-Type", std::string{doh::media_type});
+    response.headers.append("Age", "250");
+    auto parsed = doh::parse_response(response, *wire);
+    CHECK_VALUE(parsed);
+    if (parsed) {
+        CHECK(parsed->answers.front().ttl == 350);
+        CHECK(parsed->authorities.front().ttl == 0);
+        CHECK(parsed->additionals.front().ttl == 0);
+        CHECK(std::get<SoaData>(parsed->authorities.front().data).minimum == 60);
+        CHECK(parsed->edns == answer.edns);
+    }
+    for (const auto& [age, ttl] : std::vector<std::pair<std::string, std::uint32_t>>{
+             {" 250 , 999", 350}, {"999999999999999999999999", 0},
+             {"0", 600}, {"-1", 600}, {"250x", 600}, {"", 600}}) {
+        response.headers.clear();
+        response.headers.append("Content-Type", std::string{doh::media_type});
+        response.headers.append("Age", age);
+        response.headers.append("Age", "500");  // First field/list member wins.
+        parsed = doh::parse_response(response, *wire);
+        CHECK(parsed && parsed->answers.front().ttl == ttl);
+    }
 }
 
 /// In-process DoH responder: A records from a tiny zone, NXDOMAIN otherwise.
@@ -143,6 +197,7 @@ struct Zone {
         response.status = 200;
         response.headers.append("Content-Type", std::string{doh::media_type});
         response.headers.append("Cache-Control", "max-age=" + std::to_string(min_ttl(answer).value_or(0)));
+        response.headers.append("Age", "10");
         co_return co_await writer.send(response, *encoded);
     }
 };
@@ -178,6 +233,7 @@ Task<void> loopback(EventLoop& loop) {
                 if (answered) {
                     CHECK(answered->header.id == 0);
                     CHECK(answered->answers.size() == 1);
+                    CHECK(answered->answers.front().ttl == 32);
                     CHECK((std::get<AData>(answered->answers[0].data).address ==
                            std::array<std::uint8_t, 4>{127, 0, 0, 1}));
                 }
@@ -204,6 +260,7 @@ Task<void> loopback(EventLoop& loop) {
 int main() {
     base64();
     mapping();
+    response_age();
     auto loop = EventLoop::create();
     if (!loop) return 1;
     if (!loop->run_until_complete(loopback(*loop))) return 1;

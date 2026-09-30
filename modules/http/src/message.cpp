@@ -146,6 +146,85 @@ std::size_t HeaderMap::count(std::string_view name) const noexcept {
     return total;
 }
 
+bool valid_request_host(const Request& request) noexcept {
+    const auto count = request.headers.count("Host");
+    if (count > 1 || (request.version == Version::http_1_1 && count != 1)) return false;
+    const auto host = request.headers.get("Host");
+    if (!host) return true;
+    // Conservative authority subset: ASCII reg-name / bracketed IPv6,
+    // plus an optional decimal port. Userinfo and whitespace are forbidden.
+    auto authority = *host;
+    if (authority.empty()) return false;
+    std::string_view port;
+    if (authority.front() == '[') {
+        const auto end = authority.find(']');
+        if (end == std::string_view::npos) return false;
+        const auto ip = authority.substr(1, end - 1);
+        const auto compression = ip.find("::");
+        if (ip.empty() || (ip.front() == ':' && !ip.starts_with("::")) ||
+            (ip.back() == ':' && !ip.ends_with("::")) || ip.find(":::") != std::string_view::npos ||
+            (compression != std::string_view::npos && ip.find("::", compression + 2) != std::string_view::npos))
+            return false;
+        std::size_t groups = 0;
+        std::string_view hex = ip;
+        if (ip.find('.') != std::string_view::npos) {
+            // IPv4-embedded IPv6 occupies the final two 16-bit groups.
+            const auto colon = ip.rfind(':');
+            if (colon == std::string_view::npos) return false;
+            auto tail = ip.substr(colon + 1);
+            hex = ip.substr(0, colon + 1);
+            for (unsigned octet = 0; octet < 4; ++octet) {
+                const auto dot = tail.find('.');
+                const auto number = tail.substr(0, dot);
+                if (number.empty() || number.size() > 3 ||
+                    (number.size() > 1 && number.front() == '0')) return false;
+                unsigned value = 0;
+                for (char c : number) {
+                    if (c < '0' || c > '9') return false;
+                    value = value * 10 + static_cast<unsigned>(c - '0');
+                }
+                if (value > 255 || ((octet < 3) != (dot != std::string_view::npos))) return false;
+                if (dot != std::string_view::npos) tail.remove_prefix(dot + 1);
+            }
+            groups = 2;
+        }
+        std::size_t digits = 0;
+        for (char c : hex) {
+            if (c == ':') { if (digits) ++groups; digits = 0; }
+            else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) ||
+                     ++digits > 4) return false;
+        }
+        if (digits) ++groups;
+        if ((compression == std::string_view::npos &&
+             (groups != 8 || ip.front() == ':' || ip.back() == ':')) ||
+            (compression != std::string_view::npos && groups >= 8)) return false;
+        authority.remove_prefix(end + 1);
+        if (!authority.empty()) {
+            if (authority.front() != ':') return false;
+            port = authority.substr(1);
+            if (port.empty()) return false;
+        }
+    } else {
+        const auto colon = authority.find(':');
+        const auto name = authority.substr(0, colon);
+        if (name.empty()) return false;
+        for (char c : name) {
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '.' || c == '-')) return false;
+        }
+        if (colon != std::string_view::npos) {
+            port = authority.substr(colon + 1);
+            if (port.empty()) return false;
+        }
+    }
+    unsigned port_number = 0;
+    for (char c : port) {
+        if (c < '0' || c > '9' || port_number > 6553) return false;
+        port_number = port_number * 10 + static_cast<unsigned>(c - '0');
+    }
+    return port_number <= 65535;
+}
+
 std::string_view default_reason(unsigned status) noexcept {
     for (const ReasonEntry& entry : kReasons) {
         if (entry.status == status) {

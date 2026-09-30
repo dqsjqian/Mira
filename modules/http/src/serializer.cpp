@@ -90,8 +90,14 @@ bool should_keep_alive(const Request& request) noexcept {
     const auto mentions = [&](std::string_view token) {
         for (const auto& [name, value] : request.headers) {
             if (!HeaderMap::names_equal(name, "Connection")) continue;
-            for (const std::string_view item : grammar::split_list(value)) {
-                if (HeaderMap::names_equal(item, token)) return true;
+            // This function is noexcept: tokenize the borrowed field directly
+            // instead of allocating split_list's temporary vector.
+            std::string_view rest = value;
+            for (;;) {
+                const auto comma = rest.find(',');
+                if (HeaderMap::names_equal(grammar::trim_ows(rest.substr(0, comma)), token)) return true;
+                if (comma == std::string_view::npos) break;
+                rest.remove_prefix(comma + 1);
             }
         }
         return false;
@@ -223,65 +229,7 @@ Result<void> write_request_head(Buffer& out, const Request& request,
     if (request.headers.contains("Content-Length") || request.headers.contains("Transfer-Encoding")) {
         return fail(SerializeError::framing_conflict);
     }
-    if (request.headers.count("Host") > 1 ||
-        (request.version == Version::http_1_1 && request.headers.count("Host") != 1)) {
-        return fail(SerializeError::invalid_header);
-    }
-    if (const auto host = request.headers.get("Host")) {
-        // Conservative authority subset: ASCII reg-name / bracketed IPv6,
-        // plus an optional decimal port.
-        auto authority = *host;
-        if (authority.empty()) return fail(SerializeError::invalid_header);
-        std::string_view port;
-        if (authority.front() == '[') {
-            const auto end = authority.find(']');
-            if (end == std::string_view::npos) return fail(SerializeError::invalid_header);
-            const auto ip = authority.substr(1, end - 1);
-            const auto compression = ip.find("::");
-            if (ip.empty() || (ip.front() == ':' && !ip.starts_with("::")) ||
-                (ip.back() == ':' && !ip.ends_with("::")) || ip.find(":::") != std::string_view::npos ||
-                (compression != std::string_view::npos && ip.find("::", compression + 2) != std::string_view::npos)) {
-                return fail(SerializeError::invalid_header);
-            }
-            std::size_t groups = 0;
-            std::size_t digits = 0;
-            for (char c : ip) {
-                if (c == ':') { if (digits) ++groups; digits = 0; }
-                else {
-                    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) ||
-                        ++digits > 4) return fail(SerializeError::invalid_header);
-                }
-            }
-            if (digits) ++groups;
-            if ((compression == std::string_view::npos &&
-                 (groups != 8 || ip.front() == ':' || ip.back() == ':')) ||
-                (compression != std::string_view::npos && groups >= 8)) return fail(SerializeError::invalid_header);
-            authority.remove_prefix(end + 1);
-            if (!authority.empty()) {
-                if (authority.front() != ':') return fail(SerializeError::invalid_header);
-                port = authority.substr(1);
-                if (port.empty()) return fail(SerializeError::invalid_header);
-            }
-        } else {
-            const auto colon = authority.find(':');
-            const auto name = authority.substr(0, colon);
-            if (name.empty()) return fail(SerializeError::invalid_header);
-            for (char c : name) {
-                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                      (c >= '0' && c <= '9') || c == '.' || c == '-')) return fail(SerializeError::invalid_header);
-            }
-            if (colon != std::string_view::npos) {
-                port = authority.substr(colon + 1);
-                if (port.empty()) return fail(SerializeError::invalid_header);
-            }
-        }
-        unsigned port_number = 0;
-        for (char c : port) {
-            if (c < '0' || c > '9' || port_number > 6553) return fail(SerializeError::invalid_header);
-            port_number = port_number * 10 + static_cast<unsigned>(c - '0');
-        }
-        if (port_number > 65535) return fail(SerializeError::invalid_header);
-    }
+    if (!valid_request_host(request)) return fail(SerializeError::invalid_header);
     if (request.target.size() > limits.max_start_line ||
         method.size() + 10 > limits.max_start_line - request.target.size() ||
         body_size > limits.max_body_size || request.headers.size() >= limits.max_header_count) {

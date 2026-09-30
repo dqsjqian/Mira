@@ -218,13 +218,11 @@ public:
         const PumpGuard guard{pumping_};
         for (;;) {
             if (auto collected = collect_events(); !collected) co_return fail(collected.error());
+            auto flushed = co_await flush(io);
+            if (!flushed) co_return fail(flushed.error());
             auto head = take_head(stream);
             if (!head) co_return fail(head.error());
-            if (*head) {
-                auto flushed = co_await flush(io);
-                if (!flushed) co_return fail(flushed.error());
-                co_return std::move(**head);
-            }
+            if (*head) co_return std::move(**head);
             if (closed()) co_return fail(Errc::eof);
             auto round = co_await do_pump(io);
             if (!round) co_return fail(round.error());
@@ -239,15 +237,11 @@ public:
         const PumpGuard guard{pumping_};
         for (;;) {
             if (auto collected = collect_events(); !collected) co_return fail(collected.error());
+            auto flushed = co_await flush(io);
+            if (!flushed) co_return fail(flushed.error());
             auto chunk = take_body(stream);
             if (!chunk) co_return fail(chunk.error());
-            if (*chunk) {
-                // Flush before returning: pending ACKs and flow-control
-                // updates must not wait for the next pump (see quic).
-                auto flushed = co_await flush(io);
-                if (!flushed) co_return fail(flushed.error());
-                co_return std::move(**chunk);
-            }
+            if (*chunk) co_return std::move(**chunk);
             if (closed()) co_return fail(Errc::eof);
             auto round = co_await do_pump(io);
             if (!round) co_return fail(round.error());
@@ -401,6 +395,8 @@ private:
     }
 
     Task<Result<void>> flush(OperationOptions io) {
+        if (io.stop.stop_requested()) co_return fail(Errc::cancelled);
+        if (io.deadline && *io.deadline <= EventLoop::Clock::now()) co_return fail(Errc::timed_out);
         for (std::size_t round = 0; round < 64; ++round) {
             auto packet = engine_->poll(detail::now_ns());
             if (!packet) co_return fail(packet.error());

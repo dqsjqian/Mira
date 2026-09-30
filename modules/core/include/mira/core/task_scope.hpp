@@ -7,7 +7,6 @@
 #include <stdexcept>
 #include <stop_token>
 #include <utility>
-#include <vector>
 
 namespace Mira {
 
@@ -30,7 +29,9 @@ namespace Mira {
 /// by I/O.
 class TaskScope final {
 public:
-    TaskScope() = default;
+    // Reserve the join frame before owning any children. Cleanup must remain
+    // available if a child or a later spawn fails because memory is exhausted.
+    TaskScope() : join_task_(wait_for_children(this)) {}
     TaskScope(const TaskScope&) = delete;
     TaskScope& operator=(const TaskScope&) = delete;
     TaskScope(TaskScope&&) = delete;
@@ -40,11 +41,7 @@ public:
         if (!joined_ && (used_ || joining_)) {
             std::terminate();
         }
-        // The retired queue holds only finished runner frames; by this point
-        // their execution chains have long returned.
-        for (auto runner : retired_) {
-            runner.destroy();
-        }
+        reclaim_retired(true);
     }
 
     /// Take over a not-yet-started, non-null Task; finished child frames do
@@ -57,6 +54,7 @@ public:
             throw std::invalid_argument(
                 "Mira::TaskScope::spawn: task holds no coroutine frame");
         }
+        reclaim_retired();
         auto runner = run_child(this, std::move(task));
         used_ = true;
         ++pending_;
@@ -69,9 +67,9 @@ public:
         if (joining_) {
             throw std::logic_error("Mira::TaskScope::join: join already requested");
         }
-        auto task = wait_for_children(this);
+        reclaim_retired();
         joining_ = true;
-        return task;
+        return std::move(join_task_);
     }
 
     [[nodiscard]] std::size_t pending() const noexcept { return pending_; }
@@ -93,9 +91,16 @@ private:
     // Only a start/completion bridge for Task; this is not a second async
     // task API.
     struct Runner {
+        // A join continuation can destroy the scope before start's resume
+        // returns. Keep active frames owned by that stack until it unwinds.
+        struct StartState {
+            TaskScope* owner;
+        };
         struct promise_type {
             TaskScope* scope{};
             bool retired = false;
+            StartState* starting{};
+            std::coroutine_handle<promise_type> next_retired{};
 
             Runner get_return_object() noexcept {
                 return Runner{std::coroutine_handle<promise_type>::from_promise(*this)};
@@ -115,8 +120,8 @@ private:
                     // the wrap-up path after destruction (ASan
                     // heap-use-after-free). The frame is handed over to the
                     // scope's retired queue, to be destroyed at a safe
-                    // point — after spawn's resume returns, or when the
-                    // scope is destructed.
+                    // point — after spawn's resume returns, at the next
+                    // spawn, or when the scope is destructed.
                     auto* owner = self.promise().scope;
                     self.promise().retired = true;
                     owner->retire(self);
@@ -146,15 +151,18 @@ private:
         void start(TaskScope& scope) noexcept {
             handle.promise().scope = &scope;
             auto running = std::exchange(handle, {});
+            StartState state{&scope};
+            running.promise().starting = &state;
             scope.frame_guard_ = running.address();
             running.resume();
             // When the child completes synchronously (the frame is already
             // in the retired queue), resume has returned, so it is safe to
             // destroy it here on the stack; frames that complete
-            // asynchronously are destroyed together by the scope's
-            // destructor.
-            if (running && running.promise().retired) {
-                scope.reclaim(running);
+            // asynchronously are reclaimed at the next spawn or teardown.
+            running.promise().starting = nullptr;
+            if (running.promise().retired) {
+                if (state.owner) state.owner->reclaim(running);
+                else running.destroy();
             }
         }
     };
@@ -209,28 +217,46 @@ private:
     }
 
     std::stop_source stop_source_;
+    Task<void> join_task_;
     std::exception_ptr failure_;
     void* frame_guard_ = nullptr;  // MSVC HALO escape hatch, see Runner::start
-    std::vector<std::coroutine_handle<>> retired_;
+    Runner::Handle retired_{};
 
-    /// Register a runner frame as retired: it is not destroyed inside its
-    /// own execution chain; safe points reclaim them all.
-    void retire(std::coroutine_handle<> runner) {
-        retired_.push_back(runner);
+    // Intrusive retirement cannot allocate at the noexcept final suspension.
+    void retire(Runner::Handle runner) noexcept {
+        runner.promise().next_retired = retired_;
+        retired_ = runner;
     }
 
-    /// Reclaim a synchronously completed runner frame after start's resume
-    /// has returned.
-    void reclaim(std::coroutine_handle<> runner) {
-        for (std::size_t i = retired_.size(); i-- > 0;) {
-            if (retired_[i] == runner) {
-                retired_.erase(retired_.begin() + static_cast<long>(i));
+    void reclaim_retired(bool destroying = false) noexcept {
+        auto* link = &retired_;
+        while (*link) {
+            auto runner = *link;
+            if (auto* starting = runner.promise().starting) {
+                if (destroying) {
+                    *link = runner.promise().next_retired;
+                    starting->owner = nullptr;
+                } else {
+                    link = &runner.promise().next_retired;
+                }
+            } else {
+                *link = runner.promise().next_retired;
                 runner.destroy();
-                return;
             }
         }
-        runner.destroy();  // not in the queue (e.g. completed synchronously
-                           // without enqueuing), destroy it directly
+    }
+
+    // Only the just-started runner is reclaimed here: a nested spawn must
+    // not reclaim an outer frame that has not returned from resume yet.
+    void reclaim(Runner::Handle runner) noexcept {
+        auto* link = &retired_;
+        while (*link && *link != runner) {
+            link = &link->promise().next_retired;
+        }
+        if (*link) {
+            *link = runner.promise().next_retired;
+            runner.destroy();
+        }
     }
     std::coroutine_handle<> waiter_{};
     std::size_t pending_{0};

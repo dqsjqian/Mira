@@ -3,7 +3,7 @@ add_library(mira_socks src/socks5.cpp)
 add_library(Mira::socks ALIAS mira_socks)
 target_include_directories(mira_socks PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>)
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_compile_features(mira_socks PUBLIC cxx_std_23)
 target_link_libraries(mira_socks PUBLIC Mira::core PRIVATE $<BUILD_INTERFACE:Mira::warnings>)
 set_target_properties(mira_socks PROPERTIES OUTPUT_NAME Mira-socks

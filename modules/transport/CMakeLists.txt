@@ -16,7 +16,7 @@ add_library(Mira::transport ALIAS mira_transport)
 
 target_include_directories(mira_transport PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_include_directories(mira_transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 

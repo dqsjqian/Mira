@@ -380,6 +380,7 @@ struct Engine::Impl {
     ngtcp2_crypto_conn_ref ref{};
     ngtcp2_path path{};
     Path validated;
+    std::deque<Path> validated_paths;
     std::optional<Path> probing;
     EarlyDataStatus early_status = EarlyDataStatus::not_attempted;
     bool early_rx_key = false, application_tx_key = false;
@@ -447,13 +448,27 @@ struct Engine::Impl {
                               reinterpret_cast<const std::byte*>(data) + size)};
     }
     bool handshake_ready() const { return ngtcp2_conn_get_handshake_completed(conn) != 0; }
+    void remember_validated(const Path& candidate) {
+        std::erase(validated_paths, candidate);
+        if (validated_paths.size() == 64) validated_paths.pop_front();
+        validated_paths.push_back(candidate);
+    }
+    void refresh_validated() {
+        const auto active = owned_path(*ngtcp2_conn_get_path(conn));
+        if ((!probing || *probing != active) &&
+            std::find(validated_paths.begin(), validated_paths.end(), active) != validated_paths.end())
+            validated = active;
+    }
     static int begin_validation(ngtcp2_conn* conn, std::uint32_t, const ngtcp2_path* path,
                                  const ngtcp2_path*, void* p) {
         return guarded([&] {
             auto& s = self(p);
             const auto candidate = owned_path(*path);
-            // A server can probe a previous path in the background.
+            // ngtcp2 can probe the previous server path in the background
+            // (DONT_CARE), without a completion callback. That probe must not
+            // erase the authenticated history needed for a return migration.
             if (s.options.server && candidate != owned_path(*ngtcp2_conn_get_path(conn))) return 0;
+            std::erase(s.validated_paths, candidate);
             s.probing = candidate;
             return 0;
         });
@@ -463,8 +478,10 @@ struct Engine::Impl {
         return guarded([&] {
             auto& s = self(p);
             const auto candidate = owned_path(*path);
-            if (result == NGTCP2_PATH_VALIDATION_RESULT_SUCCESS &&
-                candidate == owned_path(*ngtcp2_conn_get_path(conn))) s.validated = candidate;
+            if (result == NGTCP2_PATH_VALIDATION_RESULT_SUCCESS) {
+                s.remember_validated(candidate);
+                if (candidate == owned_path(*ngtcp2_conn_get_path(conn))) s.validated = candidate;
+            }
             if (s.probing && *s.probing == candidate) s.probing.reset();
             return 0;
         });
@@ -770,6 +787,7 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
     if (s->options.ca_file.empty()) s->options.session_cache.reset();
     s->clock = now;
     s->validated = {s->options.local, s->options.remote};
+    s->remember_validated(s->validated);
     auto local = s->options.local.address_bytes(), remote = s->options.remote.address_bytes();
     s->path.local = {reinterpret_cast<ngtcp2_sockaddr*>(const_cast<std::byte*>(local.data())),
                      static_cast<ngtcp2_socklen>(local.size())};
@@ -1018,6 +1036,7 @@ Result<void> Engine::receive(const Path& path, std::span<const std::byte> packet
         s.failure_code = rv;
         return std::unexpected(quic_error(rv));
     }
+    s.refresh_validated();
     return {};
 }
 Result<Bytes> Engine::poll(std::uint64_t now) {
@@ -1111,6 +1130,7 @@ Result<void> Engine::initiate_migration(const Path& path, std::uint64_t now) {
     auto candidate = native_path(path);
     const auto rv = ngtcp2_conn_initiate_migration(s.conn, &candidate, now);
     if (rv) return std::unexpected(quic_error(rv));
+    s.refresh_validated();
     return {};
 }
 Result<void> Engine::handle_expiry(std::uint64_t now) {
@@ -1123,6 +1143,7 @@ Result<void> Engine::handle_expiry(std::uint64_t now) {
         s.failure_code = rv;
         return std::unexpected(quic_error(rv));
     }
+    s.refresh_validated();
     return {};
 }
 std::uint64_t Engine::expiry() const noexcept {
@@ -1215,6 +1236,9 @@ Result<std::int64_t> Engine::open_stream(bool uni) {
     s.streams.try_emplace(id);
     return id;
 }
+std::uint64_t Engine::available_bidi_streams() const noexcept {
+    return impl_->capacity() ? ngtcp2_conn_get_streams_bidi_left(impl_->conn) : 0;
+}
 Result<void> Engine::write(std::int64_t id, std::span<const std::byte> bytes, bool fin) {
     auto& s = *impl_;
     auto it = s.streams.find(id);
@@ -1247,7 +1271,11 @@ std::vector<Event> Engine::take_events() {
 Result<void> Engine::consume(std::int64_t id, std::size_t bytes) {
     auto& s = *impl_;
     auto it = s.streams.find(id);
-    if (it == s.streams.end() || bytes > it->second.unread)
+    // Empty FIN events outlive receive-only streams, which ngtcp2 may retire
+    // immediately. Consuming the delivered zero-byte event needs no credit.
+    if (it == s.streams.end())
+        return bytes == 0 ? Result<void>{} : std::unexpected(quic_error(invalid));
+    if (bytes > it->second.unread)
         return std::unexpected(quic_error(invalid));
     int rv = ngtcp2_conn_extend_max_stream_offset(s.conn, id, bytes);
     if (rv && rv != NGTCP2_ERR_STREAM_NOT_FOUND) return std::unexpected(quic_error(rv));

@@ -15,15 +15,21 @@
 #include <concepts>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <stop_token>
 
 namespace Mira::http {
 
 /// Pull-based request body for `ClientConnection::exchange`: each call yields
 /// the next borrowed chunk, valid until the following call; empty = end of body.
+/// Prefer source(OperationOptions): forward these options to asynchronous work
+/// so the exchange can cancel it and enforce its absolute request deadline.
+/// Legacy source() callbacks must arrange their own cooperative cancellation.
 template<typename Source>
 concept BodySource = requires(Source& source) {
     { source() } -> std::same_as<Task<Result<std::span<const std::byte>>>>;
+} || requires(Source& source, OperationOptions io) {
+    { source(io) } -> std::same_as<Task<Result<std::span<const std::byte>>>>;
 };
 
 /// Duplex upload policy for `ClientConnection::exchange`.
@@ -60,7 +66,8 @@ struct ClientOptions {
     std::size_t max_buffer_size = 64 * 1024;
     std::size_t max_informational_responses = 16;
     /// Overall deadline for one exchange (send, 1xx, final response and body),
-    /// not refreshed per read.
+    /// not refreshed per read. Sources accepting OperationOptions receive this
+    /// deadline; legacy no-argument sources must bound their own asynchronous work.
     Clock::duration request_timeout = Clock::duration::zero();
     /// Charge the fixed response input capacity for this connection's lifetime.
     /// Does not cover parser metadata, caller buffers or allocator overhead.
@@ -96,7 +103,7 @@ public:
     [[nodiscard]] Task<Result<void>> begin(const Request& request, Framing framing,
                                            std::uint64_t size = 0, OperationOptions io = {}) {
         if (busy_ || active_ || !reusable_) co_return fail(Errc::invalid_argument);
-        Guard guard{busy_};
+        Guard guard{*this};
         co_return co_await open(request, framing, size, std::move(io), Expectation::none);
     }
 
@@ -111,6 +118,8 @@ public:
     /// An in-flight chunk write is never cancelled for an early response —
     /// on TLS that would invalidate the session and lose the response — so a
     /// peer that neither reads nor closes is bounded by the deadline or stop.
+    /// A cooperative producer waiting between chunks is cancelled separately,
+    /// allowing an early refusal to finish without invalidating the stream.
     /// Reader failure cancels the writer; producer failure cancels the reader.
     /// Returns once the final head is parsed; drain it with `read_body`.
     /// `skipped`/`interrupted` forbid reuse. The response body is read after
@@ -122,7 +131,7 @@ public:
         if (busy_ || active_ || !reusable_) co_return fail(Errc::invalid_argument);
         if (upload.expect_continue && upload.continue_timeout <= Clock::duration::zero())
             co_return fail(Errc::invalid_argument);
-        Guard guard{busy_};
+        Guard guard{*this};
         const auto opened = co_await open(request, framing, size, std::move(io),
                                           upload.expect_continue ? Expectation::continue_100
                                                                  : Expectation::none);
@@ -132,16 +141,27 @@ public:
         // The caller's stop reaches every leg; each leg can also be cut alone.
         std::stop_callback forward_reader{io_.stop, [&duplex] { duplex.reader_stop.request_stop(); }};
         std::stop_callback forward_writer{io_.stop, [&duplex] { duplex.writer_stop.request_stop(); }};
+        std::stop_callback forward_producer{io_.stop, [&duplex] { duplex.producer_stop.request_stop(); }};
         std::stop_callback forward_wait{io_.stop, [&duplex] { duplex.wait_stop.request_stop(); }};
         TaskScope scope;
-        scope.spawn(read_heads(duplex));
-        auto uploaded = co_await upload_body(loop, source, upload, duplex);
+        Result<UploadOutcome> uploaded = fail(Errc::internal);
+        std::exception_ptr exception;
+        try {
+            scope.spawn(read_heads(duplex));
+            uploaded = co_await upload_body(loop, source, upload, duplex);
+        } catch (...) { exception = std::current_exception(); }
         // A writer failure before the final head ends the exchange; the reader
         // is cut so the error reported is the writer's, not its echo.
         const bool reader_cut = !uploaded && !duplex.reader_done;
-        if (reader_cut) duplex.reader_stop.request_stop();
-        co_await scope.join();
+        if (reader_cut || exception) duplex.reader_stop.request_stop();
+        try { co_await scope.join(); }
+        catch (...) { if (!exception) exception = std::current_exception(); }
         uploading_ = false;
+        if (!exception) exception = duplex.exception;
+        if (exception) {
+            static_cast<void>(invalidate(make_error_code(Errc::internal)));
+            std::rethrow_exception(exception);
+        }
 
         if (const auto error = budget_error(io_)) co_return invalidate(error);
         if (!duplex.final_head) {
@@ -181,7 +201,7 @@ public:
     /// Empty chunks do not finish upload; size violations permanently invalidate reuse.
     [[nodiscard]] Task<Result<void>> send_body(std::span<const std::byte> body) {
         if (busy_ || !active_ || !uploading_) co_return fail(Errc::invalid_argument);
-        Guard guard{busy_};
+        Guard guard{*this};
         const auto result = co_await put_chunk(body, io_);
         if (!result) co_return invalidate(result.error());
         co_return Result<void>{};
@@ -191,7 +211,7 @@ public:
     /// Only this operation writes the final chunk. Request trailers are unsupported.
     [[nodiscard]] Task<Result<void>> finish() {
         if (busy_ || !active_ || !uploading_) co_return fail(Errc::invalid_argument);
-        Guard guard{busy_};
+        Guard guard{*this};
         const auto ended = co_await end_body(io_);
         if (!ended) co_return invalidate(ended.error());
         uploading_ = false;
@@ -212,18 +232,29 @@ public:
     /// Convenience for a borrowed contiguous body; the response must still be drained.
     [[nodiscard]] Task<Result<void>>
     start(const Request& request, std::span<const std::byte> body = {}, OperationOptions io = {}) {
-        auto result = co_await begin(request, Framing::content_length, body.size(), std::move(io));
-        if (!result) co_return result;
-        result = co_await send_body(body);
-        if (!result) co_return result;
-        co_return co_await finish();
+        // Reject before creating child tasks: a failure while allocating one
+        // must never clean up an exchange owned by an earlier call.
+        if (busy_ || active_ || !reusable_) co_return fail(Errc::invalid_argument);
+        try {
+            auto result = co_await begin(request, Framing::content_length, body.size(), std::move(io));
+            if (!result) co_return result;
+            result = co_await send_body(body);
+            if (!result) co_return result;
+            co_return co_await finish();
+        } catch (...) {
+            // Each operation guards its body, but allocating the next task's
+            // frame can throw before that guard exists. No I/O remains active
+            // once an awaited task propagates its exception.
+            static_cast<void>(abandon());
+            throw;
+        }
     }
 
     /// Return one borrowed slice, valid until begin/start/read_body; empty means complete.
     /// Trailers are available after drain. Otherwise abandon and close the underlying stream.
     [[nodiscard]] Task<Result<std::span<const std::byte>>> read_body() {
         if (busy_ || !active_ || uploading_) co_return fail(Errc::invalid_argument);
-        Guard guard{busy_};
+        Guard guard{*this};
         const auto step = co_await next(io_);
         if (!step) co_return invalidate(step.error());
         if (*step == ParseStep::body) co_return parser_.body();
@@ -248,16 +279,29 @@ public:
 
 private:
     struct Guard {
-        bool& busy;
-        explicit Guard(bool& value) : busy(value) { busy = true; }
-        ~Guard() { busy = false; }
+        ClientConnection& owner;
+        int exceptions = std::uncaught_exceptions();
+        explicit Guard(ClientConnection& value) : owner(value) { owner.busy_ = true; }
+        ~Guard() {
+            owner.busy_ = false;
+            // Streams and callbacks are permitted to throw. An interrupted
+            // protocol operation cannot be resumed or recycled, but must still
+            // leave the idle wrapper safe to destroy during stack unwinding.
+            if (std::uncaught_exceptions() > exceptions) {
+                owner.active_ = false;
+                owner.uploading_ = false;
+                owner.reusable_ = false;
+            }
+        }
     };
     /// Loop-thread state shared by the two legs of one exchange.
     struct Duplex {
         std::stop_source reader_stop;
         std::stop_source writer_stop;
+        std::stop_source producer_stop;
         std::stop_source wait_stop;
         Error reader_error{};
+        std::exception_ptr exception;
         bool continued = false;
         bool final_head = false;
         bool reader_done = false;
@@ -341,15 +385,12 @@ private:
                 co_await write_bytes(std::as_bytes(std::span{prefix}.first(count)), io);
             if (!framed) co_return fail(framed.error());
         }
-        // Count bytes once the chunk payload is on the wire, before its CRLF.
-        auto result = co_await write_bytes(body, io);
+        // Preserve each successful short write even if a later write fails.
+        auto result = co_await write_bytes(body, io, true);
         if (!result) co_return fail(result.error());
-        sent_ += body.size();
         if (framing_ == Framing::chunked) {
             result = co_await write_bytes(bytes("\r\n"), io);
             if (!result) co_return fail(result.error());
-        } else {
-            remaining_ -= body.size();
         }
         co_return Result<void>{};
     }
@@ -389,6 +430,7 @@ private:
     Task<void> read_heads(Duplex& duplex) {
         const OperationOptions io{.stop = duplex.reader_stop.get_token(), .deadline = io_.deadline};
         std::size_t informational = 0;
+        try {
         for (;;) {
             const auto step = co_await next(io);
             if (!step) {
@@ -402,6 +444,7 @@ private:
             const auto status = parser_.response().status;
             if (status >= 200) {
                 duplex.final_head = true;
+                if (refuses_body()) duplex.producer_stop.request_stop();
                 break;
             }
             if (status == 101) {
@@ -417,16 +460,24 @@ private:
                 break;
             }
         }
+        } catch (...) {
+            duplex.exception = std::current_exception();
+            duplex.reader_error = make_error_code(Errc::internal);
+        }
         duplex.reader_done = true;
         duplex.wait_stop.request_stop();
         // A dead connection must not leave the writer blocked in a write.
-        if (duplex.reader_error) duplex.writer_stop.request_stop();
+        if (duplex.reader_error) {
+            duplex.producer_stop.request_stop();
+            duplex.writer_stop.request_stop();
+        }
     }
     /// Writer leg. Errors are raw leg errors; exchange() decides what they mean.
     template<BodySource Source>
     Task<Result<UploadOutcome>> upload_body(EventLoop& loop, Source& source,
                                             const UploadOptions& upload, Duplex& duplex) {
         const OperationOptions io{.stop = duplex.writer_stop.get_token(), .deadline = io_.deadline};
+        const OperationOptions producer_io{.stop = duplex.producer_stop.get_token(), .deadline = io_.deadline};
         if (upload.expect_continue && !duplex.reader_done && !duplex.continued) {
             // The wait is a cancellable sleep: the reader cuts it short on
             // 100, a final head or failure; elapsing it means "send anyway".
@@ -443,9 +494,16 @@ private:
         for (;;) {
             if (duplex.reader_error) co_return fail(duplex.reader_error);
             if (duplex.final_head && refuses_body()) co_return UploadOutcome::interrupted;
-            auto chunk = co_await source();
-            if (!chunk) co_return fail(chunk.error());
+            Result<std::span<const std::byte>> chunk;
+            if constexpr (requires { { source(io) } -> std::same_as<Task<Result<std::span<const std::byte>>>>; })
+                chunk = co_await source(producer_io);
+            else chunk = co_await source();
             if (duplex.reader_error) co_return fail(duplex.reader_error);
+            // Only our refusal cancellation is an ordinary upload interruption.
+            // Preserve independent producer failures even if a final head raced it.
+            if (!chunk && !(chunk.error() == Errc::cancelled && duplex.final_head &&
+                            refuses_body() && duplex.producer_stop.stop_requested()))
+                co_return fail(chunk.error());
             if (duplex.final_head && refuses_body()) co_return UploadOutcome::interrupted;
             if (chunk->empty()) break;
             if (const auto error = chunk_error(chunk->size())) co_return fail(error);
@@ -492,13 +550,18 @@ private:
         uploading_ = false;
         return fail(error);
     }
-    Task<Result<void>> write_bytes(std::span<const std::byte> data, const OperationOptions& io) {
+    Task<Result<void>> write_bytes(std::span<const std::byte> data, const OperationOptions& io,
+                                   bool payload = false) {
         while (!data.empty()) {
             if (const auto error = budget_error(io)) co_return fail(error);
             const auto n = co_await stream_->write_some(data, io);
             if (!n) co_return fail(n.error());
             if (*n == 0) co_return fail(Errc::eof);
             if (*n > data.size()) co_return fail(Errc::invalid_argument);
+            if (payload) {
+                sent_ += *n;
+                if (framing_ == Framing::content_length) remaining_ -= *n;
+            }
             data = data.subspan(*n);
         }
         if (const auto error = budget_error(io)) co_return fail(error);

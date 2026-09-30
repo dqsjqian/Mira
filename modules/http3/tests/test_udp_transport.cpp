@@ -172,6 +172,21 @@ Task<void> client_side(EventLoop& loop,
     check(first != second, "requests must have distinct stream IDs");
     // Submit both requests before reading; the second response may arrive while reading the first.
     for (const auto stream : {first, second}) {
+        // Force a queued head before cancelling its flush. A subsequent read
+        // must still return that same head and every body byte.
+        if (stream == first) {
+            for (int round = 0; round < 3; ++round) {
+                auto pumped = co_await client->pump({.deadline = Clock::now() + 50ms});
+                if (!pumped) check(pumped.error() == Errc::timed_out, "head prebuffer failed");
+            }
+        }
+        std::stop_source stop; stop.request_stop();
+        auto cancelled_head = co_await client->await_head(stream, {.stop = stop.get_token()});
+        check(!cancelled_head && cancelled_head.error() == Errc::cancelled,
+              "head read ignored cancellation");
+        auto expired_head = co_await client->await_head(stream, {.deadline = Clock::now() - 1ms});
+        check(!expired_head && expired_head.error() == Errc::timed_out,
+              "head read ignored deadline");
         auto head = co_await client->await_head(stream, {.deadline = Clock::now() + 10s});
         check(head.has_value(), "client did not receive the response head");
         if (!head) co_return;
@@ -179,6 +194,13 @@ Task<void> client_side(EventLoop& loop,
         for (const auto& [name, value] : head->fields)
             if (name == ":status" && value == "200") status_ok = true;
         check(status_ok, "response status is not 200");
+
+        auto cancelled_body = co_await client->read_body(stream, {.stop = stop.get_token()});
+        check(!cancelled_body && cancelled_body.error() == Errc::cancelled,
+              "body read ignored cancellation");
+        auto expired_body = co_await client->read_body(stream, {.deadline = Clock::now() - 1ms});
+        check(!expired_body && expired_body.error() == Errc::timed_out,
+              "body read ignored deadline");
 
         std::uint64_t total = 0;
         bool fin = false;

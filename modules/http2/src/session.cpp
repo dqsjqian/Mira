@@ -44,7 +44,7 @@ bool success_status(const Headers& headers) {
 }
 
 bool valid_headers(const Headers& headers, bool request, std::optional<std::size_t> body_size,
-                   const Limits& limits, bool connect_response = false) {
+                   const Limits& limits, bool connect_response = false, bool head_response = false) {
     std::size_t bytes = 0;
     bool regular = false;
     bool method = false, scheme = false, path = false, authority = false, status = false;
@@ -90,7 +90,7 @@ bool valid_headers(const Headers& headers, bool request, std::optional<std::size
                 std::size_t size = 0;
                 auto result = std::from_chars(h.value.data(), h.value.data() + h.value.size(), size);
                 if (length || result.ec != std::errc{} || result.ptr != h.value.data() + h.value.size() ||
-                    (body_size && size != *body_size)) return false;
+                    (body_size && !head_response && response_status != 304 && size != *body_size)) return false;
                 length = true;
             }
         }
@@ -100,6 +100,21 @@ bool valid_headers(const Headers& headers, bool request, std::optional<std::size
     if (!request && !(connect_response && response_status < 300) &&
         (response_status == 204 || response_status == 304) && body_size && *body_size != 0) return false;
     return request ? method && scheme && path && authority : status;
+}
+
+bool encoded_headers_fit(const Headers& headers, std::size_t limit) {
+    constexpr std::size_t table_updates = 12;
+    constexpr std::size_t priority_payload = 5;
+    constexpr std::size_t field_overhead = 12;
+    if (limit < table_updates + priority_payload) return false;
+    limit -= table_updates + priority_payload;
+    for (const auto& h : headers) {
+        for (const auto size : {field_overhead, h.name.size(), h.value.size()}) {
+            if (size > limit) return false;
+            limit -= size;
+        }
+    }
+    return true;
 }
 
 std::vector<nghttp2_nv> nv_headers(const Headers& headers) {
@@ -129,6 +144,7 @@ struct Session::Impl {
         std::deque<std::vector<std::byte>> outgoing;
         std::size_t front_offset = 0, queued = 0, produced = 0;
         std::optional<std::size_t> content_length;
+        std::optional<std::size_t> received_content_length;
         bool streaming = false, finished = false, deferred = false, body_forbidden = false;
         bool responded = false;
         bool head = false;
@@ -167,6 +183,10 @@ struct Session::Impl {
                 entry.visible.error = reason;
             }
         }
+    }
+    void settle_state() {
+        if (state != State::failed && !nghttp2_session_want_read(session) &&
+            !nghttp2_session_want_write(session)) state = State::closed;
     }
     void discard_output(Entry& e) {
         queued_bodies -= e.queued;
@@ -281,6 +301,12 @@ struct Session::Impl {
                         if (field(e.block, ":status") == "204")
                             return self.reset(e.visible.id, make_error_code(Errc::not_supported), NGHTTP2_CANCEL);
                         e.accepted = success_status(e.block);
+                        const auto length = field(e.block, "content-length");
+                        if (!e.accepted && field(e.block, ":status") != "304" && !length.empty()) {
+                            std::size_t size = 0;
+                            std::from_chars(length.data(), length.data() + length.size(), size);
+                            e.received_content_length = size;
+                        }
                     }
                 }
                 if (!informational) {
@@ -292,7 +318,12 @@ struct Session::Impl {
                 }
             }
             if ((frame->hd.type == NGHTTP2_HEADERS || frame->hd.type == NGHTTP2_DATA) &&
-                (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) e.visible.remote_end = true;
+                (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+                e.visible.remote_end = true;
+                if (!e.visible.error && e.received_content_length &&
+                    e.received_bytes != *e.received_content_length)
+                    return self.reset(e.visible.id, make_error_code(Errc::invalid_argument), NGHTTP2_PROTOCOL_ERROR);
+            }
             return 0;
         });
     }
@@ -308,11 +339,18 @@ struct Session::Impl {
         });
     }
     static int frame_not_sent(nghttp2_session*, const nghttp2_frame* frame, int code, void* user) noexcept {
-        auto& self = *static_cast<Impl*>(user);
-        auto it = self.entries.find(frame->hd.stream_id);
-        if (it != self.entries.end() && !it->second.visible.error)
-            it->second.visible.error = engine_error(code);
-        return 0;
+        return guarded(user, [&](Impl& self) -> int {
+            auto it = self.entries.find(frame->hd.stream_id);
+            if (it != self.entries.end()) {
+                auto& e = it->second;
+                if (e.visible.closed || e.visible.error) return 0;
+                self.discard_output(e);
+                if (frame->hd.type == NGHTTP2_HEADERS)
+                    return self.reset(frame->hd.stream_id, engine_error(code), NGHTTP2_INTERNAL_ERROR);
+            }
+            self.error = engine_error(code);
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        });
     }
     static int frame_sent(nghttp2_session*, const nghttp2_frame* frame, void* user) noexcept {
         auto& self = *static_cast<Impl*>(user);
@@ -336,13 +374,18 @@ struct Session::Impl {
                 return nghttp2_session_consume_connection(self.session, size);
             }
             auto& e = it->second;
-            const auto retained = e.protocol.empty() ? e.received_bytes : e.visible.body.size();
+            const auto retained = e.accepted ? e.visible.body.size() : e.received_bytes;
             if (size > self.limits.max_body_bytes - retained) {
                 int result = nghttp2_session_consume_connection(self.session, size);
                 if (result != 0) return result;
                 return self.reset(id, make_error_code(Errc::limit_exceeded), NGHTTP2_ENHANCE_YOUR_CALM);
             }
-            if (e.protocol.empty()) e.received_bytes += size;
+            if (e.received_content_length && size > *e.received_content_length - e.received_bytes) {
+                const int result = nghttp2_session_consume_connection(self.session, size);
+                if (result != 0) return result;
+                return self.reset(id, make_error_code(Errc::invalid_argument), NGHTTP2_PROTOCOL_ERROR);
+            }
+            if (!e.accepted) e.received_bytes += size;
             const auto* first = reinterpret_cast<const std::byte*>(bytes);
             e.visible.body.insert(e.visible.body.end(), first, first + size);
             return 0;
@@ -479,6 +522,7 @@ Result<std::int32_t> Session::request_impl(const Headers& headers, std::span<con
         return fail(Errc::would_block);
     if (!valid_headers(headers, true, streaming ? std::nullopt : std::optional{body.size()}, s.limits))
         return fail(Errc::invalid_argument);
+    if (!encoded_headers_fit(headers, s.limits.max_header_bytes)) return fail(Errc::limit_exceeded);
     const auto protocol = field(headers, ":protocol");
     if (!protocol.empty() && (!streaming || !peer_connect_protocol_enabled()))
         return fail(Errc::not_supported);
@@ -524,8 +568,9 @@ Result<void> Session::respond_impl(std::int32_t id, const Headers& headers,
     const bool accepting = !e.protocol.empty() && success_status(headers);
     if (accepting && field(headers, ":status") == "204") return fail(Errc::not_supported);
     if (!valid_headers(headers, false, streaming ? std::nullopt : std::optional{body.size()}, s.limits,
-                       !e.protocol.empty()) || (accepting && !streaming))
+                       !e.protocol.empty(), e.head) || (accepting && !streaming))
         return fail(Errc::invalid_argument);
+    if (!encoded_headers_fit(headers, s.limits.max_header_bytes)) return fail(Errc::limit_exceeded);
     auto nv = nv_headers(headers);
     if (!e.head && !body.empty()) e.outgoing.emplace_back(body.begin(), body.end());
     e.queued = e.produced = e.head ? 0 : body.size();
@@ -551,7 +596,7 @@ Result<void> Session::write_body(std::int32_t id, std::span<const std::byte> bod
     auto& e = it->second;
     if (!e.streaming || e.finished || e.visible.closed || e.visible.error ||
         (e.body_forbidden && !body.empty())) return fail(Errc::invalid_argument);
-    if (e.protocol.empty() && body.size() > s.limits.max_body_bytes - e.produced) return fail(Errc::limit_exceeded);
+    if (!e.accepted && body.size() > s.limits.max_body_bytes - e.produced) return fail(Errc::limit_exceeded);
     if (e.content_length && !e.body_forbidden &&
         (body.size() > *e.content_length - e.produced ||
          (end && e.produced + body.size() != *e.content_length))) return fail(Errc::invalid_argument);
@@ -569,7 +614,7 @@ Result<void> Session::write_body(std::int32_t id, std::span<const std::byte> bod
     }
     e.queued += body.size();
     s.queued_bodies += body.size();
-    if (e.protocol.empty()) e.produced += body.size();
+    if (!e.accepted) e.produced += body.size();
     e.finished = end;
     return {};
 }
@@ -633,6 +678,7 @@ Result<void> Session::receive(std::span<const std::byte> bytes) {
         }
         bytes = bytes.subspan(count);
     }
+    s.settle_state();
     return {};
 }
 
@@ -643,7 +689,7 @@ Result<std::vector<std::byte>> Session::output() {
     if (rc) { s.fail_connection(s.error ? s.error : engine_error(rc)); return fail(s.error); }
     std::vector<std::byte> out;
     out.swap(s.wire);
-    if (!nghttp2_session_want_read(s.session) && !nghttp2_session_want_write(s.session)) s.state = State::closed;
+    s.settle_state();
     return out;
 }
 

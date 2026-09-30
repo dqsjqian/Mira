@@ -100,6 +100,11 @@ void handshakes() {
     auto response = server_handshake(generated->request);
     CHECK(response.has_value());
     CHECK(validate_server_handshake(*response, generated->key).has_value());
+    auto cookies = *response;
+    cookies.insert(cookies.size() - 2, "Set-Cookie: one=1\r\nSet-Cookie: two=2\r\n");
+    CHECK(validate_server_handshake(cookies, generated->key).has_value());
+    cookies.insert(cookies.size() - 2, "Sec-WebSocket-Accept: " + *accept_key(generated->key) + "\r\n");
+    CHECK(!validate_server_handshake(cookies, generated->key));
     auto second = client_handshake("localhost");
     CHECK(generated->key != second->key);
     CHECK(!client_handshake("host\r\nInjected: yes").has_value());
@@ -133,6 +138,8 @@ struct MemoryStream {
     bool closed = false;
     bool fail_write = false;
     bool throw_read = false;
+    std::stop_source* cancel_source = nullptr;
+    std::size_t cancel_at = 0;
     std::size_t reads = 0, writes = 0;
     Task<Result<std::size_t>> read_some(std::span<std::byte> out, OperationOptions options = {}) {
         ++reads;
@@ -140,6 +147,7 @@ struct MemoryStream {
         if (options.stop.stop_requested()) co_return fail(Mira::Errc::cancelled);
         if (pos == input.size()) co_return fail(Mira::Errc::eof);
         out[0] = input[pos++];
+        if (cancel_source && pos == cancel_at) cancel_source->request_stop();
         co_return 1;
     }
     Task<Result<std::size_t>> write_some(std::span<const std::byte> in, OperationOptions options = {}) {
@@ -202,6 +210,22 @@ Task<void> extended_handoff() {
 }
 Task<void> connection_tests() {
     co_await extended_handoff();
+    {
+        MemoryStream partial;
+        std::stop_source stop;
+        auto first = serialize(Frame{Opcode::text, false, bytes("prefix")}, Role::server);
+        auto last = serialize(Frame{Opcode::continuation, true, bytes("suffix")}, Role::server);
+        partial.input = *first;
+        partial.input.insert(partial.input.end(), last->begin(), last->end());
+        partial.cancel_source = &stop;
+        partial.cancel_at = first->size();
+        Connection fragmented(partial, Role::client);
+        CHECK(fragmented.adopt_extended_connect("websocket", 200).has_value());
+        auto result = co_await fragmented.read_message({.stop = stop.get_token()});
+        CHECK(!result && result.error() == Mira::Errc::cancelled);
+        CHECK(fragmented.closed() && partial.closed);
+        CHECK(!(co_await fragmented.read_message()));
+    }
     auto request = client_handshake("localhost");
     MemoryStream stream;
     stream.input = bytes(request->request);

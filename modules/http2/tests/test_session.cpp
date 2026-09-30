@@ -227,6 +227,28 @@ void streaming_bodies() {
     CHECK(client.stream(*head)->body.empty());
 }
 
+void bodyless_response_metadata() {
+    auto client = make_session(Role::client);
+    auto server = make_session(Role::server);
+    const auto head = client.request(request_headers("HEAD"));
+    const auto cached = client.request(request_headers());
+    const auto ordinary = client.request(request_headers());
+    CHECK(head && cached && ordinary);
+    exchange(client, server);
+    CHECK(server.respond(*head, {{":status", "200"}, {"content-length", "123"}}).has_value());
+    CHECK(!server.respond(*cached, {{":status", "304"}, {"content-length", "9"}}, bytes("bad")));
+    CHECK(server.respond(*cached, {{":status", "304"}, {"content-length", "9"}}).has_value());
+    CHECK(!server.respond(*ordinary, {{":status", "200"}, {"content-length", "9"}}));
+    CHECK(server.respond(*ordinary, {{":status", "200"}, {"content-length", "2"}}, bytes("ok")).has_value());
+    exchange(client, server);
+    for (const auto id : {*head, *cached}) {
+        CHECK(client.stream(id)->closed && !client.stream(id)->error);
+        CHECK(client.stream(id)->body.empty());
+    }
+    CHECK(client.stream(*head)->headers.back().value == "123");
+    CHECK(client.stream(*cached)->headers.back().value == "9");
+}
+
 void queued_cancel_and_close() {
     auto client = make_session(Role::client);
     auto server = make_session(Role::server);
@@ -284,6 +306,38 @@ void header_validation() {
     CHECK(!invalid);
 }
 
+void encoded_header_limits() {
+    Limits limits;
+    limits.max_header_bytes = 256;
+    auto client = make_session(Role::client, limits);
+    auto server = make_session(Role::server, limits);
+    exchange(client, server);
+    auto request = request_headers();
+    request.push_back({"x", ""});
+    std::size_t bound = 17 + 12 * request.size();
+    for (const auto& h : request) bound += h.name.size() + h.value.size();
+    request.back().value.assign(limits.max_header_bytes - bound + 1, 'a');
+    CHECK(!client.request(request));
+    CHECK(!client.request_stream(request));
+    CHECK(client.streams().empty() && client.queued_body_bytes() == 0);
+    CHECK(!client.wants_write());
+    request.back().value.pop_back();
+    const auto id = client.request(request);
+    CHECK(id && *id == 1);
+    exchange(client, server);
+    Headers response{{":status", "200"}, {"x", std::string(limits.max_header_bytes - 52 + 1, 'a')}};
+    CHECK(!server.respond(*id, response, bytes("queued")));
+    CHECK(!server.respond_stream(*id, response));
+    CHECK(server.queued_body_bytes() == 0 && !server.wants_write());
+    CHECK(!server.stream(*id)->closed && !server.stream(*id)->error);
+    response.back().value.pop_back();
+    CHECK(server.respond(*id, response, bytes("ok")).has_value());
+    exchange(client, server);
+    CHECK(client.stream(*id)->closed && !client.stream(*id)->error);
+    CHECK(client.stream(*id)->body.size() == 2);
+    CHECK(server.release(*id).has_value());
+}
+
 std::vector<std::byte> raw_frame(std::uint8_t type, std::uint8_t flags, std::int32_t id,
                                  std::span<const std::byte> payload = {}) {
     std::vector<std::byte> wire(9);
@@ -295,7 +349,8 @@ std::vector<std::byte> raw_frame(std::uint8_t type, std::uint8_t flags, std::int
     wire.insert(wire.end(), payload.begin(), payload.end());
     return wire;
 }
-std::vector<std::byte> header_frame(Headers headers) {
+std::vector<std::byte> header_frame(Headers headers,
+                                  std::uint8_t flags = NGHTTP2_FLAG_END_HEADERS | NGHTTP2_FLAG_END_STREAM) {
     nghttp2_hd_deflater* deflater = nullptr;
     CHECK(nghttp2_hd_deflate_new(&deflater, 4096) == 0);
     std::vector<nghttp2_nv> nv;
@@ -307,7 +362,7 @@ std::vector<std::byte> header_frame(Headers headers) {
     CHECK(n >= 0);
     encoded.resize(static_cast<std::size_t>(n));
     nghttp2_hd_deflate_del(deflater);
-    return raw_frame(NGHTTP2_HEADERS, NGHTTP2_FLAG_END_HEADERS | NGHTTP2_FLAG_END_STREAM, 1, encoded);
+    return raw_frame(NGHTTP2_HEADERS, flags, 1, encoded);
 }
 void wire_negative_cases() {
     for (int mutation = 0; mutation < 3; ++mutation) {
@@ -356,6 +411,7 @@ struct MemoryStream {
     std::size_t read_at = 0;
     int writes = 0;
     OperationOptions seen;
+    int reads = 0;
     Task<Result<std::size_t>> write_some(std::span<const std::byte> source, OperationOptions options = {}) {
         seen = options;
         if (options.stop.stop_requested()) co_return fail(Errc::cancelled);
@@ -366,6 +422,7 @@ struct MemoryStream {
         co_return n;
     }
     Task<Result<std::size_t>> read_some(std::span<std::byte> destination, OperationOptions options = {}) {
+        ++reads;
         seen = options;
         if (options.stop.stop_requested()) co_return fail(Errc::cancelled);
         if (read_at == pending.size()) {
@@ -407,6 +464,20 @@ Task<void> adapter_case() {
     CHECK(connection.session().state() == State::closed);
 }
 
+Task<void> idle_goaway_closes_without_read() {
+    auto client = make_session(Role::client), server = make_session(Role::server);
+    exchange(client, server);
+    CHECK(server.goaway().has_value());
+    auto goaway = server.output();
+    CHECK(goaway && !goaway->empty());
+    CHECK(client.receive(*goaway).has_value());
+    CHECK(client.state() == State::closed && !client.wants_write());
+    MemoryStream transport{&server, {}, 0, 0, {}};
+    Connection connection(transport, std::move(client));
+    const auto result = co_await connection.pump();
+    CHECK(!result && result.error() == Errc::eof && transport.reads == 0);
+}
+
 void shared_budget() {
     Limits limits;
     limits.max_streams = 2;
@@ -436,9 +507,12 @@ int main() {
     flow_control_and_bounds();
     queued_cancel_and_close();
     header_validation();
+    encoded_header_limits();
+    bodyless_response_metadata();
     wire_negative_cases();
     auto loop = EventLoop::create();
     CHECK(loop.has_value());
     CHECK(loop->run_until_complete(adapter_case()).has_value());
+    CHECK(loop->run_until_complete(idle_goaway_closes_without_read()).has_value());
     return test::summary();
 }

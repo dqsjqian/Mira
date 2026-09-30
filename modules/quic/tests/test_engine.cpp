@@ -349,6 +349,26 @@ int main(int argc, char** argv) {
         check(reset, "RESET_STREAM did not arrive");
         auto other = require(client.open_stream());
         require(client.write(other, {}, true));
+        // A receive-only stream can close in the same datagram as an empty
+        // FIN. The application still consumes every delivered data event,
+        // including the zero-byte terminal event after its record is retired.
+        const auto empty_uni = require(client.open_stream(true));
+        require(client.write(empty_uni, {}, true));
+        bool empty_fin = false;
+        for (int i = 0; i < 2000 && !empty_fin; ++i) {
+            drive();
+            client.take_events();
+            for (auto& e : server.take_events()) {
+                if (e.kind != quic::Event::Kind::data) continue;
+                auto consumed = server.consume(e.stream_id, e.data.size());
+                if (!consumed) throw std::runtime_error("empty FIN consume failed: stream=" +
+                    std::to_string(e.stream_id) + " bytes=" + std::to_string(e.data.size()) +
+                    " " + consumed.error().message());
+                if (e.stream_id == empty_uni) empty_fin = e.fin && e.data.empty();
+            }
+        }
+        check(empty_fin, "empty unidirectional FIN did not arrive");
+        check(!server.consume(empty_uni, 1), "retired stream accepted nonexistent receive credit");
         auto over = require(client.open_stream());
         quic::Bytes huge(co.max_buffered_bytes + 1);
         check(!client.write(over, wire(huge), false), "send budget not enforced");

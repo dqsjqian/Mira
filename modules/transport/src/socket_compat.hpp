@@ -71,7 +71,11 @@ inline void close_socket(socket_t socket) noexcept {
     const socket_t socket =
         ::WSASocketW(family, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
 #else
+    #if defined(SOCK_CLOEXEC)
+    socket_t socket = ::socket(family, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+    #else
     socket_t socket = ::socket(family, SOCK_STREAM, IPPROTO_TCP);
+    #endif
     if (socket >= 0) {
         // Non-blocking is not optional: the loop emulates completion on top of
         // readiness, and a blocking descriptor would stall it inside one read.
@@ -81,10 +85,12 @@ inline void close_socket(socket_t socket) noexcept {
             close_socket(socket);
             return fail(error);
         }
-    #ifdef FD_CLOEXEC
+    #if !defined(SOCK_CLOEXEC)
         const int descriptor_flags = ::fcntl(socket, F_GETFD, 0);
-        if (descriptor_flags >= 0) {
-            ::fcntl(socket, F_SETFD, descriptor_flags | FD_CLOEXEC);
+        if (descriptor_flags < 0 || ::fcntl(socket, F_SETFD, descriptor_flags | FD_CLOEXEC) < 0) {
+            const Error error = last_socket_error();
+            close_socket(socket);
+            return fail(error);
         }
     #endif
     }

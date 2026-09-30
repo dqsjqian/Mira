@@ -98,9 +98,12 @@ struct ServerOptions {
     /// How long one request may take, from its first byte to its last
     /// response byte.
     ///
-    /// Covers the handler as well as the I/O, because the point is to bound the
-    /// exchange rather than to bound one syscall. Expiry **is** an error
-    /// (`Errc::timed_out`) and ends the connection.
+    /// Mira I/O observes this deadline. A handler accepting a fourth
+    /// OperationOptions argument receives the same stop token and deadline;
+    /// forward them to asynchronous work to bound the complete exchange.
+    /// Three-argument handlers can use writer.operation_options(). Callbacks
+    /// that ignore cancellation cannot be forcibly interrupted. Expiry is an
+    /// error (`Errc::timed_out`) and ends the connection.
     ///
     /// No 408 is sent. Writing a response needs the stream, and the deadline
     /// that just expired is the same one the write would carry, so the attempt
@@ -128,8 +131,8 @@ public:
     ResponseWriter(Stream& stream,
                    bool head_request,
                    bool keep_alive,
-                   OperationOptions io = {}) noexcept
-        : stream_(&stream), io_(std::move(io)), head_request_(head_request),
+                   OperationOptions io = {}, Version version = Version::http_1_1) noexcept
+        : stream_(&stream), io_(std::move(io)), version_(version), head_request_(head_request),
           keep_alive_(keep_alive) {}
 
     ResponseWriter(const ResponseWriter&) = delete;
@@ -184,13 +187,17 @@ public:
 
         Buffer out;
         std::optional<Response> announced;
+        close_delimited_ = version_ == Version::http_1_0 && !head_request_ &&
+                           !status_forbids_body(original.status);
+        if (close_delimited_) keep_alive_ = false;
         const Response& response = announce(original, announced);
-        Result<void> head = write_response_head(out, response, Framing::chunked);
+        Result<void> head = write_response_head(out, response,
+            version_ == Version::http_1_0 ? Framing::none : Framing::chunked);
         if (!head) {
             co_return fail(head.error());
         }
         sent_head_ = true;
-        chunked_ = !status_forbids_body(response.status);
+        chunked_ = !close_delimited_ && !status_forbids_body(response.status);
 
         co_return co_await write_all(*stream_, out.readable(), io_);
     }
@@ -205,9 +212,9 @@ public:
         }
         // A HEAD response must not carry body bytes, but the handler should not
         // have to branch on it — swallow them here.
-        if (head_request_ || !chunked_) {
-            co_return Result<void>{};
-        }
+        if (head_request_) co_return Result<void>{};
+        if (close_delimited_) co_return co_await write_all(*stream_, piece, io_);
+        if (!chunked_) co_return Result<void>{};
 
         Buffer out;
         Result<void> framed = write_chunk(out, piece);
@@ -238,36 +245,59 @@ public:
 
     /// Whether the connection is expected to stay open after this response.
     [[nodiscard]] bool keep_alive() const noexcept { return keep_alive_; }
+    [[nodiscard]] OperationOptions operation_options() const noexcept { return io_; }
 
     /// Set by `serve_connection` while a 100-continue expectation is still
     /// unanswered: a final head sent in that state refuses the body, so it
     /// announces `Connection: close` and the connection ends after it.
     void set_refuses_unread_body(bool value) noexcept { refuses_unread_body_ = value; }
+    /// The streaming reader clears this once request framing is complete.
+    void set_unread_body(bool value) noexcept { unread_body_ = value; }
 
 private:
     const Response& announce(const Response& response, std::optional<Response>& scratch) {
-        if (!refuses_unread_body_ || response.status < 200) {
-            return response;
-        }
-        keep_alive_ = false;
+        bool has_close = false;
+        bool has_keep_alive = false;
         for (const auto& [name, value] : response.headers) {
             if (!HeaderMap::names_equal(name, "Connection")) continue;
-            if (HeaderMap::names_equal(value, "close")) return response;
+            std::string_view tokens = value;
+            do {
+                const auto comma = tokens.find(',');
+                auto token = tokens.substr(0, comma);
+                while (!token.empty() && (token.front() == ' ' || token.front() == '\t')) token.remove_prefix(1);
+                while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) token.remove_suffix(1);
+                has_close = has_close || HeaderMap::names_equal(token, "close");
+                has_keep_alive = has_keep_alive || HeaderMap::names_equal(token, "keep-alive");
+                if (comma == tokens.npos) break;
+                tokens.remove_prefix(comma + 1);
+            } while (!tokens.empty());
         }
+        // A rejecting peer may stop an upload as soon as this head arrives.
+        // Announce closure now, before bytes are sent, and do not subsequently
+        // wait for a body the client has been told to withhold.
+        if (has_close || (refuses_unread_body_ && response.status >= 200) ||
+            (unread_body_ && response.status >= 300)) keep_alive_ = false;
+        const bool add_keep_alive = keep_alive_ && version_ == Version::http_1_0 && !has_keep_alive;
+        if (response.version == version_ && (keep_alive_ || has_close) && !add_keep_alive) return response;
         scratch = response;
-        scratch->headers.append("Connection", "close");
+        scratch->version = version_;
+        if (!keep_alive_ && !has_close) scratch->headers.append("Connection", "close");
+        if (add_keep_alive) scratch->headers.append("Connection", "keep-alive");
         return *scratch;
     }
 
     Stream* stream_;
     /// This request's budget, applied to every write the handler causes.
     OperationOptions io_{};
+    Version version_{Version::http_1_1};
+    bool close_delimited_{false};
     bool head_request_{false};
     bool keep_alive_{true};
     bool sent_head_{false};
     bool chunked_{false};
     bool finished_{false};
     bool refuses_unread_body_{false};
+    bool unread_body_{false};
 };
 
 /// Reads a request body incrementally while the handler runs.
@@ -360,6 +390,7 @@ public:
             case ParseStep::complete:
                 finished_ = true;
                 last_error_.reset();
+                if (body_writer_) body_writer_->set_unread_body(false);
                 co_return std::size_t{0};
             case ParseStep::head:
                 continue;  // unreachable past the head, kept for symmetry
@@ -367,6 +398,7 @@ public:
                 if (parser_.done()) {
                     finished_ = true;
                     last_error_.reset();
+                    if (body_writer_) body_writer_->set_unread_body(false);
                     co_return std::size_t{0};
                 }
                 if (input_.size() >= max_buffer_size_) {
@@ -444,10 +476,12 @@ public:
     RequestBodyReader(Stream& stream, Buffer& input, RequestParser& parser,
                       OperationOptions io, std::size_t read_chunk,
                       std::size_t max_buffer_size = 64 * 1024,
-                      ResponseWriter<Stream>* continue_writer = nullptr)
+                      ResponseWriter<Stream>* continue_writer = nullptr,
+                      ResponseWriter<Stream>* body_writer = nullptr)
         : stream_(stream), input_(input), parser_(parser), io_(std::move(io)),
           read_chunk_(read_chunk), max_buffer_size_(max_buffer_size),
-          writer_(continue_writer), continue_pending_(continue_writer != nullptr) {}
+          writer_(continue_writer), body_writer_(body_writer),
+          continue_pending_(continue_writer != nullptr) {}
 
     /// Drain whatever the handler left unread.
     ///
@@ -488,6 +522,7 @@ public:
     std::size_t read_chunk_;
     std::size_t max_buffer_size_;
     ResponseWriter<Stream>* writer_{nullptr};
+    ResponseWriter<Stream>* body_writer_{nullptr};
     bool continue_pending_{false};
     /// Remainder of a body slice that did not fit the caller's buffer, plus
     /// a read cursor: `pending_.size() - pending_pos_` bytes are owed.
@@ -509,6 +544,9 @@ template<typename Handler, typename Stream>
 concept kHandlerWantsBuffer = requires(Handler handler, Stream& stream) {
     handler(std::declval<const Request&>(), std::declval<ResponseWriter<Stream>&>(),
             std::declval<std::span<const std::byte>>());
+} || requires(Handler handler, Stream& stream) {
+    handler(std::declval<const Request&>(), std::declval<ResponseWriter<Stream>&>(),
+            std::declval<std::span<const std::byte>>(), std::declval<OperationOptions>());
 };
 
 
@@ -649,13 +687,17 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
                 // The request is malformed or over budget. Answer once with
                 // the status that matches — 413 for sizes, 400 for grammar —
                 // then stop: the stream position is no longer trustworthy.
-                const unsigned status = step.error() == Errc::limit_exceeded ? 413u : 400u;
+                const unsigned status = step.error() == make_error_code(ParseError::limit_exceeded) ? 413u : 400u;
                 static_cast<void>(co_await detail::send_error(stream, status, io));
                 co_return fail(step.error());
             }
 
             switch (*step) {
             case ParseStep::head:
+                if (!valid_request_host(parser.request())) {
+                    static_cast<void>(co_await detail::send_error(stream, 400, io));
+                    co_return fail(ParseError::malformed_header);
+                }
                 head_ready = true;
                 if (const auto expectation = detail::request_expectation(parser.request());
                     expectation == detail::RequestExpectation::unsupported) {
@@ -753,8 +795,9 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
 
         // The handler shares the request budget: a deadline that covered the
         // reading but not the responding would bound half an exchange.
-        ResponseWriter<Stream> writer{stream, head_request, keep_alive, io};
+        ResponseWriter<Stream> writer{stream, head_request, keep_alive, io, request.version};
         writer.set_refuses_unread_body(continue_pending);
+        if constexpr (!buffered_handler) writer.set_unread_body(request.body_kind != BodyKind::none);
 
         // A throwing handler is an internal error, not a protocol event: the
         // exception must not escape `serve_connection` (the caller's loop has
@@ -767,7 +810,9 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         // attribute to a connection.
         auto run_handler = [&](auto&& body_argument) -> Task<Result<void>> {
             try {
-                co_return co_await handler(request, writer, body_argument);
+                if constexpr (requires { handler(request, writer, body_argument, io); })
+                    co_return co_await handler(request, writer, body_argument, io);
+                else co_return co_await handler(request, writer, body_argument);
             } catch (...) {
                 // co_await is illegal inside a catch handler, so the 500 is
                 // sent after the handler — the flag carries the branch out.
@@ -781,7 +826,7 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         } else {
             RequestBodyReader<Stream> reader{stream, input, parser, io, options.read_chunk,
                                              options.max_buffer_size,
-                                             continue_pending ? &writer : nullptr};
+                                             continue_pending ? &writer : nullptr, &writer};
             handled = co_await run_handler(reader);
             // A final response sent while 100-continue was unanswered refused
             // the body: the client will not send it, so draining would wait on
@@ -797,6 +842,12 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
             // that itself fails means the connection is already unusable —
             // and a reader that stopped on an error keeps failing here even
             // though the handler itself returned success.
+            // Complete response framing before waiting for any remaining request bytes.
+            if (handled && writer.sent_head()) {
+                auto complete = co_await writer.finish();
+                if (!complete) co_return fail(complete.error());
+                if (!writer.keep_alive()) co_return Result<void>{};
+            }
             if (handled && (!reader.done() || reader.last_error().has_value())) {
                 Result<void> drained = co_await reader.drain();
                 if (!drained) {
@@ -822,7 +873,7 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
             co_return fail(finished.error());
         }
 
-        if (!keep_alive) {
+        if (!writer.keep_alive()) {
             co_return Result<void>{};
         }
     }

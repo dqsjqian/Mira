@@ -12,9 +12,8 @@
 //   2. Per connection: greet (the server preface is SETTINGS, sent during
 //      session setup), then serve requests with `Connection::pump` — one
 //      bounded round of output, input, and protocol replies per call.
-//   3. Requests are polled from the session's stream list: when a stream
-//      has accumulated a request body, `respond` answers it and
-//      `take_body` reclaims the flow-control credit.
+//   3. Consume each stream's available body every round to return flow-control
+//      credit, respond after its remote end, and release every closed stream.
 //
 // One request per stream, answered in arrival order — a teaching server,
 // not a scheduler. Concurrency still shows: curls opens several streams
@@ -67,69 +66,26 @@ std::span<const std::byte> bytes_of(std::string_view text) {
                                       text.size()};
 }
 
-/// Answer one request per stream, then reclaim it once it retires.
-///
-/// Two phases, because the session distinguishes them:
-///
-///   * Answer: a stream with received headers that nobody answered yet.
-///     `respond` enforces the rest. Waiting for `remote_end` here would
-///     refuse half-closed peers — a HEAD or GET whose END_STREAM rides the
-///     HEADERS frame has `remote_end` and `closed` set in the same
-///     callback, before this coroutine ever runs (which is also why
-///     answering closed streams is skipped, not asserted).
-///   * Reclaim: once the response has been delivered the session closes
-///     the stream; `take_body` hands flow-control credit back and
-///     `release` frees the id. Both refuse a live stream, so they happen
-///     here, after `stream->closed` turns true — a later pump round, not
-///     the same one that answered.
-///
-/// `answered_` guards the first phase against double answers;
-/// `retiring_` guards the second against double release. The session
-/// keeps a released id reserved, so a late DATA frame for a retired
-/// stream cannot resurrect it.
-Task<Result<void>> serve_requests(Session& session, std::vector<std::int32_t>& answered_,
-                                  std::vector<std::int32_t>& retiring_) {
-    // Phase 2: reap what has finished.
-    for (std::size_t i = 0; i < retiring_.size();) {
-        const std::int32_t id = retiring_[i];
-        const Mira::http2::Stream* stream = session.stream(id);
-        if (stream == nullptr || !stream->closed) {
-            ++i;
+Task<Result<void>> serve_requests(Session& session, std::vector<std::int32_t>& answered) {
+    for (const auto id : session.streams()) {
+        const auto* stream = session.stream(id);
+        auto consumed = session.take_body(id);
+        if (!consumed) co_return Mira::fail(consumed.error());
+        if (stream->closed) {
+            auto released = session.release(id);
+            if (!released) co_return released;
+            std::erase(answered, id);
             continue;
         }
-        const Result<std::vector<std::byte>> consumed = session.take_body(id);
-        if (!consumed) {
-            co_return Mira::fail(consumed.error());
-        }
-        const Result<void> released = session.release(id);
-        if (!released) {
-            co_return released;
-        }
-        retiring_.erase(retiring_.begin() + static_cast<std::ptrdiff_t>(i));
-    }
+        if (stream->error || !stream->headers_received || !stream->remote_end ||
+            std::find(answered.begin(), answered.end(), id) != answered.end()) continue;
 
-    // Phase 1: answer what has arrived.
-    const auto ids = session.streams();
-    for (const std::int32_t id : ids) {
-        if (std::find(answered_.begin(), answered_.end(), id) != answered_.end()) {
-            continue;
-        }
-        const Mira::http2::Stream* stream = session.stream(id);
-        if (stream == nullptr || !stream->headers_received || stream->closed) {
-            continue;
-        }
-
-        Headers headers;
-        headers.emplace_back(":status", "200");
-        headers.emplace_back("content-type", "text/plain");
+        Headers headers{{":status", "200"}, {"content-type", "text/plain"}};
         std::string body{"served by Mira's HTTP/2 server, stream "};
         body += std::to_string(id);
-        const Result<void> sent = session.respond(id, headers, bytes_of(body));
-        if (!sent) {
-            co_return sent;
-        }
-        answered_.push_back(id);
-        retiring_.push_back(id);
+        auto sent = session.respond(id, headers, bytes_of(body));
+        if (!sent) co_return sent;
+        answered.push_back(id);
     }
     co_return Result<void>{};
 }
@@ -144,7 +100,6 @@ Task<void> serve_one(tcp::Socket socket) {
     Session session = std::move(*created);
     Connection connection{socket, std::move(session)};
     std::vector<std::int32_t> answered;
-    std::vector<std::int32_t> retiring;
 
     // The connection preface (client magic + SETTINGS) arrives as ordinary
     // input; the server preface goes out with the first flush. Pump until
@@ -159,10 +114,19 @@ Task<void> serve_one(tcp::Socket socket) {
             break;
         }
         const Result<void> replied =
-            co_await serve_requests(connection.session(), answered, retiring);
+            co_await serve_requests(connection.session(), answered);
         if (!replied) {
             std::fprintf(stderr, "h2 respond: %s\n", replied.error().message().c_str());
             break;
+        }
+        const auto flushed = co_await connection.flush();
+        if (!flushed) break;
+        for (const auto id : connection.session().streams()) {
+            if (connection.session().stream(id)->closed) {
+                const auto released = connection.session().release(id);
+                if (!released) co_return;
+                std::erase(answered, id);
+            }
         }
         if (connection.session().state() == Mira::http2::State::closed ||
             connection.session().state() == Mira::http2::State::failed) {

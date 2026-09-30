@@ -1,5 +1,6 @@
 #include "check.hpp"
 #include "mira/core/event_loop.hpp"
+#include "mira/core/task_scope.hpp"
 
 #include <array>
 #include <chrono>
@@ -7,12 +8,17 @@
 #include <cstddef>
 #include <cstdlib>
 #include <new>
+#include <memory>
 #include <optional>
 #include <utility>
+#include <vector>
 
 #if MIRA_HAS_READINESS_API
+    #include <fcntl.h>
     #include <sys/socket.h>
     #include <unistd.h>
+#else
+    #include <windows.h>
 #endif
 
 namespace allocation_probe {
@@ -21,6 +27,7 @@ struct State {
     bool enabled{false};
     std::size_t fail_at{0};
     std::size_t calls{0};
+    std::size_t peak{0};
     std::array<void*, 64> live{};
 };
 
@@ -32,6 +39,7 @@ void begin(std::size_t fail_at) {
     }
     state.fail_at = fail_at;
     state.calls = 0;
+    state.peak = 0;
     state.enabled = true;
 }
 
@@ -59,8 +67,16 @@ void* allocate(std::size_t size) {
     void* pointer = std::malloc(size == 0 ? 1 : size);
     if (pointer == nullptr) throw std::bad_alloc{};
     if (state.enabled) {
-        if (state.calls > state.live.size()) std::abort();
-        state.live[state.calls - 1] = pointer;
+        bool tracked = false;
+        for (auto& slot : state.live) {
+            if (slot == nullptr) {
+                slot = pointer;
+                tracked = true;
+                break;
+            }
+        }
+        if (!tracked) std::abort();
+        state.peak = (std::max)(state.peak, live());
     }
     return pointer;
 }
@@ -134,6 +150,42 @@ Observer observe(Task<Result<void>> task, Completion& completion) {
     ++completion.calls;
 }
 
+std::size_t native_handle_count() {
+#if MIRA_HAS_READINESS_API
+    std::size_t count = 0;
+    const long limit = ::sysconf(_SC_OPEN_MAX);
+    CHECK(limit > 0);
+    for (int fd = 0; fd < limit; ++fd) {
+        if (::fcntl(fd, F_GETFD) >= 0) ++count;
+    }
+    return count;
+#else
+    DWORD count = 0;
+    CHECK(::GetProcessHandleCount(::GetCurrentProcess(), &count) != 0);
+    return count;
+#endif
+}
+
+void test_loop_creation_allocation_rollback() {
+    test::section("loop allocation failure releases already-created native handles");
+    // Initialise process-wide backend state (notably Winsock) before measuring.
+    { CHECK(EventLoop::create().has_value()); }
+    const auto before = native_handle_count();
+    allocation_probe::begin(1);
+    bool threw = false;
+    try {
+        auto loop = EventLoop::create();
+        CHECK(loop.has_value());
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+    const auto calls = allocation_probe::end();
+    CHECK(threw);
+    CHECK(calls == 1);
+    CHECK(allocation_probe::live() == 0);
+    CHECK(native_handle_count() == before);
+}
+
 void complete_timer(EventLoop& loop) {
     Completion completion;
     auto observer = observe(loop.sleep_until(EventLoop::Clock::now()), completion);
@@ -195,6 +247,123 @@ void test_timer_allocations() {
                         warm, deadline, calls);
         }
     }
+}
+
+void test_timer_dispatch_without_allocation() {
+    test::section("multi-batch timer completion performs no allocation after dequeue");
+    auto created = EventLoop::create();
+    CHECK(created.has_value());
+    if (!created) return;
+    std::array<Completion, 160> results{};
+    std::vector<std::unique_ptr<Observer>> observers;
+    for (auto& result : results) {
+        observers.emplace_back(new Observer(observe(created->sleep_until(EventLoop::Clock::now()), result)));
+        observers.back()->start();
+    }
+    allocation_probe::begin(1);
+    bool threw = false;
+    try {
+        while (created->outstanding() != 0) CHECK(created->run_once(0ms).has_value());
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+    const auto calls = allocation_probe::end();
+    CHECK(!threw);
+    CHECK(calls == 0);
+    // Still drain if a regression throws, so the observer contract does not
+    // hide the allocation failure behind an unrelated termination.
+    while (created->outstanding() != 0) CHECK(created->run_once(0ms).has_value());
+    for (const auto& result : results) CHECK(result.calls == 1 && result.succeeded);
+}
+
+void test_cancellation_without_allocation() {
+    test::section("stop callbacks and multi-batch cancellation do not allocate");
+    auto created = EventLoop::create();
+    CHECK(created.has_value());
+    if (!created) return;
+    std::array<Completion, 160> results{};
+    std::vector<std::unique_ptr<Observer>> observers;
+    std::stop_source stop;
+    for (auto& result : results) {
+        observers.emplace_back(new Observer(observe(
+            created->sleep_for(1h, {.stop = stop.get_token()}), result)));
+        observers.back()->start();
+    }
+    allocation_probe::begin(1);
+    stop.request_stop();
+    while (created->outstanding() != 0) CHECK(created->run_once(0ms).has_value());
+    const auto calls = allocation_probe::end();
+    CHECK(calls == 0);
+    for (const auto& result : results)
+        CHECK(result.calls == 1 && !result.succeeded && result.error == Errc::cancelled);
+}
+
+void test_shutdown_without_allocation() {
+    test::section("loop destruction cancels outstanding operations without allocating");
+    auto loop = EventLoop::create();
+    CHECK(loop.has_value());
+    if (!loop) return;
+    std::optional<EventLoop> owned{std::move(*loop)};
+    std::array<Completion, 8> results{};
+    std::vector<std::unique_ptr<Observer>> observers;
+    for (auto& result : results) {
+        observers.emplace_back(new Observer(observe(owned->sleep_for(1h), result)));
+        observers.back()->start();
+    }
+    allocation_probe::begin(1);
+    owned.reset();
+    const auto calls = allocation_probe::end();
+    CHECK(calls == 0);
+    for (const auto& result : results)
+        CHECK(result.calls == 1 && !result.succeeded && result.error == Errc::cancelled);
+}
+
+struct Gate {
+    std::coroutine_handle<> waiter;
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> handle) noexcept { waiter = handle; }
+    void await_resume() const noexcept {}
+};
+Task<void> gated_child(Gate& gate) { co_await gate; }
+
+void test_scope_steady_allocation() {
+    test::section("persistent scope reclaims asynchronous runners during connection churn");
+    {
+        TaskScope scope;
+        Gate gate{};
+        allocation_probe::begin(0);
+        for (int i = 0; i < 20000; ++i) {
+            scope.spawn(gated_child(gate));
+            std::exchange(gate.waiter, {}).resume();
+        }
+        const auto calls = allocation_probe::end();
+        CHECK(calls >= 20000);
+        CHECK(scope.pending() == 0);
+        CHECK(allocation_probe::live() <= 1);
+        CHECK(allocation_probe::state.peak <= 3);
+        scope.join().sync_get();
+        CHECK(allocation_probe::live() == 0);
+    }
+    CHECK(allocation_probe::live() == 0);
+}
+
+void test_scope_join_without_allocation() {
+    test::section("scope join remains available after memory exhaustion");
+    TaskScope scope;
+    Gate gate{};
+    scope.spawn(gated_child(gate));
+    std::exchange(gate.waiter, {}).resume();
+    allocation_probe::begin(1);
+    bool threw = false;
+    try {
+        scope.join().sync_get();
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+    const auto calls = allocation_probe::end();
+    if (threw) scope.join().sync_get();
+    CHECK(!threw);
+    CHECK(calls == 0);
 }
 
 #if MIRA_HAS_READINESS_API
@@ -309,7 +478,13 @@ void test_waiter_allocations() {
 }  // namespace
 
 int main() {
+    test_loop_creation_allocation_rollback();
     test_timer_allocations();
+    test_timer_dispatch_without_allocation();
+    test_cancellation_without_allocation();
+    test_shutdown_without_allocation();
+    test_scope_steady_allocation();
+    test_scope_join_without_allocation();
 #if MIRA_HAS_READINESS_API
     test_waiter_allocations();
 #endif

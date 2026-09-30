@@ -216,7 +216,7 @@ No 408 is sent: announcing it would require a second budget the caller never gra
 
 Historical CI covers desktop base/TLS/WSS, MinGW H2, sanitizers, HTTP/WebSocket fuzzing, both Autobahn roles and Linux/macOS H2/H3. Windows MSVC has run QUIC/H3, multi-client and duplex TLS tests. Linux builds a pinned HTTP/3 curl for independent interoperability; elsewhere missing HTTP3 curl is explicitly skipped, not passed. New Windows independent-H3 / MinGW entry points have only 3/3 parameter unit tests; the entry points themselves have not been executed.
 
-Evidence is snapshot-specific: the 2026-09-29 phase source (H3 0-RTT, MQTT and the documentation sync) ran **97 tests: 95 passed, 2 external HTTP/3 curl interop tests skipped because the local curl lacks HTTP3, 0 failed** in each of AppleClang Release / GCC 16 / ASan+UBSan. The GCC 13 base configuration passed 49/49, the GCC 14 full protocol configuration 95 passed + 2 skipped, every MQTT target cross-compiled with MinGW, and installed-consumer and layering checks passed. MQTT interop ran 25 cases (8 against mosquitto 2.1.2), and the MQTT fuzzer ran 145k inputs in 91 s under ASan+UBSan without a crash. LeakSanitizer was not run on macOS. The latest fully green remote CI, for `81f8edf`, passed 17/17; consult the CI link above for this new revision rather than borrowing the older result.
+Evidence is snapshot-specific: the 2026-09-29 phase source (H3 0-RTT, MQTT and the documentation sync) ran **97 tests: 95 passed, 2 external HTTP/3 curl interop tests skipped because the local curl lacks HTTP3, 0 failed** in each of AppleClang Release / GCC 16 / ASan+UBSan. The GCC 13 base configuration passed 49/49, the GCC 14 full protocol configuration 95 passed + 2 skipped, every MQTT target cross-compiled with MinGW, and installed-consumer and layering checks passed. MQTT interop ran 25 cases (8 against mosquitto 2.1.2), and the MQTT fuzzer ran 145k inputs in 91 s under ASan+UBSan without a crash. LeakSanitizer was not run on macOS. The historical [CI for `21322d6`](https://github.com/dqsjqian/Mira/actions/runs/36537285723) passed 17/17; consult the CI link above for this new revision rather than borrowing the older result.
 
 ## ✨ Capability overview
 
@@ -239,9 +239,21 @@ Evidence is snapshot-specific: the 2026-09-29 phase source (H3 0-RTT, MQTT and t
 
 `stop()` only asks `run()` to return; per-operation cancellation is `OperationOptions`' job — every layer owns exactly one responsibility.
 
+The [2026-09-30 audit record](docs/AUDIT-2026-09-30.md) tracks repairs, individual
+findings and local validation. Historical test totals do not certify current
+source; Windows cross-compilation is recorded separately from native execution.
+
+Use security-patched OpenSSL packages in production. As of 2026-09-30, the 3.5
+LTS patch is **3.5.9** and the 3.6 patch is **3.6.5**; vendor packages with the
+corresponding backported fixes are also suitable. Meeting the API minimum alone
+does not establish patch status. In particular,
+[CVE-2026-35189](https://openssl-library.org/news/vulnerabilities/#CVE-2026-35189)
+can be reached through peer TLS certificates. Source-built CI now pins and
+hash-verifies 3.5.9.
+
 ## 🚀 Quick start
 
-Requires **CMake 3.20+ and a C++23 compiler**. Verified configurations use **GCC 14+ / Clang 19+ (Linux) / AppleClang / MSVC v143**; this does not claim every current working-tree combination passes:
+Requires **CMake 3.21+ and a C++23 compiler**. Verified configurations use **GCC 14+ / Clang 19+ (Linux) / AppleClang / MSVC v143**; this does not claim every current working-tree combination passes:
 
 - **GCC 14+**: GCC 13's coroutine optimizer has a known internal compiler error; fixed in GCC 14.
 - **Clang 19+ on Linux**: clang-18 keeps `__cpp_concepts` outdated, so libstdc++ hides `std::expected` behind its feature-test.
@@ -425,7 +437,7 @@ Recorded 600-second report `build/all-main/sustained-600.json`: 13,548/13,548 re
 ## Next: remaining verification boundaries
 
 1. iOS host smoke and unsigned cross-compilation passed, but device execution lacks a signing profile; Android has no device evidence. Windows MSVC H3, WSS duplex and TLS 1.3 KeyUpdate regressions have run. New Windows independent-H3 / MinGW entry points have only 3/3 parameter unit tests and still await execution.
-2. Cross-platform CI for this revision, longer fault injection, multi-host/WAN load and process-memory governance remain unverified; the final local full matrix passed 85/85 in all three configurations. Full official Autobahn coverage including compression has only the complete `d3424f0` report above. Reproduce on Linux with `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker --compression`; CI preserves the complete reports.
+2. Cross-platform CI for this revision, longer fault injection, multi-host/WAN load and process-memory governance remain unverified; the historical 2026-09-28 snapshot passed 85/85 in three local configurations, which does not certify the current source. Full official Autobahn coverage including compression has only the complete `d3424f0` report above. Reproduce on Linux with `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker --compression`; CI preserves the complete reports.
 3. Validated QUIC migration/NAT rebinding, explicit raw-QUIC 0-RTT, HTTP/3 0-RTT and H2/H3 Extended CONNECT are implemented on main. Comprehensive anti-replay guarantees and independent Extended CONNECT interoperability remain undelivered/unverified; HTTP/3 0-RTT has same-library engine and real-UDP evidence but no third-party 0-RTT interoperability yet. Retry tokens are not guaranteed single-use; the listener is not an Internet flood-protection system.
 4. **Delivered in the 2026-09-29 phase**: HTTP/3 0-RTT, HTTP/1 `Expect: 100-continue` with duplex early responses, and independent SOCKS5, DNS/DoH and MQTT modules. Still open: a 0-RTT anti-replay store, remembered server SETTINGS on the client, a packaged DoH query over H2/H3, MQTT over WebSocket and session persistence. Keep gRPC/Redis/WebRTC in the ecosystem layer, not bundled into the network core.
 

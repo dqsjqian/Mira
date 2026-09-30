@@ -54,8 +54,14 @@ Task<Result<void>> serve_h2(TlsStream& stream, Mira::OperationOptions io) {
         bool replied = false;
         for (const auto id : connection.session().streams()) {
             const auto* request = connection.session().stream(id);
-            if (!request || !request->headers_received || !request->remote_end || request->closed)
+            auto body = connection.session().take_body(id);
+            if (!body) co_return Mira::fail(body.error());
+            if (request->closed) {
+                auto released = connection.session().release(id);
+                if (!released) co_return released;
                 continue;
+            }
+            if (request->error || !request->headers_received || !request->remote_end) continue;
             Mira::http2::Headers headers{{":status", "200"}, {"content-type", "text/plain"}};
             auto result = connection.session().respond(id, headers, bytes("managed HTTPS: h2\n"));
             if (!result) co_return result;

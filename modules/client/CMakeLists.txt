@@ -2,7 +2,7 @@ add_library(mira_client INTERFACE)
 add_library(Mira::client ALIAS mira_client)
 target_include_directories(mira_client INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>)
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_compile_features(mira_client INTERFACE cxx_std_23)
 target_link_libraries(mira_client INTERFACE Mira::http Mira::socks Mira::transport)
 set_target_properties(mira_client PROPERTIES EXPORT_NAME client)

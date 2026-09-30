@@ -312,6 +312,75 @@ void test_shared_buffer_budget() {
     CHECK(budget.used() == 0);
 }
 
+void test_audit_server_policy() {
+    test::section("Host rejection and parser-limit status");
+    auto handler = [](const Request&, auto& writer, std::span<const std::byte>) -> Task<Result<void>> {
+        Response response;
+        co_return co_await writer.send(response);
+    };
+    for (const auto fields : {"", "Host: a\r\nHost: b\r\n", "Host: user@host\r\n",
+                              "Host: [:::1]\r\n", "Host: a:65536\r\n"}) {
+        ScriptedStream stream{std::string{"GET / HTTP/1.1\r\n"} + fields + "\r\n"};
+        CHECK(!serve_connection(stream, handler).sync_get());
+        CHECK(stream.sent().starts_with("HTTP/1.1 400 "));
+    }
+    ScriptedStream oversized{"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 100\r\n\r\n"};
+    ServerOptions bounded;
+    bounded.limits.max_body_size = 5;
+    CHECK(!serve_connection(oversized, handler, bounded).sync_get());
+    CHECK(oversized.sent().starts_with("HTTP/1.1 413 "));
+
+    test::section("final refusal completes without draining withheld body");
+    ScriptedStream refused{"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nx"};
+    auto reject = [](const Request&, auto& writer, auto&) -> Task<Result<void>> {
+        Response response;
+        response.status = 413;
+        co_return co_await writer.send_head_chunked(response);
+    };
+    CHECK(serve_connection(refused, reject).sync_get().has_value());
+    CHECK(refused.sent().find("Connection: close\r\n") != std::string::npos);
+    CHECK(refused.sent().ends_with("0\r\n\r\n"));
+
+    test::section("response policy controls reuse and HTTP/1.0 framing");
+    ScriptedStream close{"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n"};
+    unsigned calls = 0;
+    auto close_handler = [&calls](const Request&, auto& writer, std::span<const std::byte>) -> Task<Result<void>> {
+        ++calls;
+        Response response;
+        response.headers.append("Connection", "close");
+        co_return co_await writer.send(response);
+    };
+    CHECK(serve_connection(close, close_handler).sync_get().has_value());
+    CHECK(calls == 1);
+    ScriptedStream old{"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"};
+    auto streaming = [](const Request&, auto& writer, std::span<const std::byte>,
+                        OperationOptions io) -> Task<Result<void>> {
+        CHECK(io.deadline.has_value());
+        CHECK(writer.operation_options().deadline == io.deadline);
+        Response response;
+        auto head = co_await writer.send_head_chunked(response);
+        if (!head) co_return head;
+        co_return co_await writer.write(bytes_of("plain"));
+    };
+    ServerOptions timed;
+    timed.request_timeout = std::chrono::seconds{1};
+    CHECK(serve_connection(old, streaming, timed).sync_get().has_value());
+    CHECK(old.sent().starts_with("HTTP/1.0 200 "));
+    CHECK(old.sent().find("Transfer-Encoding:") == std::string::npos);
+    CHECK(old.sent().find("Connection: close\r\n") != std::string::npos);
+    CHECK(old.sent().ends_with("\r\n\r\nplain"));
+    ScriptedStream bodyless{"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"};
+    auto no_content = [](const Request&, auto& writer, std::span<const std::byte>) -> Task<Result<void>> {
+        Response response;
+        response.status = 204;
+        co_return co_await writer.send_head_chunked(response);
+    };
+    CHECK(serve_connection(bodyless, no_content).sync_get().has_value());
+    CHECK(bodyless.sent().starts_with("HTTP/1.0 204 "));
+    CHECK(bodyless.sent().find("Connection: keep-alive\r\n") != std::string::npos);
+    CHECK(bodyless.sent().find("Transfer-Encoding:") == std::string::npos);
+}
+
 void test_single_exchange() {
     test::section("single exchange");
 
@@ -332,7 +401,7 @@ void test_single_exchange() {
     CHECK(served.has_value());
     CHECK(seen_target == "/hello");
     CHECK(stream.sent() == "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
-                           "Content-Length: 2\r\n\r\nhi");
+                           "Connection: close\r\nContent-Length: 2\r\n\r\nhi");
 }
 
 void test_keep_alive_pipeline() {
@@ -505,7 +574,7 @@ void test_head_request_withholds_body() {
     CHECK(served.has_value());
     // Content-Length still describes what a GET would return — that is the
     // point of HEAD — but no body bytes follow.
-    CHECK(stream.sent() == "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n");
+    CHECK(stream.sent() == "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 13\r\n\r\n");
     CHECK(stream.sent().find("body-not-sent") == std::string::npos);
 }
 
@@ -533,7 +602,7 @@ void test_streaming_response() {
 
     const Result<void> served = serve_connection(stream, handler).sync_get();
     CHECK(served.has_value());
-    CHECK(stream.sent() == "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+    CHECK(stream.sent() == "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n"
                            "5\r\nalpha\r\n4\r\nbeta\r\n0\r\n\r\n");
 }
 
@@ -884,6 +953,7 @@ int main() {
 
     test_shared_buffer_budget();
     test_single_exchange();
+    test_audit_server_policy();
     test_keep_alive_pipeline();
     test_handler_exception_is_contained();
     test_body_is_drained_even_if_ignored();

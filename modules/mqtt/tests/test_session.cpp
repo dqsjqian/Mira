@@ -396,7 +396,9 @@ void failures() {
     CHECK(authing.auth(reason::continue_authentication, answer).has_value());
     sent = broker.take(authing);
     CHECK(sent.size() == 1 && std::get<Auth>(sent[0]).properties.authentication_data == text("client-final"));
-    CHECK(broker.send(authing, Connack{}).has_value() && authing.state() == SessionState::connected);
+    Connack authenticated_ack;
+    authenticated_ack.properties.authentication_method = "SCRAM-SHA-256";
+    CHECK(broker.send(authing, authenticated_ack).has_value() && authing.state() == SessionState::connected);
 
     ClientOptions invalid;
     invalid.properties.receive_maximum = std::uint16_t{5};
@@ -406,6 +408,144 @@ void failures() {
     v3_alias.client_id = "c";
     v3_alias.topic_alias_maximum = std::uint16_t{1};
     CHECK(!Session::create(v3_alias));
+}
+
+void resume_reduced_limits() {
+    Broker broker;
+    ClientOptions options;
+    options.client_id = "replay";
+    options.clean_start = false;
+    auto session = connected(broker, options);
+    std::vector<std::uint16_t> ids;
+    for (int i = 0; i < 3; ++i) ids.push_back(*session.publish(publish("q", QoS::at_least_once)));
+    broker.take(session);
+    CHECK(session.connect(1).has_value());
+    broker.take(session);
+    Connack ack{true, reason::success, {}};
+    ack.properties.receive_maximum = 1;
+    CHECK(broker.send(session, ack).has_value());
+    static_cast<void>(session.take_events());
+    for (const auto id : ids) {
+        auto batch = broker.take(session);
+        CHECK(batch.size() == 1 && std::holds_alternative<Publish>(batch.front()));
+        if (batch.size() == 1 && std::holds_alternative<Publish>(batch.front())) {
+            CHECK(std::get<Publish>(batch.front()).packet_id == id);
+            CHECK(std::get<Publish>(batch.front()).dup);
+        }
+        CHECK(broker.take(session).empty());
+        CHECK(broker.send(session, Ack{PacketType::puback, id, reason::success, {}}).has_value());
+        static_cast<void>(session.take_events());
+    }
+    CHECK(session.inflight() == 0);
+    CHECK(session.publish(publish("large", QoS::at_least_once, 0, std::string(50, 'x'))).has_value());
+    broker.take(session);
+    CHECK(session.connect(2).has_value());
+    broker.take(session);
+    ack.properties.maximum_packet_size = 20;
+    auto resumed = broker.send(session, ack);
+    CHECK(!resumed && resumed.error() == MqttError::packet_too_large);
+    CHECK(session.inflight() == 1 && session.state() == SessionState::closed);
+    for (const auto& packet : broker.take(session)) CHECK(!std::holds_alternative<Publish>(packet));
+}
+
+void bounded_lifecycle_and_auth() {
+    test::section("event budgets include lifecycle notices and authentication stays bound to CONNECT");
+    Broker broker;
+    ClientOptions options;
+    options.client_id = "bounded-lifecycle";
+    options.max_events = 1;
+    auto session = connected(broker, options);
+    CHECK(broker.send(session, publish("t", QoS::at_most_once)).has_value());
+    auto closed = broker.send(session, Disconnect{});
+    CHECK(!closed && closed.error() == Errc::limit_exceeded);
+    CHECK(session.state() == SessionState::closed && session.take_events().size() == 1);
+
+    auto reconnect = connected(broker, options);
+    CHECK(reconnect.publish(publish("t", QoS::at_least_once)).has_value());
+    broker.take(reconnect);
+    CHECK(broker.send(reconnect, publish("t", QoS::at_most_once)).has_value());
+    auto blocked = reconnect.connect(1);
+    CHECK(!blocked && blocked.error() == Errc::would_block);
+    CHECK(reconnect.inflight() == 1 && reconnect.state() == SessionState::connected);
+    CHECK(reconnect.take_events().size() == 1);
+    CHECK(reconnect.connect(1).has_value());
+    auto notices = reconnect.take_events();
+    CHECK(notices.size() == 1 && notices.front().discarded);
+
+    options.clean_start = false;
+    auto lost = connected(broker, options);
+    CHECK(lost.publish(publish("a", QoS::at_least_once)).has_value());
+    CHECK(lost.publish(publish("b", QoS::at_least_once)).has_value());
+    broker.take(lost);
+    CHECK(lost.connect(1).has_value());
+    broker.take(lost);
+    auto lost_ack = broker.send(lost, Connack{});
+    CHECK(!lost_ack && lost_ack.error() == Errc::limit_exceeded);
+    CHECK(lost.state() == SessionState::closed && lost.take_events().empty());
+
+    options.properties.authentication_method = "expected";
+    auto authing = make(options);
+    CHECK(authing.connect(0).has_value());
+    broker.take(authing);
+    Properties wrong;
+    wrong.authentication_method = "different";
+    CHECK(!authing.auth(reason::continue_authentication, wrong));
+    CHECK(broker.take(authing).empty());
+    auto auth = broker.send(authing, Auth{reason::continue_authentication, wrong});
+    CHECK(!auth && auth.error() == MqttError::protocol_error);
+    CHECK(authing.state() == SessionState::closed);
+    auto missing_method = make(options);
+    CHECK(missing_method.connect(0).has_value());
+    broker.take(missing_method);
+    auto missing = broker.send(missing_method, Connack{});
+    CHECK(!missing && missing.error() == MqttError::protocol_error);
+
+    Connack small;
+    small.properties.maximum_packet_size = 2;
+    auto tiny = connected(broker, {}, small);
+    // Even internal acknowledgements must respect the negotiated packet size.
+    auto too_big = broker.send(tiny, publish("q", QoS::at_least_once, 7));
+    CHECK(!too_big && too_big.error() == MqttError::packet_too_large);
+    CHECK(tiny.state() == SessionState::closed);
+    CHECK(broker.take(tiny).empty());
+
+    Connack authenticated;
+    authenticated.properties.authentication_method = "expected";
+    auto established = connected(broker, options, authenticated);
+    CHECK(!established.auth(reason::success, options.properties));
+    CHECK(broker.take(established).empty());
+}
+
+void replay_controls_bypass_publish_quota() {
+    test::section("resumed PUBREL bypasses a full PUBLISH quota without reordering PUBLISH");
+    Broker broker;
+    ClientOptions options;
+    options.client_id = "replay-controls";
+    options.clean_start = false;
+    auto session = connected(broker, options);
+    const auto first = *session.publish(publish("first", QoS::at_least_once));
+    const auto second_id = *session.publish(publish("second", QoS::at_least_once));
+    const auto released = *session.publish(publish("third", QoS::exactly_once));
+    broker.take(session);
+    CHECK(broker.send(session, Ack{PacketType::pubrec, released, reason::success, {}}).has_value());
+    broker.take(session);
+    CHECK(session.connect(1).has_value());
+    broker.take(session);
+    Connack resumed{true, reason::success, {}};
+    resumed.properties.receive_maximum = 1;
+    CHECK(broker.send(session, resumed).has_value());
+    auto wire = broker.take(session);
+    CHECK(wire.size() == 2);
+    if (wire.size() == 2) {
+        CHECK(std::holds_alternative<Publish>(wire[0]) && std::get<Publish>(wire[0]).packet_id == first);
+        CHECK(std::holds_alternative<Ack>(wire[1]) && std::get<Ack>(wire[1]).packet_id == released);
+    }
+    CHECK(broker.send(session, Ack{PacketType::pubcomp, released, reason::success, {}}).has_value());
+    CHECK(broker.take(session).empty());
+    CHECK(broker.send(session, Ack{PacketType::puback, first, reason::success, {}}).has_value());
+    wire = broker.take(session);
+    CHECK(wire.size() == 1 && std::holds_alternative<Publish>(wire[0]) &&
+          std::get<Publish>(wire[0]).packet_id == second_id);
 }
 
 void identifiers() {
@@ -439,7 +579,10 @@ int main() {
     subscriptions();
     keep_alive();
     resume();
+    resume_reduced_limits();
     failures();
+    bounded_lifecycle_and_auth();
+    replay_controls_bypass_publish_quota();
     identifiers();
     return test::summary();
 }

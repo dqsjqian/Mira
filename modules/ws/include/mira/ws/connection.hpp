@@ -129,7 +129,10 @@ public:
         bool started = false;
         for (;;) {
             auto frame = co_await read_locked(options);
-            if (!frame) co_return fail(frame.error());
+            if (!frame) {
+                if (started) static_cast<void>(terminate(frame.error()));
+                co_return fail(frame.error());
+            }
             if (frame->opcode == Opcode::close) co_return std::move(*frame);
             if (frame->opcode == Opcode::ping || frame->opcode == Opcode::pong) continue;
             if (!started) { message.opcode = frame->opcode; started = true; }
@@ -168,10 +171,7 @@ private:
         explicit Guard(Connection& value) : owner(value) { owner.busy_ = true; }
         ~Guard() {
             owner.busy_ = false;
-            if (std::uncaught_exceptions() > exceptions) {
-                owner.failed_ = true;
-                owner.incoming_.reset(); owner.outgoing_.reset();
-            }
+            if (std::uncaught_exceptions() > exceptions) owner.fail_exception();
         }
     };
     struct DirectionGuard {
@@ -181,11 +181,11 @@ private:
         DirectionGuard(Connection& value, bool& direction) : owner(value), flag(direction) { flag = true; }
         ~DirectionGuard() {
             flag = false;
-            if (std::uncaught_exceptions() > exceptions) owner.failed_ = true;
+            if (std::uncaught_exceptions() > exceptions) owner.fail_exception();
         }
     };
     Task<Result<void>> flush_control(OperationOptions options) {
-        if (pending_pong_) {
+        while (pending_pong_) {
             auto frame = std::move(*pending_pong_);
             pending_pong_.reset();
             auto sent = co_await send_locked(frame, options, true);
@@ -205,7 +205,9 @@ private:
             co_return Result<void>{};
         }
         DirectionGuard guard{*this, writing_};
-        co_return co_await send_locked(frame, options, true);
+        auto sent = co_await send_locked(frame, options, true);
+        if (!sent) co_return sent;
+        co_return co_await flush_control(options);
     }
     Result<void> configure_extensions(const Negotiated& negotiated) {
         if (!negotiated.compression.enabled) return {};
@@ -242,10 +244,19 @@ private:
         if constexpr (ClosableStream<Transport>) transport_->close();
         return fail(error);
     }
+    void fail_exception() noexcept {
+        if (failed_) return;
+        // Match the failure-return path: closing a capable transport releases
+        // the companion operation. Preserve the original exception even if a
+        // user-provided close() implementation itself throws during unwinding.
+        try { static_cast<void>(terminate(make_error_code(Mira::Errc::internal))); }
+        catch (...) {}
+    }
     Task<Result<std::size_t>> read_bytes(std::span<std::byte> bytes, OperationOptions options) {
         Result<std::size_t> result;
         if constexpr (BoundedStream<Transport>) result = co_await transport_->read_some(bytes, options);
         else result = co_await transport_->read_some(bytes);
+        if (failed_) co_return fail(make_error_code(Errc::closed));
         if (!result || *result == 0 || *result > bytes.size()) {
             auto error = !result ? result.error() : make_error_code(Errc::abnormal_close);
             if (error == make_error_code(Mira::Errc::eof)) error = make_error_code(Errc::abnormal_close);
@@ -256,6 +267,7 @@ private:
     }
     Task<Result<void>> write_bytes(std::span<const std::byte> bytes, OperationOptions options) {
         while (!bytes.empty()) {
+            if (failed_) co_return fail(make_error_code(Errc::closed));
             Result<std::size_t> n;
             if constexpr (BoundedStream<Transport>) n = co_await transport_->write_some(bytes, options);
             else n = co_await transport_->write_some(bytes);
@@ -342,6 +354,10 @@ private:
                 if (!sent) co_return fail(sent.error());
             } else if (frame.opcode == Opcode::close) {
                 close_received_ = true;
+                // A queued Pong is no longer needed once the peer closes. In
+                // particular, do not let it turn a completed simultaneous Close
+                // exchange into an attempted write on an already closed session.
+                pending_pong_.reset();
                 if (!close_sent_) {
                     auto reply = frame;
                     if (role_ == Role::server && reply.payload.size() >= 2 &&

@@ -62,7 +62,7 @@ static_assert(BoundedStream<http3::ConnectStream<Driver>>);
 struct Pair {
     http3::Engine client;
     http3::Engine server;
-    static Pair create(const char* cert, const char* key, bool enabled) {
+    static Pair create(const char* cert, const char* key, bool enabled, std::size_t event_limit = 4096) {
         quic::Options co, so;
         co.local = transport::Endpoint::loopback(44330); co.remote = transport::Endpoint::loopback(44331);
         co.ca_file = cert; co.peer_name = "localhost";
@@ -71,6 +71,7 @@ struct Pair {
         auto initial = require(cq.poll(1'000'000'000));
         auto sq = require(quic::Engine::accept(so, initial, 1'000'000'000));
         http3::Limits limits; limits.enable_connect_protocol = enabled; limits.max_buffered_body = 32768;
+        limits.max_events = event_limit;
         return {require(http3::Engine::create(std::move(cq), false, limits)),
                 require(http3::Engine::create(std::move(sq), true, limits))};
     }
@@ -222,6 +223,53 @@ void lifecycle(const char* cert, const char* key) {
     }
     check(found && c.ready() && s.ready(), "reset disrupted another stream");
 }
+void rejected_streaming_length(const char* cert, const char* key) {
+    auto pair = Pair::create(cert, key, true);
+    auto& c = pair.client; auto& s = pair.server;
+    Driver d{c, s}; ready(d);
+    const auto id = require(c.request_stream(request_headers())); d.settle();
+    require(s.respond_stream(id, {{":status", "403"}, {"content-length", "3"}}));
+    require(s.write_body(id, bytes("ab"))); d.settle();
+    check(!s.write_body(id, bytes("cd")), "rejected CONNECT exceeded content-length");
+    require(s.write_body(id, bytes("c"), true)); d.settle();
+    quic::Bytes body;
+    bool ended = false;
+    for (auto& event : c.take_events()) {
+        check(event.kind != http3::Event::Kind::reset, "valid rejected body was reset");
+        if (event.kind == http3::Event::Kind::body) {
+            body.insert(body.end(), event.data.begin(), event.data.end());
+            require(c.consume(id, event.data.size()));
+        }
+        if (event.kind == http3::Event::Kind::end) ended = true;
+    }
+    check(ended && body == bytes("abc"), "rejected CONNECT lost incremental body");
+}
+
+void shared_tunnel_budget(const char* cert, const char* key) {
+    auto pair = Pair::create(cert, key, true, 4);
+    auto& c = pair.client; auto& s = pair.server;
+    Driver d{c, s}; ready(d);
+    const auto a = require(c.request_stream(request_headers()));
+    const auto b = require(c.request_stream(request_headers())); d.settle();
+    static_cast<void>(s.take_events());
+    require(s.respond_stream(a, {{":status", "200"}}));
+    require(s.respond_stream(b, {{":status", "200"}})); d.settle();
+    static_cast<void>(c.take_events());
+    for (const auto id : {a, b, a, b}) {
+        require(c.write_connect(id, bytes("x"))); d.settle();
+    }
+    std::array<std::byte, 1> buffer{};
+    check(require(s.read_connect(a, buffer)) == 1, "tunnel input missing");
+    require(c.write_connect(b, bytes("y"))); d.settle();
+    require(c.write_connect(a, bytes("z")));
+    bool rejected = false;
+    for (int round = 0; round < 100 && !rejected; ++round) {
+        const auto packet = require(c.poll(d.now));
+        if (!packet.empty()) rejected = !s.receive(packet, d.now);
+        d.now += 1'000'000;
+    }
+    check(rejected && s.closed(), "separate tunnels bypassed connection-wide chunk budget");
+}
 quic::Bytes raw_headers(http3::Headers fields, std::int64_t id) {
     nghttp3_qpack_encoder* encoder = nullptr;
     check(nghttp3_qpack_encoder_new(&encoder, 0, nghttp3_mem_default()) == 0, "QPACK encoder");
@@ -297,11 +345,33 @@ void wire_validation(const char* cert, const char* key) {
         check(received, "malformed CONNECT damaged another stream");
     }
 }
+void rejected_wire_length(const char* cert, const char* key) {
+    for (const std::string payload : {"ab", "abcd"}) {
+        auto pair = Pair::create(cert, key, true);
+        auto& c = pair.client; auto& s = pair.server;
+        Driver d{c, s}; ready(d);
+        const auto id = require(c.request_stream(request_headers())); d.settle();
+        auto wire = raw_headers({{":status", "403"}, {"content-length", "3"}}, id);
+        wire.push_back(std::byte{0});
+        wire.push_back(static_cast<std::byte>(payload.size()));
+        const auto data = bytes(payload); wire.insert(wire.end(), data.begin(), data.end());
+        require(s.transport().write(id, wire, true)); d.settle();
+        bool reset = false;
+        for (auto& event : c.take_events()) {
+            reset |= event.kind == http3::Event::Kind::reset && event.stream_id == id;
+            if (event.kind == http3::Event::Kind::body) require(c.consume(id, event.data.size()));
+        }
+        check(reset && c.ready(), "malformed rejected CONNECT body did not reset the stream");
+    }
+}
 int main(int argc, char** argv) {
     if (argc != 3) return 2;
     try {
         websocket_roundtrip(argv[1], argv[2], false); websocket_roundtrip(argv[1], argv[2], true);
         lifecycle(argv[1], argv[2]); wire_validation(argv[1], argv[2]);
+        rejected_streaming_length(argv[1], argv[2]);
+        rejected_wire_length(argv[1], argv[2]);
+        shared_tunnel_budget(argv[1], argv[2]);
         std::cout << "HTTP/3 Extended CONNECT passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n'; return 1;

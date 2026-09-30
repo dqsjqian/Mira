@@ -18,7 +18,8 @@
 // HTTP only, and a MIME table short enough to read. The examples directory
 // is teaching material; this file teaches the streaming contracts.
 //
-// Usage: mira_tiny_file_server [port] [root-directory]
+// Usage: mira_tiny_file_server [port] [root-directory] [--allow-upload]
+// Uploads are disabled unless explicitly enabled; do not expose this demo publicly.
 //   port             0 (the default) binds an ephemeral loopback port
 //   root-directory   "." (the default); everything resolves under it
 // Interruption uses the default signal behavior, not graceful shutdown.
@@ -219,7 +220,16 @@ Task<Result<void>> list_directory(auto& writer, const fs::path& path) {
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator(path, ec)) {
         page += "<li>";
-        page += entry.path().filename().string();
+        for (const char c : entry.path().filename().string()) {
+            switch (c) {
+            case '&': page += "&amp;"; break;
+            case '<': page += "&lt;"; break;
+            case '>': page += "&gt;"; break;
+            case '"': page += "&quot;"; break;
+            case '\'': page += "&#39;"; break;
+            default: page.push_back(c); break;
+            }
+        }
         page += "</li>";
     }
     page += "</ul></body></html>";
@@ -228,7 +238,7 @@ Task<Result<void>> list_directory(auto& writer, const fs::path& path) {
 
 /// Route by method; stream in both directions where it matters.
 Task<Result<void>> handle(const Request& request, auto& writer, auto& body_reader,
-                          const fs::path& root) {
+                          const fs::path& root, bool allow_upload) {
     const auto resolved = resolve_under_root(root, request.target);
     if (!resolved) {
         Response r;
@@ -237,6 +247,12 @@ Task<Result<void>> handle(const Request& request, auto& writer, auto& body_reade
     }
 
     if (request.method == Method::put || request.method == Method::post) {
+        if (!allow_upload) {
+            Response r;
+            r.status = 405;
+            r.headers.append("Connection", "close");
+            co_return co_await writer.send(r, bytes_of("uploads are disabled"));
+        }
         const Result<void> stored = co_await receive_upload(body_reader, *resolved);
         if (!stored) {
             const bool too_big =
@@ -271,19 +287,21 @@ Task<Result<void>> handle(const Request& request, auto& writer, auto& body_reade
 /// `serve_connection` yields `Task<Result<void>>`; `TaskScope::spawn` takes
 /// `Task<void>`. Wrap, log, discard: a file server should outlive one sick
 /// connection.
-Task<void> serve_one(tcp::Socket socket, const fs::path& root) {
+Task<void> serve_one(tcp::Socket socket, const fs::path& root, bool allow_upload) {
+    Mira::http::ServerOptions options;
+    options.limits.max_body_size = k_max_upload;
     const Result<void> served = co_await serve_connection(
         socket,
-        [&root](const Request& request, auto& writer, auto& body_reader) -> Task<Result<void>> {
-            co_return co_await handle(request, writer, body_reader, root);
-        });
+        [&root, allow_upload](const Request& request, auto& writer, auto& body_reader) -> Task<Result<void>> {
+            co_return co_await handle(request, writer, body_reader, root, allow_upload);
+        }, options);
     if (!served && served.error() != Mira::Errc::eof) {
         std::fprintf(stderr, "connection ended: %s\n", served.error().message().c_str());
     }
     co_return;
 }
 
-Task<void> serve(tcp::Listener& listener, const fs::path& root) {
+Task<void> serve(tcp::Listener& listener, const fs::path& root, bool allow_upload) {
     TaskScope scope;
     for (;;) {
         Result<tcp::Socket> accepted = co_await listener.accept();
@@ -291,7 +309,7 @@ Task<void> serve(tcp::Listener& listener, const fs::path& root) {
             scope.request_stop();
             break;
         }
-        scope.spawn(serve_one(std::move(*accepted), root));
+        scope.spawn(serve_one(std::move(*accepted), root, allow_upload));
     }
     co_await scope.join();
 }
@@ -301,8 +319,9 @@ Task<void> serve(tcp::Listener& listener, const fs::path& root) {
 int main(int argc, char** argv) {
     std::uint16_t port = 0;
     fs::path root{"."};
-    if (argc > 3 || (argc > 1 && !parse_number(argv[1], port))) {
-        std::fprintf(stderr, "usage: %s [port] [root-directory]\n", argv[0]);
+    const bool allow_upload = argc == 4 && std::string_view(argv[3]) == "--allow-upload";
+    if (argc > 4 || (argc == 4 && !allow_upload) || (argc > 1 && !parse_number(argv[1], port))) {
+        std::fprintf(stderr, "usage: %s [port] [root-directory] [--allow-upload]\n", argv[0]);
         return 2;
     }
     if (argc > 2) {
@@ -342,7 +361,7 @@ int main(int argc, char** argv) {
                 resolved_root.string().c_str());
     std::fflush(stdout);
 
-    const Result<void> ran = loop.run_until_complete(serve(*listener, resolved_root));
+    const Result<void> ran = loop.run_until_complete(serve(*listener, resolved_root, allow_upload));
     if (!ran) {
         std::fprintf(stderr, "run: %s\n", ran.error().message().c_str());
         return 1;

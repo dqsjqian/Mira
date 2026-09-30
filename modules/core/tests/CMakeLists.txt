@@ -44,7 +44,7 @@ mira_add_terminate_tests(task_contract mira_core_tests
     sync-get-suspended abandoned-awaiter)
 
 mira_add_terminate_tests(event_loop mira_event_loop_tests
-    destroy-during-dispatch reentrant-run-once root-task-deadlock)
+    destroy-during-dispatch destroy-during-shutdown reentrant-run-once root-task-deadlock)
 
 # POSIX-only: detach synchronously resumes readiness waiters; IOCP
 # cancellation drains through completions instead.

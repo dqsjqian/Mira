@@ -80,6 +80,7 @@ Result<Engine> Engine::create(const Context& context, std::string_view peer_name
         SSL_set_connect_state(impl->ssl);
         ERR_clear_error();
         ASN1_OCTET_STRING* ip = a2i_IPADDRESS(name.c_str());
+        const bool is_ip = ip != nullptr;
 #if OPENSSL_VERSION_NUMBER >= 0x40000000L
         // OpenSSL 4.0 deprecated SSL_set1_host in favour of the split
         // dnsname/ipaddr entry points; SSL_set_hostflags is available on
@@ -105,8 +106,9 @@ Result<Engine> Engine::create(const Context& context, std::string_view peer_name
                 return fail(make_error_code(Errc::configuration_error));
         }
 #endif
-        {
+        if (!is_ip) {
             ERR_clear_error();
+            // IP literals are verified through SAN but are not legal SNI names.
             // The convenience macro expands to a C-style cast on OpenSSL 3.0.
             // Use its underlying control call with an explicit C++ cast so
             // GCC's -Wold-style-cast remains enabled for our own code.

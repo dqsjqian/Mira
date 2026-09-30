@@ -216,7 +216,7 @@ auto client = Mira::tls::Context::client({
 
 历史 CI 覆盖三桌面基础/TLS/WSS、MinGW H2、sanitizers、HTTP/WebSocket fuzz、Autobahn 双端及 Linux/macOS H2/H3；Windows MSVC 已实跑 QUIC/H3、多客户端与双工 TLS。Linux 使用固定源码构建的 HTTP/3 curl 做独立互操作；其它平台缺少 HTTP3 curl 时明确跳过，不计为通过。新增 Windows 独立 H3 / MinGW 验证入口仅有参数单测 3/3，通过不代表入口已实跑。
 
-验证按快照计量：2026-09-29 阶段源码（H3 0-RTT、MQTT 及文档同步）在本机 AppleClang Release / GCC 16 / ASan+UBSan 各 **97 项：95 通过、2 项外部 HTTP/3 curl 互操作因本机 curl 无 HTTP3 跳过、0 失败**；GCC 13 基础配置 49/49，GCC 14 协议全配置 95 通过 + 2 跳过，MinGW 交叉编译 MQTT 全部目标通过，安装消费与分层检查通过；MQTT 互操作 25 例（其中 mosquitto 2.1.2 8 例），MQTT 模糊测试 ASan+UBSan 91 秒 14.5 万次无崩溃。macOS 未运行 LeakSanitizer。远端最近全绿的 `81f8edf` CI 为 17/17；本轮新提交的跨平台结果须单独查看顶部 CI，不能借用旧结果。
+验证按快照计量：2026-09-29 阶段源码（H3 0-RTT、MQTT 及文档同步）在本机 AppleClang Release / GCC 16 / ASan+UBSan 各 **97 项：95 通过、2 项外部 HTTP/3 curl 互操作因本机 curl 无 HTTP3 跳过、0 失败**；GCC 13 基础配置 49/49，GCC 14 协议全配置 95 通过 + 2 跳过，MinGW 交叉编译 MQTT 全部目标通过，安装消费与分层检查通过；MQTT 互操作 25 例（其中 mosquitto 2.1.2 8 例），MQTT 模糊测试 ASan+UBSan 91 秒 14.5 万次无崩溃。macOS 未运行 LeakSanitizer。历史提交 [`21322d6` 的 CI](https://github.com/dqsjqian/Mira/actions/runs/36537285723) 为 17/17；本轮新提交的跨平台结果须单独查看顶部 CI，不能借用旧结果。
 
 ## ✨ 能力全景
 
@@ -239,9 +239,13 @@ auto client = Mira::tls::Context::client({
 
 `stop()` 只请求 `run()` 返回；逐操作取消是 `OperationOptions` 的职责 —— 每一层职责清晰、互不越界。
 
+2026-09-30 的审核修复、逐项问题处置与本机验证结果见[审核记录](docs/AUDIT-2026-09-30.md)。历史版本测试数不替代当前源码的验证；Windows 交叉编译与原生运行分别记录。
+
+生产依赖应使用包含安全修复的 OpenSSL：截至 2026-09-30，3.5 LTS 为 **3.5.9**、3.6 分支为 **3.6.5**，也可使用已回移相应修复的供应商包。仅满足 API 最低版本不代表包含这些补丁；其中 [CVE-2026-35189](https://openssl-library.org/news/vulnerabilities/#CVE-2026-35189) 可由对端 TLS 证书触发。CI 源码构建已固定到带哈希校验的 3.5.9。
+
 ## 🚀 快速开始
 
-需要 **CMake 3.20+、C++23 编译器**。已验证配置使用 **GCC 14+ / Clang 19+（Linux）/ AppleClang / MSVC v143**；这不是当前工作区所有组合均通过的声明：
+需要 **CMake 3.21+、C++23 编译器**。已验证配置使用 **GCC 14+ / Clang 19+（Linux）/ AppleClang / MSVC v143**；这不是当前工作区所有组合均通过的声明：
 
 - **GCC 14+**：GCC 13 的协程优化器存在已知内部错误（GCC 14 修复）。
 - **Linux 上 Clang 19+**：clang-18 的 `__cpp_concepts` 宏版本过旧，libstdc++ 据此隐藏 `std::expected`。
@@ -425,7 +429,7 @@ python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak 
 ## 接下来：仍需验证的边界
 
 1. iOS 已通过宿主 smoke 和无签名交叉编译，真机缺签名 profile；Android 真机尚无证据。Windows MSVC H3、WSS 全双工及 TLS 1.3 KeyUpdate 已有运行回归；新增 Windows 独立 H3 / MinGW 入口只有参数单测 3/3，仍待实跑。
-2. 本轮新提交的跨平台 CI、更长时故障注入、真实多机/WAN 与进程内存治理仍待验；本机最终三套完整矩阵已各 85/85。官方 Autobahn 全量含压缩仅有上述 `d3424f0` 的完整报告；可用 `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker --compression` 在 Linux 复现，完整报告由 CI 保存。
+2. 本轮新提交的跨平台 CI、更长时故障注入、真实多机/WAN 与进程内存治理仍待验；2026-09-28 历史快照的三套本机矩阵曾各通过 85/85，此数字不代表当前源码。官方 Autobahn 全量含压缩仅有上述 `d3424f0` 的完整报告；可用 `python3 tools/ci/run_autobahn.py --server build/ws/mira_ws_autobahn_server --client build/ws/mira_ws_autobahn_client --runtime docker --compression` 在 Linux 复现，完整报告由 CI 保存。
 3. QUIC validated migration/NAT rebinding、显式原始 QUIC 0-RTT、HTTP/3 0-RTT 与 H2/H3 Extended CONNECT 已在主线实现，但完整防重放保证与第三方 Extended CONNECT 互操作未交付/未验证；HTTP/3 0-RTT 目前只有同库引擎与真实 UDP 证据，尚无第三方 0-RTT 互操作。Retry 不保证 token 一次性使用，listener 不是互联网抗洪泛防护系统。
 4. **2026-09-29 阶段已交付**：HTTP/3 0-RTT、HTTP/1 `Expect: 100-continue` / 提前响应双工，以及独立 SOCKS5、DNS/DoH、MQTT 模块。仍开放：0-RTT 防重放存储、客户端记忆服务端 SETTINGS、打包好的 DoH over H2/H3 查询、MQTT over WebSocket 与会话持久化。gRPC/Redis/WebRTC 保持生态层边界，不将专业子系统全部塞进网络内核。
 

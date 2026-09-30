@@ -113,6 +113,7 @@ public:
     [[nodiscard]] static bool names_equal(std::string_view a, std::string_view b) noexcept;
 
 private:
+    friend class RequestParser;
     std::vector<Entry> entries_{};
     /// Drained entries kept for capacity reuse across `clear()` cycles.
     /// Only the most recent drain is kept: one message's worth of headers,
@@ -146,9 +147,12 @@ struct Request {
     BodyKind body_kind{BodyKind::none};
     /// Declared length when `body_kind == length`.
     std::uint64_t content_length{0};
+    /// Exact parsed method token, including extension methods and their case.
+    std::string method_token{};
 
     void clear() {
         method = Method::get;
+        method_token.clear();
         target.clear();
         version = Version::http_1_1;
         headers.clear();
@@ -176,6 +180,10 @@ struct Response {
         content_length = 0;
     }
 };
+
+/// Validate the Host field using the same authority rules as request serialization.
+/// HTTP/1.1 requires exactly one Host; HTTP/1.0 permits omission.
+[[nodiscard]] bool valid_request_host(const Request& request) noexcept;
 
 /// Default reason phrase for a status code, or an empty view if unknown.
 [[nodiscard]] std::string_view default_reason(unsigned status) noexcept;

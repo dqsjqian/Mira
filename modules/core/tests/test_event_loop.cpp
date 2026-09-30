@@ -229,6 +229,32 @@ void test_post_and_stop() {
     CHECK(loop.stopped());
 }
 
+void test_extreme_sleep_duration() {
+    test::section("extreme sleep durations saturate instead of wrapping into the past");
+    auto created = EventLoop::create();
+    CHECK(created.has_value());
+    if (!created) return;
+    auto& loop = *created;
+    std::stop_source stop;
+    bool done = false;
+    Result<void> result;
+    struct Sleeper {
+        static DetachedTask go(EventLoop& target, std::stop_token token,
+                               bool& done, Result<void>& result) {
+            result = co_await target.sleep_for(EventLoop::Duration::max(), {.stop = token});
+            done = true;
+        }
+    };
+    Sleeper::go(loop, stop.get_token(), done, result);
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(!done);
+    stop.request_stop();
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(done);
+    CHECK(!result && result.error() == Errc::cancelled);
+    CHECK(loop.outstanding() == 0);
+}
+
 void test_timers() {
     test::section("timers");
 
@@ -1742,6 +1768,20 @@ int run_contract_violation(std::string_view mode) {
         auto* loop = new Result<EventLoop>{std::move(created)};
         loop->value().post([loop] { delete loop; });
         (void)loop->value().run_once(0ms);
+    } else if (mode == "destroy-during-shutdown") {
+        std::set_terminate([] { std::_Exit(std::current_exception() ? 78 : 77); });
+        auto* loop = new EventLoop{std::move(*created)};
+        struct Sleeper {
+            static DetachedTask go(EventLoop* target) {
+                const auto outcome = co_await target->sleep_for(1h);
+                if (outcome || outcome.error() != Errc::cancelled) std::_Exit(3);
+                delete target;
+            }
+        };
+        Sleeper::go(loop);
+        auto replacement = EventLoop::create();
+        if (!replacement) std::_Exit(2);
+        *loop = std::move(*replacement);
     } else if (mode == "reentrant-run-once") {
         EventLoop& loop = created.value();
         loop.post([&loop] { (void)loop.run_once(0ms); });
@@ -1810,6 +1850,7 @@ int main(int argc, char** argv) {
     }
     test_create_and_backend();
     test_post_and_stop();
+    test_extreme_sleep_duration();
     test_timers();
     test_read_write_roundtrip();
     test_eof_is_distinct_from_empty();

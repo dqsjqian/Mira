@@ -70,6 +70,7 @@ public:
         /// Cleared when it fires, so that an operation resolving normally does
         /// not spend a syscall removing something already gone.
         bool armed{false};
+        bool cancel_pending{false};
 
         /// When a sleep should succeed, and when the caller's deadline cuts
         /// the operation short. Independent, and either may be absent.
@@ -117,29 +118,34 @@ public:
         // rather than leak. They observe `cancelled` and are expected to
         // return promptly — the loop is already unusable by then.
         //
-        // The flag is set before the dispatch check so that shutdown's own
-        // `finalize` calls, which raise the depth themselves, are not mistaken
-        // for a coroutine destroying the loop it is being resumed by.
-        if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
+        // A cancellation continuation can re-enter destruction while shutdown
+        // is dispatching it. Check before the idempotent return: the Impl must
+        // remain alive until its current finalize call unwinds.
         if (dispatch_depth_ != 0) {
             detail::report_dispatch_violation("destroyed or replaced while dispatching");
         }
+        if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
+        const detail::DispatchScope dispatching{dispatch_depth_};
 
-        std::vector<detail::OperationId> orphans;
         std::vector<move_only_function<void()>> discarded_work;
         {
             const std::lock_guard lock{mutex_};
-            orphans.reserve(operations_.size());
-            for (const auto& [id, operation] : operations_) {
-                orphans.push_back(id);
-            }
             posted_.drain_into(discarded_work);
         }
 
         // Resume outside the lock: a resumed coroutine may call back in. It
         // may also resolve a sibling operation, which is why this goes through
         // `finalize` by id — one that is already gone is simply not found.
-        for (const detail::OperationId id : orphans) {
+        // Shutdown cannot allocate: it may itself be unwinding bad_alloc.
+        // New submissions are rejected, so extracting one id at a time also
+        // tolerates a continuation cancelling or destroying a sibling.
+        for (;;) {
+            detail::OperationId id;
+            {
+                const std::lock_guard lock{mutex_};
+                if (operations_.empty()) break;
+                id = operations_.begin()->first;
+            }
             finalize(id, fail(Errc::cancelled));
         }
     }
@@ -330,12 +336,13 @@ public:
     void request_cancel(detail::OperationId id) {
         {
             const std::lock_guard lock{mutex_};
-            if (!operations_.contains(id)) {
+            auto operation = operations_.find(id);
+            if (operation == operations_.end() || operation->second.cancel_pending) {
                 return;  // already resolved
             }
-            // No de-duplication: `finalize` is idempotent by id, so a repeated
-            // request costs one wasted lookup and nothing else.
-            pending_cancels_.push_back(id);
+            // Stop callbacks are noexcept: cancellation must never allocate.
+            operation->second.cancel_pending = true;
+            ++pending_cancels_;
         }
         wake();
     }
@@ -389,7 +396,7 @@ public:
             // and drained wholesale afterwards, so it is never what guarantees
             // progress — leaving `pending_cancels_` out would let the loop
             // block with a cancellation sitting in it.
-            const bool queued = !posted_.empty() || !pending_cancels_.empty() || stopped();
+            const bool queued = !posted_.empty() || pending_cancels_ != 0 || stopped();
             timeout_ms = detail::resolve_timeout_ms(timeout, timers_.earliest(), queued);
         }
 
@@ -399,25 +406,19 @@ public:
             return fail(ready.error());
         }
 
-        // `(id, outcome)` rather than anything pointing at a frame: by the
-        // time these are delivered, an earlier resumption may already have
-        // resolved one of them, and a stale id resolves to nothing.
-        // Members, not locals: at a high event rate the per-iteration
-        // construction and destruction of five vectors is five guaranteed
-        // heap round-trips per loop turn. Reentrancy is impossible (a
-        // resumed coroutine calling run_once terminates by contract), so
-        // one set of scratch vectors is owned by the loop itself and
-        // cleared at the top of every turn.
-        resolved_.clear();
+        // Polling consumes one-shot registrations irreversibly. Fixed batches
+        // keep every later classification and timer extraction allocation-free.
+        // IDs remain safe when an earlier callback cancels another batch entry.
+        std::array<std::pair<detail::OperationId, Result<void>>, 4 * kEventBatch> resolved{};
+        std::array<std::pair<int, detail::Interest>, kEventBatch> to_rearm{};
+        std::array<detail::TimerTarget, kEventBatch> expired{};
+        std::array<detail::OperationId, kEventBatch> cancels{};
+        std::size_t resolved_count = 0;
+        std::size_t rearm_count = 0;
+        std::size_t expired_count = 0;
+        std::size_t cancel_count = 0;
         to_run_.clear();
-        to_rearm_.clear();
-        expired_.clear();
-        cancels_.clear();
-        auto& resolved = resolved_;
         auto& to_run = to_run_;
-        auto& to_rearm = to_rearm_;
-        auto& expired = expired_;
-        auto& cancels = cancels_;
         bool wakeup_fired = false;
 
         {
@@ -430,7 +431,7 @@ public:
                 auto operation = operations_.find(id);
                 if (operation == operations_.end() || !operation->second.armed) return;
                 operation->second.armed = false;
-                resolved.emplace_back(id, Result<void>{});
+                resolved[resolved_count++] = {id, Result<void>{}};
             };
 
             for (std::size_t i = 0; i < *ready; ++i) {
@@ -465,18 +466,26 @@ public:
 
                 const auto remaining = interest(it->second);
                 if (remaining != detail::Interest::none) {
-                    to_rearm.emplace_back(event.fd, remaining);
+                    to_rearm[rearm_count++] = {event.fd, remaining};
                 }
             }
 
             // kqueue may deliver separate read/write events in one batch.
             // Recompute after every claim to avoid rearming a consumed direction.
-            for (auto& [fd, remaining] : to_rearm) {
+            for (auto& [fd, remaining] : std::span(to_rearm).first(rearm_count)) {
                 remaining = interest(fd_waiters_.at(fd));
             }
 
-            timers_.extract_expired(detail::Clock::now(), expired);
-            cancels.swap(pending_cancels_);
+            expired_count = timers_.extract_expired(detail::Clock::now(), expired);
+            if (pending_cancels_ != 0) {
+                for (auto& [id, operation] : operations_) {
+                    if (!operation.cancel_pending) continue;
+                    cancels[cancel_count++] = id;
+                    operation.cancel_pending = false;
+                    --pending_cancels_;
+                    if (cancel_count == cancels.size()) break;
+                }
+            }
             posted_.drain_into(to_run);
             wake_pending_.store(false, std::memory_order_release);
         }
@@ -487,15 +496,6 @@ public:
         // reported as finished even if its deadline expired in the same
         // instant; `finalize` is by id, so the later mention of it does
         // nothing.
-        for (const detail::TimerTarget& target : expired) {
-            resolved.emplace_back(target.operation,
-                                  target.is_deadline ? Result<void>{fail(Errc::timed_out)}
-                                                     : Result<void>{});
-        }
-        for (const detail::OperationId id : cancels) {
-            resolved.emplace_back(id, fail(Errc::cancelled));
-        }
-
         Result<void> status{};
         if (wakeup_fired) {
             drain_wakeup();
@@ -510,7 +510,7 @@ public:
             }
         }
 
-        for (const auto& [fd, interest] : to_rearm) {
+        for (const auto& [fd, interest] : std::span(to_rearm).first(rearm_count)) {
             if (interest == detail::Interest::none) continue;
             if (Result<void> rearmed = poller_.arm(fd, interest); !rearmed) {
                 // Queue failures by operation ID, just like readiness. Never
@@ -521,7 +521,7 @@ public:
                     for (const auto id : {waiters->second.read, waiters->second.write}) {
                         if (auto operation = operations_.find(id); operation != operations_.end()) {
                             operation->second.armed = false;
-                            resolved.emplace_back(id, fail(rearmed.error()));
+                            resolved[resolved_count++] = {id, fail(rearmed.error())};
                         }
                     }
                 }
@@ -530,8 +530,15 @@ public:
 
         // Everything below runs outside the lock. Resumed coroutines may
         // submit more I/O, post work, or stop the loop.
-        for (const auto& [id, outcome] : resolved) {
+        for (const auto& [id, outcome] : std::span(resolved).first(resolved_count)) {
             finalize(id, outcome);
+        }
+        for (const auto& target : std::span(expired).first(expired_count)) {
+            finalize(target.operation, target.is_deadline ? Result<void>{fail(Errc::timed_out)}
+                                                          : Result<void>{});
+        }
+        for (const auto id : std::span(cancels).first(cancel_count)) {
+            finalize(id, fail(Errc::cancelled));
         }
         detail::dispatch_posts(to_run);
 
@@ -586,6 +593,7 @@ private:
             return {};
         }
         const Operation operation = it->second;
+        if (operation.cancel_pending) --pending_cancels_;
         operations_.erase(it);
 
         Unlinked out{.found = true, .handle = operation.handle, .result = operation.result};
@@ -696,16 +704,10 @@ private:
     std::unordered_map<int, std::array<std::shared_ptr<bool>, 2>> datagrams_{};
     detail::TimerQueue timers_{};
     detail::PostQueue posted_{};
-    std::vector<detail::OperationId> pending_cancels_{};
+    std::size_t pending_cancels_{0};
 
-    // Scratch batches for `run_once`, cleared and refilled every turn.
-    // Members rather than locals so a high event rate does not pay five
-    // heap allocations per loop turn; see the comment at their use site.
-    std::vector<std::pair<detail::OperationId, Result<void>>> resolved_{};
+    // Swapped with the producer queue without allocating while dispatching.
     std::vector<move_only_function<void()>> to_run_{};
-    std::vector<std::pair<int, detail::Interest>> to_rearm_{};
-    std::vector<detail::TimerTarget> expired_{};
-    std::vector<detail::OperationId> cancels_{};
     detail::OperationId next_id_{detail::kNoOperation};
 
     /// Non-zero while a batch is being delivered. Loop thread only, which is
@@ -756,7 +758,14 @@ Result<EventLoop> EventLoop::create() {
         }
     }
 
-    auto impl = std::make_unique<Impl>(std::move(*poller), wake[0], wake[1]);
+    std::unique_ptr<Impl> impl;
+    try {
+        impl = std::make_unique<Impl>(std::move(*poller), wake[0], wake[1]);
+    } catch (...) {
+        ::close(wake[0]);
+        ::close(wake[1]);
+        throw;
+    }
     Result<void> armed = impl->arm_wakeup();
     if (!armed) {
         return fail(armed.error());
@@ -893,18 +902,13 @@ Task<Result<std::size_t>> EventLoop::writev(NativeHandle handle,
     // A caller with more pieces than that can still loop `write` — the
     // span-of-spans shape is a convenience, not a capacity promise.
     std::array<::iovec, 16> scatter{};
-    std::size_t count = 0;
-    std::size_t total = 0;
-    for (const std::span<const std::byte> piece : pieces) {
-        if (piece.empty() || count == scatter.size()) {
-            continue;
-        }
-        scatter[count].iov_base = const_cast<std::byte*>(piece.data());
-        scatter[count].iov_len = piece.size();
-        ++count;
-        total += piece.size();
-    }
-    if (total == 0) {
+    const auto count = detail::visit_scatter_prefix(
+        pieces, static_cast<std::size_t>((std::numeric_limits<ssize_t>::max)()), scatter.size(),
+        [&scatter](std::size_t index, std::span<const std::byte> piece) {
+            scatter[index].iov_base = const_cast<std::byte*>(piece.data());
+            scatter[index].iov_len = piece.size();
+        });
+    if (count == 0) {
         co_return std::size_t{0};
     }
     for (;;) {
@@ -946,8 +950,22 @@ EventLoop::accept(NativeHandle listener, int address_family, OperationOptions op
     }
 
     for (;;) {
+#if MIRA_IO_BACKEND_EPOLL
+        // Set both flags atomically so a concurrent exec cannot inherit the
+        // connection between accept and its descriptor configuration.
+        const int accepted = ::accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+#else
         const int accepted = ::accept(listener, nullptr, nullptr);
+#endif
         if (accepted >= 0) {
+#if !MIRA_IO_BACKEND_EPOLL
+            const int flags = ::fcntl(accepted, F_GETFD, 0);
+            if (flags < 0 || ::fcntl(accepted, F_SETFD, flags | FD_CLOEXEC) < 0) {
+                const auto error = last_os_error();
+                ::close(accepted);
+                co_return fail(error);
+            }
+#endif
             // Attach before handing it over: a caller that has to remember
             // this would have code that works here and fails on Windows.
             Result<void> attached = impl_->attach(accepted);
@@ -1137,7 +1155,7 @@ Task<Result<void>> EventLoop::sleep_until(Clock::time_point deadline, OperationO
 }
 
 Task<Result<void>> EventLoop::sleep_for(Duration delay, OperationOptions options) {
-    return sleep_until(Clock::now() + delay, std::move(options));
+    return sleep_until(detail::deadline_after(Clock::now(), delay), std::move(options));
 }
 
 Task<void> EventLoop::yield() {

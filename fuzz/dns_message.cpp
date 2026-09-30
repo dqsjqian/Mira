@@ -29,6 +29,14 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     const std::string_view text(reinterpret_cast<const char*>(data), size);
     auto plain = Mira::dns::doh::base64url_decode(text);
     if (plain && Mira::dns::doh::base64url_encode(*plain) != text) std::abort();
+    Mira::http::Response response;
+    response.headers.append("Content-Type", "application/dns-message");
+    response.headers.append("Age", std::to_string(size));
+    (void)Mira::dns::doh::parse_response(response, bytes, limits);
+    response.headers.clear();
+    response.headers.append("Content-Type", "application/dns-message");
+    response.headers.append("Age", std::string(text.substr(0, 64)));
+    (void)Mira::dns::doh::parse_response(response, bytes, limits);
     if (size < 4096) {
         Mira::http::Request request;
         request.target = "/dns-query?" + std::string(text);

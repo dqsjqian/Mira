@@ -9,7 +9,7 @@ add_library(Mira::tls ALIAS mira_tls)
 
 target_include_directories(mira_tls PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_compile_features(mira_tls PUBLIC cxx_std_23)
 target_link_libraries(mira_tls

@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <map>
+#include <set>
 #include <span>
 #include <string_view>
 #include <system_error>
@@ -49,31 +49,33 @@ Task<void> h2_server(tcp::Listener listener, std::uint64_t target) {
     http2::Connection<tcp::Socket> connection(peer, std::move(*created));
 
     std::uint64_t answered = 0;
-    std::map<std::int32_t, bool> responded;
-    std::map<std::int32_t, bool> released;
+    std::set<std::int32_t> responded;
     // The server ends on the client's GOAWAY (state leaves open) or the
     // read loop's eof; it never races the client's own completion count.
     while (connection.session().state() == http2::State::open && answered < target) {
         if (const Result<void> round = co_await connection.pump(); !round) break;
         for (const std::int32_t id : connection.session().streams()) {
             const http2::Stream* stream = connection.session().stream(id);
-            if (stream == nullptr || stream->error || responded[id]) continue;
-            static_cast<void>(connection.session().take_body(id));
-            if (!stream->remote_end) continue;
+            if (stream == nullptr) continue;
+            if (!connection.session().take_body(id)) co_return;
+            if (stream->closed) {
+                if (!connection.session().release(id)) co_return;
+                responded.erase(id);
+                continue;
+            }
+            if (stream->error || responded.contains(id) || !stream->remote_end) continue;
             if (connection.session().respond(id, {{":status", "200"}}, {}).has_value()) {
-                responded[id] = true;
+                responded.insert(id);
                 answered += 1;
             }
         }
-        // A released stream returns its slot to the concurrent-stream budget;
-        // without this the server's entries grow without bound and the
-        // default 100-stream limit eventually refuses every new request,
-        // which is a bench bug, not library behaviour.
-        for (auto& [id, sent] : responded) {
-            if (sent && !released[id] && connection.session().release(id).has_value())
-                released[id] = true;
-        }
         if (const Result<void> flushed = co_await connection.flush(); !flushed) break;
+        for (const auto id : connection.session().streams()) {
+            if (connection.session().stream(id)->closed) {
+                if (!connection.session().release(id)) co_return;
+                responded.erase(id);
+            }
+        }
     }
     static_cast<void>(co_await connection.flush());
     // Closing the socket is what ends the client's read loop: without eof
@@ -101,7 +103,6 @@ Task<void> h2_client(EventLoop& loop, const Endpoint& address, std::uint64_t str
                                  {":authority", "localhost"},
                                  {":path", "/bench"}};
 
-    std::map<std::int32_t, bool> drained;
     int rounds = 0;
     while (counters.answered < streams && rounds < 100000) {
         // Keep up to `concurrency` streams in flight — the pattern the h2
@@ -114,12 +115,12 @@ Task<void> h2_client(EventLoop& loop, const Endpoint& address, std::uint64_t str
         ++rounds;
         for (const std::int32_t id : connection.session().streams()) {
             const http2::Stream* stream = connection.session().stream(id);
-            if (stream == nullptr || drained[id]) continue;
-            static_cast<void>(connection.session().take_body(id));
-            if (!stream->remote_end) continue;
-            drained[id] = true;
+            if (stream == nullptr) continue;
+            if (!connection.session().take_body(id)) co_return;
+            if (!stream->closed) continue;
+            if (stream->error || !stream->remote_end) co_return;
+            if (!connection.session().release(id)) co_return;
             counters.answered += 1;
-            static_cast<void>(connection.session().release(id));
         }
         if (const Result<void> flushed = co_await connection.flush(); !flushed) break;
     }

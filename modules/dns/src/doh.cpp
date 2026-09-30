@@ -1,6 +1,9 @@
 #include "mira/dns/doh.hpp"
 
 #include <array>
+#include <algorithm>
+#include <charconv>
+#include <limits>
 
 namespace Mira::dns::doh {
 
@@ -33,6 +36,19 @@ bool is_dns_message(const http::HeaderMap& headers) {
     auto value = *headers.get("Content-Type");
     const auto semicolon = value.find(';');
     return ascii_iequal(trim(value.substr(0, semicolon)), media_type);
+}
+
+std::uint32_t response_age(const http::HeaderMap& headers) noexcept {
+    const auto field = headers.get("Age");
+    if (!field) return 0;
+    // RFC 9111 section 5.1: first field/list member; ignore malformed values.
+    const auto text = trim(field->substr(0, field->find(',')));
+    if (text.empty()) return 0;
+    std::uint32_t age = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), age);
+    if (end != text.data() + text.size()) return 0;
+    if (error == std::errc::result_out_of_range) return std::numeric_limits<std::uint32_t>::max();
+    return error == std::errc{} ? age : 0;
 }
 
 Result<void> check_path(std::string_view path) {
@@ -124,11 +140,22 @@ Result<Message> parse_response(const http::Response& response, std::span<const s
     if (response.status < 200 || response.status > 299) return fail(DnsError::bad_status);
     if (!is_dns_message(response.headers)) return fail(DnsError::bad_media_type);
     if (body.size() > limits.max_message_size) return fail(DnsError::too_large);
-    return decode(body, limits);
+    auto message = decode(body, limits);
+    if (!message) return fail(message.error());
+    // HTTP caches do not rewrite the DNS payload. RFC 8484 section 5.1
+    // requires recipients to deduct Age before using a DNS record's TTL.
+    const auto age = response_age(response.headers);
+    for (auto* section : {&message->answers, &message->authorities, &message->additionals})
+        for (auto& record : *section) record.ttl -= (std::min)(record.ttl, age);
+    return message;
 }
 
 Result<std::vector<std::byte>> decode_request(const http::Request& request,
                                               std::span<const std::byte> body, const Limits& limits) {
+    // RFC 8484 section 6 caps application/dns-message at 65535 bytes even
+    // when a caller raises its local resource budget. Clamp before arithmetic
+    // or copying input so GET and POST enforce the same wire bound.
+    const auto limit = (std::min)(limits.max_message_size, std::size_t{65535});
     std::vector<std::byte> wire;
     if (request.method == http::Method::get) {
         const auto question = request.target.find('?');
@@ -147,19 +174,19 @@ Result<std::vector<std::byte>> decode_request(const http::Request& request,
             query.remove_prefix(amp + 1);
         }
         if (!encoded || encoded->empty()) return fail(DnsError::bad_request);
-        if (encoded->size() > (limits.max_message_size * 4 + 2) / 3) return fail(DnsError::too_large);
+        if (encoded->size() > (limit * 4 + 2) / 3) return fail(DnsError::too_large);
         auto decoded = base64url_decode(*encoded);
         if (!decoded) return fail(DnsError::bad_request);
         wire = std::move(*decoded);
     } else if (request.method == http::Method::post) {
         if (!is_dns_message(request.headers)) return fail(DnsError::bad_media_type);
-        if (body.size() > limits.max_message_size) return fail(DnsError::too_large);
+        if (body.size() > limit) return fail(DnsError::too_large);
         wire.assign(body.begin(), body.end());
     } else {
         return fail(DnsError::bad_method);
     }
     if (wire.size() < 12) return fail(DnsError::bad_request);
-    if (wire.size() > limits.max_message_size) return fail(DnsError::too_large);
+    if (wire.size() > limit) return fail(DnsError::too_large);
     return wire;
 }
 

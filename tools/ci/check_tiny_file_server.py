@@ -42,14 +42,15 @@ def http_roundtrip(port: int, request: str) -> bytes:
     return response
 
 
-def check_file_server(executable: str, use_curl: bool) -> None:
+def check_file_server(executable: str, use_curl: bool, allow_upload: bool) -> None:
     with tempfile.TemporaryDirectory(prefix="mira-fileserver-") as root:
-        payload = os.urandom(256 * 1024)  # forces multi-slice streaming both ways
+        payload = os.urandom(2 * 1024 * 1024)  # forces multi-slice streaming both ways
         with open(os.path.join(root, "blob.bin"), "wb") as f:
             f.write(payload)
 
         process = subprocess.Popen(
-            [executable, "0", root], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            [executable, "0", root, *(["--allow-upload"] if allow_upload else [])],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True,
         )
         lines: "queue.Queue[str]" = queue.Queue(maxsize=4)
@@ -84,7 +85,26 @@ def check_file_server(executable: str, use_curl: bool) -> None:
             assert b" 400 " in smuggle.split(b"\r\n", 1)[0], \
                 f"traversal must 400: {smuggle[:80]!r}"
 
-            # 3. Streaming upload via a raw socket.
+            # A read-only default must reject writes without creating files.
+            if not allow_upload:
+                refused = http_roundtrip(port,
+                    "PUT /refused.bin HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n"
+                    "Connection: close\r\n\r\n")
+                assert b" 405 " in refused.split(b"\r\n", 1)[0], refused[:80]
+                assert not os.path.exists(os.path.join(root, "refused.bin"))
+                return
+
+            # Directory names are text, never markup (POSIX permits these names).
+            if os.name != "nt":
+                name = '<svg onload=alert(1)>\"\'&'
+                with open(os.path.join(root, name), "wb") as f:
+                    f.write(b"safe")
+                listing = http_roundtrip(port,
+                    "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                assert b"<svg onload" not in listing
+                assert b"&lt;svg onload=alert(1)&gt;&quot;&#39;&amp;" in listing
+
+            # 3. Streaming upload larger than the library's default 1 MiB.
             upload = (
                 f"PUT /uploaded.bin HTTP/1.1\r\nHost: x\r\n"
                 f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n"
@@ -151,7 +171,8 @@ def check_cli_validation(executable: str) -> None:
 def main() -> int:
     executable = sys.argv[1]
     use_curl = shutil.which("curl") is not None
-    check_file_server(executable, use_curl)
+    check_file_server(executable, use_curl, allow_upload=False)
+    check_file_server(executable, use_curl, allow_upload=True)
     check_cli_validation(executable)
     print(f"tiny file server example: ok (curl interop={'yes' if use_curl else 'skipped'})")
     return 0

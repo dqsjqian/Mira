@@ -23,6 +23,7 @@
 #include "mira/core/task.hpp"
 
 #include <concepts>
+#include <algorithm>
 #include <cstddef>
 #include <span>
 #include <utility>
@@ -127,11 +128,7 @@ writev_all(S& stream, std::span<const std::span<const std::byte>> pieces) {
     // Nothing offered means nothing owed — the same answer `write_all` gives
     // for an empty source, rather than mistaking an empty submission for a
     // peer that closed.
-    std::size_t offered = 0;
-    for (const std::span<const std::byte> p : pieces) {
-        offered += p.size();
-    }
-    if (offered == 0) {
+    if (std::none_of(pieces.begin(), pieces.end(), [](const auto piece) { return !piece.empty(); })) {
         co_return Result<void>{};
     }
     std::size_t piece = 0;
@@ -191,11 +188,7 @@ template<BoundedVectorWriteStream S>
 Task<Result<void>> writev_all(S& stream,
                               std::span<const std::span<const std::byte>> pieces,
                               OperationOptions options) {
-    std::size_t offered = 0;
-    for (const std::span<const std::byte> p : pieces) {
-        offered += p.size();
-    }
-    if (offered == 0) {
+    if (std::none_of(pieces.begin(), pieces.end(), [](const auto piece) { return !piece.empty(); })) {
         co_return Result<void>{};
     }
     std::size_t piece = 0;

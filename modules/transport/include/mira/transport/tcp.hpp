@@ -72,9 +72,10 @@ public:
 
     Socket& operator=(Socket&& other) noexcept {
         if (this != &other) {
-            close();
+            auto previous = std::move(*this);
             loop_ = std::exchange(other.loop_, nullptr);
             handle_ = std::exchange(other.handle_, invalid_handle);
+            return *this;  // Form the result before previous.close() resumes user code.
         }
         return *this;
     }
@@ -147,11 +148,12 @@ public:
 
     Listener& operator=(Listener&& other) noexcept {
         if (this != &other) {
-            close();
+            auto previous = std::move(*this);
             loop_ = std::exchange(other.loop_, nullptr);
             handle_ = std::exchange(other.handle_, invalid_handle);
             local_ = other.local_;
             options_ = other.options_;
+            return *this;
         }
         return *this;
     }

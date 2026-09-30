@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -572,7 +573,7 @@ Task<void> server_expectations(EventLoop& loop) {
         {"POST / HTTP/1.1\r\nHost: a\r\nExpect: fancy\r\nContent-Length: 1\r\n\r\nx",
          "HTTP/1.1 417 ", false, false},
         {"POST / HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc",
-         "HTTP/1.1 200 ", false, true},
+         "HTTP/1.0 200 ", false, true},
         {"GET / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
          "HTTP/1.1 200 ", false, true},
     };
@@ -616,7 +617,204 @@ Task<void> server_expectations(EventLoop& loop) {
     }
 }
 
+// Deterministic fault injection around the concurrent response reader.
+struct FaultStream {
+    EventLoop& loop;
+    explicit FaultStream(EventLoop& value) : loop(value) {}
+    std::stop_source response_ready;
+    unsigned writes = 0;
+    unsigned throw_write = 0;
+    bool throw_read = false;
+    bool partial_failure = false;
+    bool reply = false;
+    bool replied = false;
+    bool reader_exited = false;
+    std::string_view response = "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n";
+    Task<Result<std::size_t>> read_some(std::span<std::byte> out, OperationOptions io = {}) {
+        if (throw_read) throw std::runtime_error("read fault");
+        if (!reply) {
+            std::stop_callback forward{io.stop, [this] { response_ready.request_stop(); }};
+            const auto wait = co_await loop.sleep_for(1h, {.stop = response_ready.get_token(), .deadline = io.deadline});
+            if (!reply) {
+                reader_exited = true;
+                co_return fail(wait ? make_error_code(Errc::eof) : wait.error());
+            }
+        }
+        if (replied) co_return fail(Errc::eof);
+        CHECK(out.size() >= response.size());
+        std::memcpy(out.data(), response.data(), response.size());
+        replied = true;
+        reader_exited = true;
+        co_return response.size();
+    }
+    Task<Result<std::size_t>> write_some(std::span<const std::byte> input, OperationOptions = {}) {
+        ++writes;
+        if (writes == throw_write) throw std::runtime_error("write fault");
+        if (partial_failure && writes == 2) co_return std::min(std::size_t{2}, input.size());
+        if (partial_failure && writes == 3) {
+            reply = true;
+            response_ready.request_stop();
+            while (!reader_exited) co_await loop.yield();
+            co_return fail(Errc::eof);
+        }
+        co_return input.size();
+    }
+};
+
+Task<void> audit_callback_and_write_failures(EventLoop& loop) {
+    test::section("upload exceptions always join the parked reader");
+    for (const bool throw_before_task : {false, true}) {
+        FaultStream stream{loop};
+        ClientConnection client{stream};
+        auto source = [throw_before_task]() -> Task<Result<std::span<const std::byte>>> {
+            if (throw_before_task) throw std::bad_alloc{};
+            throw std::runtime_error("source fault");
+            co_return std::span<const std::byte>{};
+        };
+        bool caught = false;
+        try { static_cast<void>(co_await client.exchange(loop, post(), Framing::content_length, 5, source)); }
+        catch (const std::exception&) { caught = true; }
+        CHECK(caught && stream.reader_exited && !client.reusable());
+    }
+    // Throwing while constructing the Task is distinct from throwing inside it.
+    {
+        FaultStream stream{loop};
+        ClientConnection client{stream};
+        auto source = []() -> Task<Result<std::span<const std::byte>>> { throw std::bad_alloc{}; };
+        bool caught = false;
+        try { static_cast<void>(co_await client.exchange(loop, post(), Framing::content_length, 5, source)); }
+        catch (const std::bad_alloc&) { caught = true; }
+        CHECK(caught && stream.reader_exited && !client.reusable());
+    }
+    test::section("exceptions in every client stage invalidate without destructor abort");
+    for (unsigned stage = 0; stage < 5; ++stage) {
+        FaultStream stream{loop};
+        ClientConnection client{stream};
+        Repeating source{5, 5};
+        bool caught = false;
+        try {
+            if (stage == 0) {
+                stream.throw_write = 1;
+                static_cast<void>(co_await client.begin(post(), Framing::content_length, 5));
+            } else if (stage == 1) {
+                stream.throw_write = 2;
+                static_cast<void>(co_await client.begin(post(), Framing::content_length, 5));
+                static_cast<void>(co_await client.send_body(bytes("hello")));
+            } else if (stage == 2) {
+                static_cast<void>(co_await client.begin(post(), Framing::content_length, 0));
+                stream.throw_read = true;
+                static_cast<void>(co_await client.finish());
+            } else if (stage == 3) {
+                stream.throw_write = 2;
+                static_cast<void>(co_await client.exchange(loop, post(), Framing::content_length, 5, source));
+            } else {
+                stream.throw_read = true;
+                static_cast<void>(co_await client.exchange(loop, post(), Framing::content_length, 5, source));
+            }
+        } catch (const std::runtime_error&) { caught = true; }
+        CHECK(caught && !client.reusable());
+        if (stage == 3) CHECK(stream.reader_exited);
+    }
+    test::section("partial body write remains interrupted after final response");
+    {
+        FaultStream stream{loop};
+        stream.partial_failure = true;
+        ClientConnection client{stream};
+        Repeating source{5, 5};
+        auto result = co_await client.exchange(loop, post(), Framing::content_length, 5, source,
+            {.expect_continue = true, .continue_timeout = 1ms});
+        CHECK(result && result->upload == UploadOutcome::interrupted && result->body_sent == 2);
+        CHECK(!client.reusable());
+        CHECK((co_await client.read_body()).has_value());
+    }
+    test::section("request deadline reaches cooperative body source");
+    {
+        FaultStream stream{loop};
+        ClientOptions options;
+        options.request_timeout = 5ms;
+        ClientConnection client{stream, options};
+        bool received_options = false;
+        auto source = [&](OperationOptions io) -> Task<Result<std::span<const std::byte>>> {
+            received_options = io.deadline.has_value() && io.stop.stop_possible();
+            auto waited = co_await loop.sleep_for(1h, io);
+            CHECK(!waited);
+            co_return fail(waited.error());
+        };
+        auto result = co_await client.exchange(loop, post(), Framing::content_length, 5, source);
+        CHECK(!result && result.error() == Errc::timed_out);
+        CHECK(received_options && stream.reader_exited && !client.reusable());
+    }
+}
+
+Task<void> refusal_stops_cooperative_producer(EventLoop& loop) {
+    test::section("early refusal cancels a parked producer while preserving the response");
+    FaultStream stream{loop};
+    ClientConnection client{stream};
+    bool source_started = false;
+    bool source_cancelled = false;
+    auto source = [&](OperationOptions io) -> Task<Result<std::span<const std::byte>>> {
+        source_started = true;
+        const auto wait = co_await loop.sleep_for(1h, io);
+        source_cancelled = !wait && wait.error() == Errc::cancelled;
+        co_return wait ? Result<std::span<const std::byte>>{bytes("hello")} : fail(wait.error());
+    };
+    TaskScope scope;
+    auto refuse = [&]() -> Task<void> {
+        while (!source_started) co_await loop.yield();
+        stream.reply = true;
+        stream.response_ready.request_stop();
+    };
+    scope.spawn(refuse());
+    // The safety deadline bounds an unfixed implementation; the refusal must
+    // complete by cancelling just the producer, not timing out the exchange.
+    auto result = co_await client.exchange(loop, post(), Framing::content_length, 5, source,
+                                           {}, {.deadline = Clock::now() + 100ms});
+    co_await scope.join();
+    CHECK(source_started && source_cancelled);
+    CHECK(result && result->upload == UploadOutcome::interrupted && result->body_sent == 0);
+    CHECK(client.response().status == 413);
+    CHECK(!client.reusable());
+    if (result) CHECK((co_await client.read_body()).has_value());
+
+    test::section("early keep-alive success leaves a cooperative producer running");
+    FaultStream accepted{loop};
+    accepted.response = "HTTP/1.1 204 No Content\r\n\r\n";
+    ClientConnection accepted_client{accepted};
+    bool produced = false;
+    auto continuing_source = [&](OperationOptions io) -> Task<Result<std::span<const std::byte>>> {
+        if (produced) co_return std::span<const std::byte>{};
+        accepted.reply = true;
+        accepted.response_ready.request_stop();
+        auto waited = co_await loop.sleep_for(1ms, io);
+        CHECK(waited.has_value());
+        if (!waited) co_return fail(waited.error());
+        produced = true;
+        co_return bytes("hello");
+    };
+    auto completed = co_await accepted_client.exchange(loop, post(), Framing::content_length, 5,
+        continuing_source, {}, {.deadline = Clock::now() + 100ms});
+    CHECK(completed && completed->upload == UploadOutcome::complete && completed->body_sent == 5);
+    if (completed) CHECK((co_await accepted_client.read_body()).has_value());
+    CHECK(accepted_client.reusable());
+
+    test::section("a refusal does not hide an independent producer error");
+    FaultStream faulty{loop};
+    ClientConnection faulty_client{faulty};
+    auto failing_source = [&](OperationOptions io) -> Task<Result<std::span<const std::byte>>> {
+        faulty.reply = true;
+        faulty.response_ready.request_stop();
+        static_cast<void>(co_await loop.sleep_for(1h, io));
+        co_return fail(Errc::internal);
+    };
+    auto failed = co_await faulty_client.exchange(loop, post(), Framing::content_length, 5,
+        failing_source, {}, {.deadline = Clock::now() + 100ms});
+    CHECK(!failed && failed.error() == Errc::internal);
+    CHECK(!faulty_client.reusable());
+}
+
 Task<void> run(EventLoop& loop) {
+    co_await refusal_stops_cooperative_producer(loop);
+    co_await audit_callback_and_write_failures(loop);
     co_await serializer_rules();
     co_await expect_continue_granted(loop);
     co_await expect_refused(loop);

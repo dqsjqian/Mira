@@ -16,8 +16,9 @@ import tempfile
 
 from build_protocol_deps import extract, output_path, positive_jobs, run, sha256
 
-VERSION = "8.16.0"
-DIGEST = "40c8cddbcb6cc6251c03dea423a472a6cea4037be654ba5cf5dec6eb2d22ff1d"
+VERSION = "8.22.0"
+# SHA256 from the curl project's immutable GitHub release asset metadata.
+DIGEST = "f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7"
 REPO = Path(__file__).resolve().parents[2]
 
 
@@ -85,7 +86,8 @@ def main() -> None:
     else:
         with tempfile.TemporaryDirectory(prefix="download-", dir=work) as temp:
             candidate = Path(temp) / archive.name
-            url = f"https://github.com/curl/curl/releases/download/curl-8_16_0/{archive.name}"
+            tag = f"curl-{VERSION.replace('.', '_')}"
+            url = f"https://github.com/curl/curl/releases/download/{tag}/{archive.name}"
             run(["curl", "-fL", "--retry", "2", "--connect-timeout", "30",
                  "--max-time", "180", url, "-o", str(candidate)])
             if sha256(candidate) != DIGEST:

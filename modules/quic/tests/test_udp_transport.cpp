@@ -12,7 +12,9 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <source_location>
 #include <stop_token>
+#include <utility>
 
 using namespace Mira;
 using namespace std::chrono_literals;
@@ -23,15 +25,17 @@ using UdpConnection = Connection<transport::udp::Socket>;
 namespace {
 
 template<class T>
-T require(Result<T> value) {
+T require(Result<T> value, std::source_location location = std::source_location::current()) {
     if (!value)
         throw std::runtime_error(value.error().message() + " (" +
-                                 std::to_string(value.error().value()) + ")");
+                                 std::to_string(value.error().value()) + ") at line " +
+                                 std::to_string(location.line()));
     return std::move(*value);
 }
 
-void require(Result<void> value) {
-    if (!value) throw std::runtime_error(value.error().message());
+void require(Result<void> value, std::source_location location = std::source_location::current()) {
+    if (!value) throw std::runtime_error(value.error().message() + " at line " +
+                                         std::to_string(location.line()));
 }
 
 void check(bool ok, const char* message) {
@@ -247,7 +251,8 @@ Task<void> expired_engine_timer(EventLoop& loop, const char* certificate) {
 }
 
 Task<void> accept_only(transport::udp::Socket socket, quic::Options options,
-                       std::unique_ptr<UdpConnection>& connection, bool& client_ready) {
+                       std::unique_ptr<UdpConnection>& connection, bool& client_ready,
+                       bool& server_ready) {
     std::array<std::byte, 65536> initial{};
     auto datagram = require(co_await socket.receive_from(initial, {.deadline = Clock::now() + 5s}));
     options.local = require(socket.local_endpoint());
@@ -257,6 +262,7 @@ Task<void> accept_only(transport::udp::Socket socket, quic::Options options,
         std::span<const std::byte>{initial.data(), datagram.size},
         {.deadline = Clock::now() + 5s}));
     connection = std::make_unique<UdpConnection>(std::move(accepted));
+    server_ready = true;
     // Server handshake completion can precede the peer receiving the final
     // handshake flight. Keep its retransmission timer alive until both finish.
     const auto deadline = Clock::now() + 5s;
@@ -267,15 +273,27 @@ Task<void> accept_only(transport::udp::Socket socket, quic::Options options,
     }
 }
 
+template<class Datagram>
 Task<void> connect_only(EventLoop& loop, quic::Options options,
-                        std::unique_ptr<UdpConnection>& connection, bool& client_ready) {
-    auto connected = require(co_await UdpConnection::connect(
+                        std::unique_ptr<Connection<Datagram>>& connection, bool& client_ready,
+                        bool& server_ready) {
+    auto connected = require(co_await Connection<Datagram>::connect(
         loop, std::move(options), {.deadline = Clock::now() + 5s}));
-    connection = std::make_unique<UdpConnection>(std::move(connected));
+    connection = std::make_unique<Connection<Datagram>>(std::move(connected));
     client_ready = true;
+    // Local cryptographic completion does not mean the peer received our
+    // Finished flight. Keep handling its retransmissions and our PTO/pacing
+    // until the server completes too; otherwise joining the pair can deadlock.
+    const auto deadline = Clock::now() + 5s;
+    while (!server_ready) {
+        auto round = co_await connection->pump({.deadline = std::min(deadline, Clock::now() + 10ms)});
+        if (!round && round.error() != Errc::timed_out) require(std::move(round));
+        check(Clock::now() < deadline, "server did not confirm handshake completion");
+    }
 }
 
-Task<void> drain_input(UdpConnection& connection) {
+template<class Datagram>
+Task<void> drain_input(Connection<Datagram>& connection) {
     const auto deadline = Clock::now() + 30ms;
     for (;;) {
         auto round = co_await connection.pump({.deadline = deadline});
@@ -284,6 +302,208 @@ Task<void> drain_input(UdpConnection& connection) {
             co_return;
         }
     }
+}
+
+// Fail after the engine has committed its packet, before it reaches the OS.
+// Continuing to pump must recover through QUIC retransmission without asking
+// the application to submit its payload a second time.
+struct FaultDatagram {
+    enum class Fault { none, cancelled, timed_out, short_send };
+    struct State {
+        EventLoop* loop = nullptr;
+        Fault fault = Fault::none;
+        std::size_t failures = 0;
+        const bool* release_handshake = nullptr;
+        std::size_t handshake_drops = 0;
+    };
+    static inline std::shared_ptr<State> next;
+    transport::udp::Socket socket;
+    std::shared_ptr<State> state;
+
+    static Result<FaultDatagram> bind(EventLoop& loop, const Endpoint& endpoint) {
+        auto socket = transport::udp::Socket::bind(loop, endpoint);
+        if (!socket) return fail(socket.error());
+        next->loop = &loop;
+        return FaultDatagram{std::move(*socket), next};
+    }
+    Result<Endpoint> local_endpoint() const { return socket.local_endpoint(); }
+    static bool contains_handshake(std::span<const std::byte> bytes) {
+        // QUIC can coalesce Initial and Handshake packets into one datagram.
+        // Walk the public long-header lengths, without inspecting ciphertext.
+        std::size_t offset = 0;
+        const auto skip = [&](std::uint64_t count) {
+            if (count > bytes.size() - offset) return false;
+            offset += static_cast<std::size_t>(count);
+            return true;
+        };
+        const auto varint = [&]() -> std::optional<std::uint64_t> {
+            if (offset == bytes.size()) return std::nullopt;
+            const auto first = std::to_integer<unsigned>(bytes[offset]);
+            const auto size = std::size_t{1} << (first >> 6);
+            if (size > bytes.size() - offset) return std::nullopt;
+            std::uint64_t value = first & 0x3fu;
+            for (std::size_t i = 1; i < size; ++i)
+                value = (value << 8) | std::to_integer<unsigned>(bytes[offset + i]);
+            offset += size;
+            return value;
+        };
+        while (bytes.size() - offset >= 5) {
+            const auto tag = std::to_integer<unsigned>(bytes[offset]);
+            if ((tag & 0x80u) == 0 || bytes[offset + 1] != std::byte{0} ||
+                bytes[offset + 2] != std::byte{0} || bytes[offset + 3] != std::byte{0} ||
+                bytes[offset + 4] != std::byte{1}) return false;
+            const auto type = (tag >> 4) & 3u;
+            if (type == 2) return true;
+            if (type == 3 || !skip(5)) return false;  // Retry has no length field.
+            for (int cid = 0; cid < 2; ++cid) {
+                if (offset == bytes.size()) return false;
+                const auto size = std::to_integer<unsigned>(bytes[offset++]);
+                if (!skip(size)) return false;
+            }
+            if (type == 0) {
+                const auto token = varint();
+                if (!token || !skip(*token)) return false;
+            }
+            const auto length = varint();
+            if (!length || !skip(*length)) return false;
+        }
+        return false;
+    }
+    Task<Result<std::size_t>> send_to(std::span<const std::byte> bytes,
+                                     const Endpoint& peer, OperationOptions io) {
+        // QUIC v1 long-header type 0b10 is Handshake. Drop the whole flight
+        // before connect() returns, including any ACK-only datagrams before
+        // Finished. The client's ready flag then releases retransmissions.
+        if (state->release_handshake && !*state->release_handshake && contains_handshake(bytes)) {
+            ++state->handshake_drops;
+            co_return bytes.size();
+        }
+        const auto fault = std::exchange(state->fault, Fault::none);
+        if (fault != Fault::none) {
+            ++state->failures;
+            // Force time to advance between packet construction and failure.
+            auto paused = co_await state->loop->sleep_for(40ms, io);
+            if (!paused) co_return fail(paused.error());
+            if (fault == Fault::cancelled) co_return fail(Errc::cancelled);
+            if (fault == Fault::timed_out) co_return fail(Errc::timed_out);
+            co_return bytes.size() - 1;
+        }
+        co_return co_await socket.send_to(bytes, peer, io);
+    }
+    Task<Result<transport::udp::Datagram>> receive_from(std::span<std::byte> bytes,
+                                                       OperationOptions io) {
+        co_return co_await socket.receive_from(bytes, io);
+    }
+};
+
+Task<void> fault_echo(UdpConnection& server, std::int64_t id, const quic::Bytes& expected,
+                       bool& client_done) {
+    const auto deadline = Clock::now() + 2s;
+    quic::Bytes received;
+    bool fin = false;
+    while (!fin) {
+        auto chunk = require(co_await server.read(id, {.deadline = deadline}));
+        received.insert(received.end(), chunk.data.begin(), chunk.data.end());
+        require(server.consume(id, chunk.data.size()));
+        fin = chunk.fin;
+    }
+    check(received == expected, "failed datagram send lost or duplicated stream bytes");
+    require(co_await server.write(id, received, true, {.deadline = deadline}));
+    while (!client_done) {
+        auto round = co_await server.pump({.deadline = std::min(deadline, Clock::now() + 10ms)});
+        if (!round && round.error() != Errc::timed_out) require(std::move(round));
+        check(Clock::now() < deadline, "client did not complete after failed send recovery");
+    }
+}
+
+Task<void> fault_reply(Connection<FaultDatagram>& client, std::int64_t id,
+                       const quic::Bytes& expected, bool& done) {
+    const auto deadline = Clock::now() + 2s;
+    quic::Bytes reply;
+    bool fin = false;
+    while (!fin) {
+        auto chunk = require(co_await client.read(id, {.deadline = deadline}));
+        reply.insert(reply.end(), chunk.data.begin(), chunk.data.end());
+        require(client.consume(id, chunk.data.size()));
+        fin = chunk.fin;
+    }
+    check(reply == expected, "failed send recovery changed the echoed stream");
+    done = true;
+}
+
+Task<void> failed_send_recovery(EventLoop& loop, const char* certificate, const char* key) {
+    auto socket = require(transport::udp::Socket::bind(loop, Endpoint::loopback(0)));
+    quic::Options co, so;
+    co.local = Endpoint::loopback(0); co.remote = require(socket.local_endpoint());
+    co.ca_file = certificate; co.peer_name = "localhost";
+    so.certificate_file = certificate; so.private_key_file = key;
+    FaultDatagram::next = std::make_shared<FaultDatagram::State>();
+    auto faults = FaultDatagram::next;
+    std::unique_ptr<Connection<FaultDatagram>> client;
+    std::unique_ptr<UdpConnection> server;
+    bool ready = false, server_ready = false;
+    TaskScope handshake;
+    handshake.spawn(accept_only(std::move(socket), so, server, ready, server_ready));
+    handshake.spawn(connect_only(loop, co, client, ready, server_ready));
+    co_await handshake.join();
+    for (const auto fault : {FaultDatagram::Fault::cancelled, FaultDatagram::Fault::timed_out,
+                             FaultDatagram::Fault::short_send}) {
+        TaskScope settle;
+        settle.spawn(drain_input(*client)); settle.spawn(drain_input(*server));
+        co_await settle.join();
+        const auto id = require(client->open_stream());
+        const quic::Bytes payload(512, std::byte{0x6b});
+        faults->fault = fault;
+        auto written = co_await client->write(id, payload, true, {.deadline = Clock::now() + 2s});
+        const auto expected = fault == FaultDatagram::Fault::cancelled ? make_error_code(Errc::cancelled) :
+            fault == FaultDatagram::Fault::timed_out ? make_error_code(Errc::timed_out) :
+            std::make_error_code(std::errc::io_error);
+        check(!written && written.error() == expected, "datagram send failure was hidden");
+        check(!client->closed(), "recoverable datagram send failure closed the connection");
+        bool done = false;
+        TaskScope exchange;
+        exchange.spawn(fault_echo(*server, id, payload, done));
+        exchange.spawn(fault_reply(*client, id, payload, done));
+        co_await exchange.join();
+    }
+    check(faults->failures == 3, "datagram send fault injection did not run");
+    FaultDatagram::next.reset();
+}
+
+Task<void> lost_client_handshake(EventLoop& loop, const char* certificate, const char* key) {
+    const std::array initial{std::byte{0xc0}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}, std::byte{0}};
+    quic::Bytes coalesced(initial.begin(), initial.end());
+    coalesced.insert(coalesced.end(), {std::byte{0xe0}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}});
+    check(!FaultDatagram::contains_handshake(initial) && FaultDatagram::contains_handshake(coalesced),
+          "handshake fault matcher missed a coalesced packet");
+    auto socket = require(transport::udp::Socket::bind(loop, Endpoint::loopback(0)));
+    quic::Options co, so;
+    co.local = Endpoint::loopback(0); co.remote = require(socket.local_endpoint());
+    co.ca_file = certificate; co.peer_name = "localhost";
+    so.certificate_file = certificate; so.private_key_file = key;
+    FaultDatagram::next = std::make_shared<FaultDatagram::State>();
+    auto faults = FaultDatagram::next;
+    std::unique_ptr<Connection<FaultDatagram>> client;
+    std::unique_ptr<UdpConnection> server;
+    bool client_ready = false, server_ready = false;
+    faults->release_handshake = &client_ready;
+    TaskScope handshake;
+    handshake.spawn(accept_only(std::move(socket), so, server, client_ready, server_ready));
+    handshake.spawn(connect_only(loop, co, client, client_ready, server_ready));
+    co_await handshake.join();
+    check(faults->handshake_drops != 0, "client handshake flight loss was not injected");
+    check(client_ready && server_ready && client->handshake_complete() && server->handshake_complete(),
+          "lost client handshake flight prevented the peer completing");
+    const auto id = require(client->open_stream());
+    const quic::Bytes payload(512, std::byte{0x71});
+    require(co_await client->write(id, payload, true));
+    bool done = false;
+    TaskScope exchange;
+    exchange.spawn(fault_echo(*server, id, payload, done));
+    exchange.spawn(fault_reply(*client, id, payload, done));
+    co_await exchange.join();
+    FaultDatagram::next.reset();
 }
 
 Task<void> fixed_peer(EventLoop& loop, const char* certificate, const char* key,
@@ -302,9 +522,9 @@ Task<void> fixed_peer(EventLoop& loop, const char* certificate, const char* key,
     std::unique_ptr<UdpConnection> client;
     std::unique_ptr<UdpConnection> server;
     TaskScope scope;
-    bool client_ready = false;
-    scope.spawn(accept_only(std::move(server_socket), server_options, server, client_ready));
-    scope.spawn(connect_only(loop, client_options, client, client_ready));
+    bool client_ready = false, server_ready = false;
+    scope.spawn(accept_only(std::move(server_socket), server_options, server, client_ready, server_ready));
+    scope.spawn(connect_only(loop, client_options, client, client_ready, server_ready));
     co_await scope.join();
     TaskScope drain;
     drain.spawn(drain_input(*client));
@@ -328,6 +548,66 @@ Task<void> fixed_peer(EventLoop& loop, const char* certificate, const char* key,
     auto leaked = co_await stranger.receive_from(packet, {.deadline = Clock::now() + 30ms});
     check(!leaked && leaked.error() == Errc::timed_out,
           "stranger must not receive QUIC output after a forged source datagram");
+}
+
+Task<void> buffered_reads_and_queue_limit(EventLoop& loop, const char* certificate, const char* key) {
+    auto socket = require(transport::udp::Socket::bind(loop, Endpoint::loopback(0)));
+    quic::Options co, so;
+    co.local = Endpoint::loopback(0); co.remote = require(socket.local_endpoint());
+    co.ca_file = certificate; co.peer_name = "localhost";
+    so.certificate_file = certificate; so.private_key_file = key;
+    std::unique_ptr<UdpConnection> client, server;
+    bool ready = false, server_ready = false;
+    TaskScope scope;
+    scope.spawn(accept_only(std::move(socket), so, server, ready, server_ready));
+    scope.spawn(connect_only(loop, co, client, ready, server_ready));
+    co_await scope.join();
+    const auto id = require(client->open_stream());
+    const quic::Bytes request(1, std::byte{'q'}), reply(3, std::byte{'r'});
+    require(co_await client->write(id, request, true));
+    const auto request_chunk = require(co_await server->read(id, {.deadline = Clock::now() + 2s}));
+    require(server->consume(id, request_chunk.data.size()));
+    require(co_await server->write(id, reply, true));
+    TaskScope settle;
+    settle.spawn(drain_input(*client)); settle.spawn(drain_input(*server));
+    co_await settle.join();
+    std::stop_source stopped; stopped.request_stop();
+    auto cancelled = co_await client->read(id, {.stop = stopped.get_token()});
+    check(!cancelled && cancelled.error() == Errc::cancelled, "buffered read ignored cancellation");
+    auto expired = co_await client->read(id, {.deadline = Clock::now() - 1ms});
+    check(!expired && expired.error() == Errc::timed_out, "buffered read ignored expired deadline");
+    const auto chunk = require(co_await client->read(id, {.deadline = Clock::now() + 10ms}));
+    check(chunk.data == reply && chunk.fin, "ACK or failed flush lost already-buffered data");
+    require(client->consume(id, chunk.data.size()));
+
+    // Empty FIN streams consume no byte budget; their unread terminal records
+    // still have to hit the adapter's connection-wide event budget.
+    bool overflow = false;
+    int opened = 0;
+    for (int n = 0; n < 10000 && !overflow && opened < 4097; ++n) {
+        auto stream = client->open_stream(true);
+        if (stream) {
+            ++opened;
+            require(co_await client->write(*stream, {}, true));
+        }
+        auto received = co_await server->pump({.deadline = Clock::now() + 2ms});
+        if (!received) {
+            if (received.error() == Errc::limit_exceeded) { overflow = true; break; }
+            check(received.error() == Errc::timed_out, "empty-stream churn receive failed");
+        }
+        auto acknowledged = co_await client->pump({.deadline = Clock::now() + 2ms});
+        if (!acknowledged) check(acknowledged.error() == Errc::timed_out, "empty-stream churn ACK failed");
+    }
+    if (!overflow || !server->closed())
+        throw std::runtime_error("empty FIN churn bypassed raw Connection event budget, streams=" + std::to_string(opened));
+    const auto terminal = co_await server->read(2);
+    check(!terminal && terminal.error() == Errc::limit_exceeded, "raw queue overflow did not stay terminal");
+    const auto new_stream = server->open_stream();
+    check(!new_stream && new_stream.error() == Errc::limit_exceeded,
+          "terminal raw queue overflow admitted another stream");
+    const auto new_write = co_await server->write(1, reply, true);
+    check(!new_write && new_write.error() == Errc::limit_exceeded,
+          "terminal raw queue overflow did not reject writes before engine mutation");
 }
 
 Task<void> migration_udp(EventLoop& loop, const char* certificate, const char* key, bool active) {
@@ -433,8 +713,39 @@ Task<void> migration_udp(EventLoop& loop, const char* certificate, const char* k
     require(listener.ingest(bad.peer, {buffer.data(), bad.size}, quic::detail::now_ns()));
     check(server->validated_path().remote == new_address && !server->closed(),
           "forged CID source poisoned validated connection");
+    // A -> B -> A can reuse ngtcp2's validated-path history without another
+    // success callback. Both the engine view and listener close route must
+    // still follow the active authenticated path.
+    if (active) require(client.initiate_migration({old_address, server_address}, quic::detail::now_ns()));
+    else rebound = false;
+    const auto returned = require(client.open_stream());
+    require(client.write(returned, payload, true));
+    total = 0;
+    fin = false;
+    for (int n = 0; n < 5000; ++n) {
+        co_await round();
+        for (auto& event : server->take_events()) {
+            if (event.kind != quic::Event::Kind::data || event.stream_id != returned) continue;
+            total += event.data.size();
+            fin |= event.fin;
+            require(server->consume(event.stream_id, event.data.size()));
+        }
+        if (fin && server->validated_path().remote == old_address &&
+            (!active || client.validated_path().local == old_address)) break;
+    }
+    if (total != payload.size() || !fin || server->validated_path().remote != old_address)
+        throw std::runtime_error("historical path failed: active=" + std::to_string(active) +
+            " bytes=" + std::to_string(total) + " fin=" + std::to_string(fin) +
+            " server validated=" + std::to_string(server->validated_path().remote.port()) +
+            " server active=" + std::to_string(server->active_path().remote.port()) +
+            " server pending=" + std::to_string(server->path_validation_pending()) +
+            " client active=" + std::to_string(client.active_path().local.port()) +
+            " client validated=" + std::to_string(client.validated_path().local.port()) +
+            " old=" + std::to_string(old_address.port()) + " new=" + std::to_string(new_address.port()));
+    check(!active || client.validated_path().local == old_address,
+          "return to historical path left stale validated client endpoint");
     auto close = require(listener.close(id, 0, quic::detail::now_ns()));
-    check(close.peer == new_address && listener.tombstone_count() == 1,
+    check(close.peer == old_address && !close.data.empty() && listener.tombstone_count() == 1,
           "migrated closing lost validated peer or tombstone");
     auto discarded = require(listener.ingest(attacker_address, forged, quic::detail::now_ns()));
     check(discarded.kind == quic::Listener::Ingest::Kind::dropped,
@@ -451,13 +762,26 @@ int main(int argc, char** argv) {
     if (argc < 3) return 2;
     auto loop = EventLoop::create();
     if (!loop) return 2;
+    const char* phase = "active migration and return";
     try {
         static_cast<void>(loop->run_until_complete(migration_udp(*loop, argv[1], argv[2], true)));
+        phase = "NAT rebinding and return";
         static_cast<void>(loop->run_until_complete(migration_udp(*loop, argv[1], argv[2], false)));
+        phase = "200KB bidirectional transfer";
         static_cast<void>(loop->run_until_complete(run(*loop, argv[1], argv[2])));
+        phase = "buffered reads and empty-stream event budget";
+        static_cast<void>(loop->run_until_complete(buffered_reads_and_queue_limit(*loop, argv[1], argv[2])));
+        phase = "failed sends and delayed scheduling";
+        static_cast<void>(loop->run_until_complete(failed_send_recovery(*loop, argv[1], argv[2])));
+        phase = "lost final client handshake flight";
+        static_cast<void>(loop->run_until_complete(lost_client_handshake(*loop, argv[1], argv[2])));
+        phase = "silent peer deadline";
         static_cast<void>(loop->run_until_complete(silent_peer_budget(*loop, argv[1])));
+        phase = "expired engine timers";
         static_cast<void>(loop->run_until_complete(expired_engine_timer(*loop, argv[1])));
+        phase = "fixed server peer";
         static_cast<void>(loop->run_until_complete(fixed_peer(*loop, argv[1], argv[2], true)));
+        phase = "fixed client peer";
         static_cast<void>(loop->run_until_complete(fixed_peer(*loop, argv[1], argv[2], false)));
 
         // Outside any coroutine it is legal to drive the loop again; if the
@@ -471,7 +795,7 @@ int main(int argc, char** argv) {
         std::cout << "QUIC over UDP loopback: handshake, 200KB streams, flow control, close, caller budget, expired timers, and fixed peers passed\n";
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
+        std::cerr << phase << ": " << error.what() << '\n';
         return 1;
     }
 }

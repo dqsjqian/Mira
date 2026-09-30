@@ -11,16 +11,21 @@ import threading
 
 
 def certificates(directory, openssl):
+    # install_sw and relocatable OpenSSL builds need not ship openssl.cnf.
+    config = directory / "openssl.cnf"
+    config.write_text("[req]\ndistinguished_name=dn\n[dn]\n", encoding="ascii")
     def run(*arguments):
         subprocess.run([openssl, *arguments], cwd=directory, check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     for name in ("ca", "unrelated"):
-        run("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+        run("req", "-config", str(config), "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+            "-pkeyopt", "ec_param_enc:named_curve",
             "-nodes", "-keyout", f"{name}.key", "-out", f"{name}.pem", "-days", "1",
             "-subj", f"/CN=Mira {name}", "-addext", "basicConstraints=critical,CA:TRUE",
             "-addext", "keyUsage=critical,keyCertSign,cRLSign")
-    run("req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+    run("req", "-config", str(config), "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+        "-pkeyopt", "ec_param_enc:named_curve",
         "-nodes", "-keyout", "server.key", "-out", "server.csr", "-subj", "/CN=localhost")
     extension = directory / "server.ext"
     extension.write_text("basicConstraints=critical,CA:FALSE\n"

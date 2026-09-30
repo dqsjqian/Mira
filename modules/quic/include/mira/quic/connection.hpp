@@ -60,7 +60,10 @@ public:
     Connection& operator=(const Connection&) = delete;
 
     /// Client: bind the transport locally and drive the handshake to
-    /// completion (or the first failure). `options.remote` is the server.
+    /// local cryptographic completion (or the first failure). `options.remote`
+    /// is the server. The peer may still be waiting for our final flight;
+    /// keep driving I/O or pump() so pacing and retransmission can finish it.
+    /// Returning here does not imply peer-confirmed handshake completion.
     [[nodiscard]] static Task<Result<Connection>>
     connect(EventLoop& loop, Options options, OperationOptions io = {}) {
         auto bound = Transport::bind(loop, options.local);
@@ -116,6 +119,7 @@ public:
     write(std::int64_t stream, std::span<const std::byte> bytes, bool fin,
           OperationOptions io = {}) {
         if (!engine_) co_return fail(Errc::invalid_argument);
+        if (buffer_error_) co_return fail(buffer_error_);
         auto written = engine_->write(stream, bytes, fin);
         if (!written) co_return fail(written.error());
         auto flushed = co_await flush(io);
@@ -126,6 +130,7 @@ public:
     /// Open a stream (client: bidi or uni).
     [[nodiscard]] Result<std::int64_t> open_stream(bool unidirectional = false) {
         if (!engine_) return fail(Errc::invalid_argument);
+        if (buffer_error_) return fail(buffer_error_);
         return engine_->open_stream(unidirectional);
     }
 
@@ -137,13 +142,11 @@ public:
         pumping_ = true;
         const PumpGuard guard{pumping_};
         for (;;) {
-            if (auto chunk = take_chunk(stream); chunk) {
-                // Flush before returning: ngtcp2 may hold a pending ACK or a
-                // flow-control update from the caller's consume(). Holding it
-                // until the next pump stalls the peer for a full deadline.
+            if (auto collected = collect_events(); !collected) co_return fail(collected.error());
+            if (buffers_.contains(stream)) {
                 auto flushed = co_await flush(io);
                 if (!flushed) co_return fail(flushed.error());
-                co_return std::move(*chunk);
+                co_return std::move(*take_chunk(stream));
             }
             auto round = co_await do_pump(io);
             if (!round) co_return fail(round.error());
@@ -185,7 +188,7 @@ public:
     [[nodiscard]] std::string negotiated_protocol() const {
         return engine_ ? engine_->negotiated_protocol() : std::string{};
     }
-    [[nodiscard]] bool closed() const noexcept { return !engine_ || engine_->closed(); }
+    [[nodiscard]] bool closed() const noexcept { return !engine_ || buffer_error_ || engine_->closed(); }
     [[nodiscard]] const Transport* transport() const noexcept { return transport_.get(); }
 
 private:
@@ -204,7 +207,7 @@ private:
         auto it = buffers_.find(stream);
         if (it == buffers_.end() || it->second.empty()) return std::nullopt;
         StreamChunk chunk;
-        const Event& front = it->second.front();
+        Event& front = it->second.front();
         if (front.kind == Event::Kind::data) {
             chunk.data = std::move(front.data);
             chunk.fin = front.fin;
@@ -219,16 +222,16 @@ private:
             chunk.fin = true;
             it->second.pop_front();
             if (it->second.empty()) buffers_.erase(it);
-        } else {
-            it->second.pop_front();  // acknowledged: not interesting to readers
-            if (it->second.empty()) buffers_.erase(it);
-            return std::nullopt;
         }
+        --buffered_events_;
         return chunk;
     }
 
     /// Send everything the engine currently wants to send.
     Task<Result<void>> flush(OperationOptions io) {
+        if (buffer_error_) co_return fail(buffer_error_);
+        if (io.stop.stop_requested()) co_return fail(Errc::cancelled);
+        if (io.deadline && *io.deadline <= EventLoop::Clock::now()) co_return fail(Errc::timed_out);
         for (std::size_t round = 0; round < 64; ++round) {
             auto packet = engine_->poll_datagram(detail::now_ns());
             if (!packet) co_return fail(packet.error());
@@ -246,11 +249,12 @@ private:
     /// One round: flush output, then wait for the next datagram or the
     /// engine's next timer deadline, and feed whichever arrives.
     Task<Result<void>> do_pump(OperationOptions io) {
+        if (buffer_error_) co_return fail(buffer_error_);
         if (engine_->closed()) co_return fail(Errc::eof);
         auto flushed = co_await flush(io);
         if (!flushed) co_return fail(flushed.error());
 
-        collect_events();
+        if (auto collected = collect_events(); !collected) co_return fail(collected.error());
         if (io.stop.stop_requested()) co_return fail(Errc::cancelled);
         if (io.deadline && *io.deadline <= EventLoop::Clock::now()) {
             co_return fail(Errc::timed_out);
@@ -268,7 +272,7 @@ private:
                 auto handled = engine_->handle_expiry(now);
                 if (!handled) co_return fail(handled.error());
                 if (engine_->closed()) co_return fail(Errc::eof);
-                collect_events();
+                if (auto collected = collect_events(); !collected) co_return fail(collected.error());
                 co_return co_await flush(io);
             }
             const auto deadline =
@@ -292,7 +296,7 @@ private:
                     co_return fail(handled.error());
                 }
                 if (engine_->closed()) co_return fail(Errc::eof);
-                collect_events();
+                if (auto collected = collect_events(); !collected) co_return fail(collected.error());
                 auto after = co_await flush(io);
                 if (!after) co_return fail(after.error());
                 co_return Result<void>{};
@@ -306,18 +310,26 @@ private:
             !fed) {
             co_return fail(fed.error());
         }
-        collect_events();
+        if (auto collected = collect_events(); !collected) co_return fail(collected.error());
         auto out = co_await flush(io);
         if (!out) co_return fail(out.error());
         co_return Result<void>{};
     }
 
     /// Drain the engine's event queue into per-stream buffers.
-    void collect_events() {
+    Result<void> collect_events() {
+        if (buffer_error_) return fail(buffer_error_);
         for (auto& event : engine_->take_events()) {
+            if (event.kind == Event::Kind::acknowledged) continue;
+            if (buffered_events_ >= 4096) {
+                buffer_error_ = make_error_code(Errc::limit_exceeded);
+                return fail(buffer_error_);
+            }
             const std::int64_t id = event.stream_id;
             buffers_[id].push_back(std::move(event));
+            ++buffered_events_;
         }
+        return {};
     }
 
     /// pump rounds until `done` holds or the wait fails.
@@ -333,6 +345,8 @@ private:
     std::unique_ptr<Engine> engine_;
     transport::Endpoint local_{};
     std::map<std::int64_t, std::deque<Event>> buffers_;
+    std::size_t buffered_events_ = 0;
+    Error buffer_error_;
     bool pumping_ = false;
 };
 

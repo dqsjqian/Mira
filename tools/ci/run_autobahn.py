@@ -174,7 +174,7 @@ class Runtime:
                            stderr=subprocess.DEVNULL, timeout=20, check=False)
 
 
-def summarize(report, agent, expected):
+def summarize(report, agent, expected, *, fail_non_strict=False):
     rows = {}
     if report.is_file():
         rows = json.loads(report.read_text(encoding="utf-8")).get(agent, {})
@@ -188,7 +188,7 @@ def summarize(report, agent, expected):
     unexpected = sorted(set(rows) - set(expected), key=case_key)
     non_strict = sum("NON-STRICT" in (r.get("behavior"), r.get("behaviorClose")) for r in rows.values())
     informational = sum("INFORMATIONAL" in (r.get("behavior"), r.get("behaviorClose")) for r in rows.values())
-    passed = bool(rows) and not (failed or missing or unexpected)
+    passed = bool(rows) and not (failed or missing or unexpected or (fail_non_strict and non_strict))
     return {
         "expected_count": len(expected), "executed_count": len(rows),
         "behavior_counts": dict(collections.Counter(r.get("behavior") for r in rows.values())),
@@ -214,6 +214,8 @@ def main():
     parser.add_argument("--case-timeout", type=int, default=300)
     parser.add_argument("--cases", nargs="+", default=["*"], help="Diagnostic subset; the summary is marked partial")
     parser.add_argument("--compression", action="store_true", help="include RFC7692 compression cases 12.* and 13.*")
+    parser.add_argument("--fail-non-strict", action="store_true",
+                        help="fail on NON-STRICT behavior while retaining INFORMATIONAL cases")
     args = parser.parse_args()
     excluded_patterns = [] if args.compression else EXCLUDED.copy()
     if not 1 <= args.timeout <= 86400 or not 1 <= args.case_timeout <= 3600:
@@ -225,7 +227,8 @@ def main():
     summary = {"status": "blocked", "scope": "full" if args.cases == ["*"] else "partial",
                "suite": "official crossbario/autobahn-testsuite", "run_directory": str(run_dir),
                "case_patterns": args.cases, "accepted_behaviors": sorted(ACCEPTED),
-               "compression": args.compression, "excluded_patterns": excluded_patterns,
+               "compression": args.compression, "fail_non_strict": args.fail_non_strict,
+               "excluded_patterns": excluded_patterns,
                "excluded_reason": None if args.compression else "Compression cases require --compression",
                "excluded_count": None, "executed_count": 0, "failed_count": None,
                "non_strict_count": None, "informational_count": None, "strict_passed": False,
@@ -270,7 +273,8 @@ def main():
             summary["mira_server_exit"] = server.returncode
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             summary["errors"].append("server: " + str(exc))
-        summary["server"] = summarize(server_reports / "index.json", "Mira-server", expected)
+        summary["server"] = summarize(server_reports / "index.json", "Mira-server", expected,
+                                      fail_non_strict=args.fail_non_strict)
         write_json(output / "summary.json", summary)
 
         client_reports = run_dir / "clients"
@@ -287,7 +291,8 @@ def main():
                     summary["mira_client_exit"] = client.wait(timeout=args.timeout)
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             summary["errors"].append("client: " + str(exc))
-        summary["client"] = summarize(client_reports / "index.json", "Mira-client", expected)
+        summary["client"] = summarize(client_reports / "index.json", "Mira-client", expected,
+                                      fail_non_strict=args.fail_non_strict)
         for field in ("executed_count", "failed_count", "non_strict_count", "informational_count"):
             summary[field] = summary["server"][field] + summary["client"][field]
         success = (summary["server"]["passed"] and summary["client"]["passed"] and

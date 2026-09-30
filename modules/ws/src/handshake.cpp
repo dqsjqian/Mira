@@ -79,7 +79,7 @@ Result<Head> parse(std::string_view wire, Limits limits, bool request) {
         }
         auto key = lowercase(name);
         auto [it, inserted] = head.fields.emplace(key, content);
-        if (!inserted) {
+        if (!inserted && !(!request && key == "set-cookie")) {
             if (key != "connection" && key != "upgrade" &&
                 !(request && (key == "sec-websocket-protocol" || key == "sec-websocket-extensions")))
                 return fail(make_error_code(Errc::invalid_handshake));
@@ -487,7 +487,7 @@ Result<Head> connect_fields(std::span<const http::Header> fields, Limits limits,
                 return fail(make_error_code(Errc::invalid_handshake));
         }
         auto [it, inserted] = head.fields.emplace(field.name, field.value);
-        if (!inserted) {
+        if (!inserted && !(response && field.name == "set-cookie")) {
             if (response || (field.name != "sec-websocket-protocol" && field.name != "sec-websocket-extensions"))
                 return fail(make_error_code(Errc::invalid_handshake));
             it->second += ',';

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.21)
 
 project(Mira
     VERSION 0.5.0
@@ -331,7 +331,7 @@ if(MIRA_BUILD_EXAMPLES)
                         ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_h2_interop.py
                         $<TARGET_FILE:mira_h2_prior_knowledge_server>
                 )
-                set_tests_properties(mira_h2_interop PROPERTIES TIMEOUT 90)
+                set_tests_properties(mira_h2_interop PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
             endif()
             if(TARGET mira_h3_server)
                 add_test(NAME mira_h3_pair
@@ -366,6 +366,7 @@ if(MIRA_INSTALL)
     include(CMakePackageConfigHelpers)
 
     set(MIRA_CMAKE_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Mira)
+    install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/Mira)
 
     install(EXPORT miraTargets
         FILE miraTargets.cmake

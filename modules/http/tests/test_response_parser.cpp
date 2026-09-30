@@ -296,7 +296,11 @@ void test_request_serialization() {
                                              "[bad]",
                                              "[::1",
                                              "::1",
-                                             "[:::1]"};
+                                             "[:::1]",
+                                             "[::ffff:127.0.0.256]",
+                                             "[::ffff:127.00.0.1]",
+                                             "[::ffff:127.0.0]",
+                                             "[1:2:3:4:5:6::127.0.0.1]"};
     for (const auto& host : bad_hosts) {
         request.headers.clear();
         request.headers.append("Host", host);
@@ -304,7 +308,8 @@ void test_request_serialization() {
         CHECK_VALUE(!write_request_head(out, request));
         CHECK_VALUE(out.empty());
     }
-    for (const auto& host : {"localhost", "127.0.0.1", "[::1]:443", "[2001:db8::1]"}) {
+    for (const auto& host : {"localhost", "127.0.0.1", "[::1]:443", "[2001:db8::1]",
+                              "[::ffff:127.0.0.1]:443", "[1:2:3:4:5:6:127.0.0.1]"}) {
         request.headers.clear();
         request.headers.append("Host", host);
         out.clear();

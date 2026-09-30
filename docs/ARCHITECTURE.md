@@ -41,7 +41,7 @@ and remaining acceptance work must be described separately.
 | Transport and composition | Completion-shaped TCP/UDP/local streams; `DatagramTransport` conformance assertions; bounded family-interleaved `tcp::dial`; separately composed HTTP/HTTPS client pools and grace-draining TCP serving | Maintain backend-specific teardown evidence; DNS is bounded system getaddrinfo, not independent asynchronous A/AAAA resolution |
 | Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered and streaming request bodies (`RequestBodyReader`), chunked trailers, connection-loop drain guarantees; request- and response-parser fuzzing in CI; curl interop exercised out-of-process against the example servers — HTTP/1.1 against the file server, real-nghttp2 HTTP/2 (prior knowledge, including concurrent streams) against `examples/h2_prior_knowledge_server`, native-QUIC HTTP/3 (ngtcp2 + nghttp3) against `examples/h3_server`; HTTP/1 `Expect: 100-continue` and duplex early responses; SOCKS5 against curl and independent Python peers; DoH against curl and Python peers; MQTT 3.1.1/5.0 against an independent Python broker and mosquitto | Protocol conformance evidence, slow-consumer backpressure bounds and bounded aggregate memory measurements |
 | Security and robustness | Duplex TLS with terminal cancellation, bounded parsers, shared accounting budgets, HTTP/WS/SOCKS/DNS/MQTT fuzzing, opt-in validated QUIC paths, explicit replay-safe raw-QUIC early data and HTTP/3 0-RTT with SETTINGS-bound ticket domains and automatic 425 for unsafe early requests | No complete anti-replay or process-RSS guarantee; longer exhaustion tests and mobile TLS runtime evidence remain open |
-| Engineering evidence | `d3424f0` desktop CI and full compression-inclusive Autobahn reports; snapshot-scoped sanitizer suites, real-network H2/H3 CONNECT tests and a 600-second H3 loopback soak | Local final Release/GCC/ASan+UBSan each passed 85/85; new Windows H3/MinGW entry points await execution, iOS lacks signed device evidence, Android devices and multi-host/WAN remain unverified; no stable ABI promise |
+| Engineering evidence | `d3424f0` desktop CI and full compression-inclusive Autobahn reports; snapshot-scoped sanitizer suites, real-network H2/H3 CONNECT tests and a 600-second H3 loopback soak | The historical 2026-09-28 Release/GCC/ASan+UBSan suites each passed 85/85, not a result for current source; new Windows H3/MinGW entry points await execution, iOS lacks signed device evidence, Android devices and multi-host/WAN remain unverified; no stable ABI promise |
 
 Rejecting ambiguous or malformed input is part of protocol correctness, not a
 substitute for the other contracts. The HTTP parser rejects conflicting
@@ -259,7 +259,7 @@ cross-thread scheduler or a complete server-launch facility.
   Join rethrows it only after every child has finished and released its frame;
   siblings are not abandoned when the first child fails. `Result` failures are
   values, not exceptions: a `Task<void>` adapter must handle them explicitly,
-  for example by throwing `std::system_error`, as in the README example.
+  for example by throwing `std::system_error`.
 - `get_stop_token()` / `request_stop()` expose a `std::stop_token` signal.
   Children may inspect it or register callbacks, but pending I/O is not
   automatically cancelled and there is no deadline propagation. Requesting stop
@@ -462,8 +462,13 @@ A/AAAA DNS. Cancelling the wait cannot interrupt a system call already entered.
 HTTP/1 `ClientConnection::begin` sends the head, `send_body` borrows one chunk
 until sent, and `finish` completes framing then reads the final response head.
 Content-length and chunked uploads do not collect the whole body; size/framing
-errors invalidate reuse. The exchange budget covers producer pauses, upload
-and response without reset. That trio is send-first: it reads nothing until
+errors invalidate reuse. One absolute exchange budget covers upload and response
+without reset, so time spent in a producer consumes that budget. Prefer
+`source(OperationOptions)` and pass its options to asynchronous waits; legacy
+zero-argument sources must arrange their own cooperative cancellation. Server
+handlers can accept the extra OperationOptions argument or obtain it from
+`writer.operation_options()`. Arbitrary user code that ignores those options
+cannot be safely forced to stop. That trio is send-first: it reads nothing until
 the body is sent.
 
 `ClientConnection::exchange` is the duplex form. It writes the head, then pulls
@@ -481,7 +486,7 @@ cancels the reader; `skipped`/`interrupted` forbid reuse, and the response body
 is read after the upload. On the server, `serve_connection` answers
 `100-continue` eagerly for buffered handlers and on the first body read for
 streaming ones, closes rather than draining a refused body, and answers unknown
-expectations with 417. Request trailers remain unsupported and no business
+expectations with 417. The client upload API does not emit request trailers and no business
 request is automatically retried.
 
 `client::HttpClient` / `HttpsClient` own resolver/dial/pool composition above
@@ -636,14 +641,22 @@ flows, packet-identifier allocation, the server's CONNACK limits (Receive
 Maximum, Maximum Packet Size, Maximum QoS, Retain/Wildcard/Shared/Subscription
 Identifier availability, Server Keep Alive, Assigned Client Identifier),
 inbound topic aliases, keep-alive with PINGRESP supervision, enhanced AUTH
-exchange, and resumption that resends unacknowledged PUBLISH (DUP) and PUBREL
-in original order or reports them `discarded`. Nothing is queued invisibly:
+exchange, and resumption that resends unacknowledged PUBLISH (DUP) in original
+order or reports them `discarded`. Replay observes the new connection's packet
+size and Receive Maximum; PUBREL controls can pass quota-blocked PUBLISH packets.
+Oversized retained packets fail the new connection instead of violating its
+negotiated maximum. Nothing is queued invisibly:
 the server's Receive Maximum, identifier exhaustion and the output bound return
 `would_block`; peer violations close the session with a 5.0 DISCONNECT reason.
 `Client<Stream>` borrows a caller-owned stream and follows the duplex stream
 contract: one reader (`receive` / `wait_for`) beside serialized writers, with
 `keep_alive(loop)` as a timer-driven writer, so keep-alive never depends on
-read deadlines that would poison a TLS session. Received QoS 1 messages are
+read deadlines that would poison a TLS session. Client and Session share the
+event bound, including reconnect abandonment notices. `connect` accepts an
+asynchronous authentication callback `(const Event&, OperationOptions)` so
+initial AUTH challenges can be answered before CONNACK; the method must match
+CONNECT throughout, and callback waits should honor the operation options.
+Received QoS 1 messages are
 acknowledged when surfaced. Out of scope: a broker, MQTT over WebSocket,
 outbound topic aliases, persistent session storage and reconnect policy.
 
