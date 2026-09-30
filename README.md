@@ -21,7 +21,7 @@
 
 **完成式 I/O 一个接口打通 kqueue / epoll / IOCP；从 TCP 到 HTTP/3，验证按提交与配置记录。C++23 是基线，不是卖点 —— 协程、`std::expected`、`stop_token` 都是一等公民。**
 
-本页描述当前 `main` 开发主线，不是已发布 v0.4.0 的能力清单；历史 CI、专项测试与当前源码的完整矩阵验收必须分开看。
+本页描述所在提交的能力。源码版本、兼容策略和发布包消费方式统一见[版本与发布指南](docs/RELEASES.md)；历史 CI 与当前提交的验收结果分别记录。
 
 ## 🚀 30 秒看懂 Mira
 
@@ -297,28 +297,21 @@ ctest --test-dir build/protocols --output-on-failure
 
 ### 📦 在自己的项目中使用
 
-**版本边界：本页描述 `main` 开发分支；下列发布档示例固定为 v0.4.0，并不包含后续未发布能力。** 使用主线 API 时应固定经过验证的完整提交；不要把主线验证结果视为旧发布档的功能清单。
+版本来源、兼容策略及带 SHA256 校验的源码包消费示例统一见[版本与发布指南](docs/RELEASES.md)。选择 Release 时请阅读对应 tag 下的文档。
 
-推荐与 Aria、AriaAgent 相同的**哈希钉定发布档**方式：每个版本的源码包随 GitHub Release 发布，取回、校验 SHA256、再 `add_subdirectory`，配置期不引入任何子模块或 vendored 目录：
+已校验并解压的源码可直接加入构建：
 
 ```cmake
-include(ariaFetchPinned)  # 或你自己仓库里的等价「下载 + SHA256 校验」原语
-aria_fetch_pinned_archive(
-    NAME      Mira
-    VERSION   0.4.0
-    URL       "https://github.com/dqsjqian/Mira/releases/download/v0.4.0/Mira-0.4.0.tar.gz"
-    SHA256    3290abda456d4897103f160e0905d09c5b29dfc973ec15024b8f76ce705dd856
-)
 set(MIRA_BUILD_TESTS OFF)
 set(MIRA_BUILD_EXAMPLES OFF)
-add_subdirectory(${ARIA_PINNED_MIRA_SOURCE_DIR} Mira)
+add_subdirectory(vendor/Mira)
 target_link_libraries(my_app PRIVATE Mira::transport Mira::http)
 # TLS：同时 set(MIRA_ENABLE_TLS ON) 并额外链接 Mira::tls
 ```
 
-本地开发也可以直接指向源码树：`add_subdirectory(vendor/Mira)`（子目录模式下 `MIRA_BUILD_TESTS` 默认关闭）。安装消费则用 `find_package(Mira REQUIRED COMPONENTS core transport http)`，需要 TLS 时加 `tls` 组件。
+安装消费使用 `find_package(Mira REQUIRED COMPONENTS core transport http)`，需要 TLS 时加 `tls` 组件；精确版本由消费方的依赖锁定文件指定，见统一指南。
 
-仅主线的拥有式客户端组合使用 `find_package(Mira REQUIRED COMPONENTS client)` / `Mira::client`；HTTPS 使用 `client_tls` / `Mira::client_tls`，构建时需 `MIRA_ENABLE_TLS=ON`。基础 `client` 不引入 OpenSSL；`http` 本身仍不依赖 transport。主线协议组件 `socks`、`dns`、`mqtt` 对应 `Mira::socks` / `Mira::dns` / `Mira::mqtt`，均不引入 OpenSSL，TLS 由调用方组合。不要把这些目标套用到上述 v0.4.0 发布档。
+拥有式客户端组合使用 `find_package(Mira REQUIRED COMPONENTS client)` / `Mira::client`；HTTPS 使用 `client_tls` / `Mira::client_tls`，构建时需 `MIRA_ENABLE_TLS=ON`。基础 `client` 不引入 OpenSSL；`http` 本身仍不依赖 transport。协议组件 `socks`、`dns`、`mqtt` 对应 `Mira::socks` / `Mira::dns` / `Mira::mqtt`，均不引入 OpenSSL，TLS 由调用方组合。
 
 Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` 门控关闭了；NDK 29（clang 21）在 API 24 上实测可构建。
 

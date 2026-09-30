@@ -667,9 +667,9 @@ Task<void> audit_callback_and_write_failures(EventLoop& loop) {
         FaultStream stream{loop};
         ClientConnection client{stream};
         auto source = [throw_before_task]() -> Task<Result<std::span<const std::byte>>> {
+            co_await std::suspend_never{};
             if (throw_before_task) throw std::bad_alloc{};
             throw std::runtime_error("source fault");
-            co_return std::span<const std::byte>{};
         };
         bool caught = false;
         try { static_cast<void>(co_await client.exchange(loop, post(), Framing::content_length, 5, source)); }

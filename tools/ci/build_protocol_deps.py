@@ -196,8 +196,6 @@ def main() -> None:
     common = [f"-DCMAKE_INSTALL_PREFIX={prefix}", "-DCMAKE_INSTALL_LIBDIR=lib",
               f"-DCMAKE_BUILD_TYPE={args.config}", f"-DCMAKE_TRY_COMPILE_CONFIGURATION={args.config}",
               "-DCMAKE_POSITION_INDEPENDENT_CODE=ON", "-DENABLE_LIB_ONLY=ON", "-DBUILD_TESTING=OFF"]
-    if openssl:
-        common.append(f"-DOPENSSL_ROOT_DIR={openssl}")
     if toolchain:
         common.append(f"-DCMAKE_TOOLCHAIN_FILE={toolchain.as_posix()}")
     if sys.platform == "win32":
@@ -214,6 +212,9 @@ def main() -> None:
             options = (["-DBUILD_SHARED_LIBS=OFF", "-DBUILD_STATIC_LIBS=ON",
                         "-DENABLE_DOC=OFF", "-DENABLE_FAILMALLOC=OFF"] if name == "nghttp2"
                        else ["-DENABLE_SHARED_LIB=OFF", "-DENABLE_STATIC_LIB=ON"])
+            # nghttp3 is the framing library and does not search for TLS.
+            if openssl and name != "nghttp3":
+                options.append(f"-DOPENSSL_ROOT_DIR={openssl}")
             if name == "ngtcp2":
                 options += ["-DENABLE_OPENSSL=ON", "-DENABLE_GNUTLS=OFF",
                             "-DENABLE_BORINGSSL=OFF", "-DENABLE_PICOTLS=OFF",

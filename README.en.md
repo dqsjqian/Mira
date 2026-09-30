@@ -21,7 +21,7 @@ One completion-shaped I/O API across kqueue, epoll, and IOCP — so protocols ne
 
 **One completion-shaped I/O API across kqueue / epoll / IOCP; TCP-to-HTTP/3 evidence recorded by revision and configuration. C++23 is the baseline, not the selling point — coroutines, `std::expected`, and `stop_token` are first-class citizens.**
 
-This page describes the current `main` development tree, not the published v0.4.0 feature set. Historical CI, targeted tests and full-matrix acceptance of the current source are separate evidence.
+This page describes its source revision. The [version and release guide](docs/RELEASES.md) is the shared reference for the source version, compatibility policy and release consumption. Historical CI and current-revision acceptance are recorded separately.
 
 ## 🚀 Mira in 30 seconds
 
@@ -305,28 +305,21 @@ The final command creates a local demonstration certificate only. The client ver
 
 ### 📦 Using it in your project
 
-**Version boundary: this page describes the `main` development branch; the archive example below pins v0.4.0 and does not include later unreleased capabilities.** Pin a verified full commit when consuming main-only APIs. Main-branch verification is not a feature list for an older release archive.
+The [version and release guide](docs/RELEASES.md) centralizes version policy and the SHA256-pinned archive example. Read documentation at the selected release tag.
 
-The recommended pattern — the one Aria and AriaAgent use — is a **hash-pinned release archive**: every version ships a source tarball on GitHub Releases; download it, verify its SHA256, then `add_subdirectory` it. No submodules, no vendored trees, no configure-time network beyond the pinned fetch:
+Add an already verified and extracted source tree to your build:
 
 ```cmake
-include(ariaFetchPinned)  # or your repo's equivalent download + SHA256 primitive
-aria_fetch_pinned_archive(
-    NAME      Mira
-    VERSION   0.4.0
-    URL       "https://github.com/dqsjqian/Mira/releases/download/v0.4.0/Mira-0.4.0.tar.gz"
-    SHA256    3290abda456d4897103f160e0905d09c5b29dfc973ec15024b8f76ce705dd856
-)
 set(MIRA_BUILD_TESTS OFF)
 set(MIRA_BUILD_EXAMPLES OFF)
-add_subdirectory(${ARIA_PINNED_MIRA_SOURCE_DIR} Mira)
+add_subdirectory(vendor/Mira)
 target_link_libraries(my_app PRIVATE Mira::transport Mira::http)
-# TLS: also set(MIRA_ENABLE_TLS ON) and additionally link Mira::tls
+# TLS: also set(MIRA_ENABLE_TLS ON) and link Mira::tls
 ```
 
-For local development, pointing at a source tree works too: `add_subdirectory(vendor/Mira)` (`MIRA_BUILD_TESTS` defaults off in subdirectory mode). Installed consumption uses `find_package(Mira REQUIRED COMPONENTS core transport http)`, add the `tls` component when needed.
+Installed consumers use `find_package(Mira REQUIRED COMPONENTS core transport http)`; add the `tls` component for TLS. Keep the exact dependency version in the consuming application's lock file, as described in the shared guide.
 
-Main-only owning-client composition uses `find_package(Mira REQUIRED COMPONENTS client)` / `Mira::client`; HTTPS uses `client_tls` / `Mira::client_tls` and requires `MIRA_ENABLE_TLS=ON` when building. The base `client` target does not introduce OpenSSL; `http` itself still does not depend on transport. The main-line protocol components `socks`, `dns` and `mqtt` map to `Mira::socks` / `Mira::dns` / `Mira::mqtt`; none introduces OpenSSL, and TLS is composed by the caller. These targets do not apply to the v0.4.0 archive above.
+Owning-client composition uses `find_package(Mira REQUIRED COMPONENTS client)` / `Mira::client`; HTTPS uses `client_tls` / `Mira::client_tls` and requires `MIRA_ENABLE_TLS=ON` when building. The base `client` target does not introduce OpenSSL; `http` itself still does not depend on transport. Protocol components `socks`, `dns` and `mqtt` map to `Mira::socks`, `Mira::dns` and `Mira::mqtt`; none introduces OpenSSL, and TLS is composed by the caller.
 
 Android requires **NDK 29 or newer**: NDK 27/28's libc++ gates `std::stop_token` off; NDK 29 (clang 21) builds on API 24 as tested.
 

@@ -5,7 +5,6 @@
 extern "C" int mira_device_smoke();
 
 @interface MiraSmokeDelegate : UIResponder <UIApplicationDelegate>
-@property(nonatomic, strong) UIWindow* window;
 @end
 
 @implementation MiraSmokeDelegate
@@ -13,7 +12,21 @@ extern "C" int mira_device_smoke();
     didFinishLaunchingWithOptions:(NSDictionary*)options {
     static_cast<void>(application);
     static_cast<void>(options);
-    self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    return YES;
+}
+@end
+
+@interface MiraSmokeSceneDelegate : UIResponder <UIWindowSceneDelegate>
+@property(nonatomic, strong) UIWindow* window;
+@end
+
+@implementation MiraSmokeSceneDelegate
+- (void)scene:(UIScene*)scene willConnectToSession:(UISceneSession*)session
+    options:(UISceneConnectionOptions*)options {
+    static_cast<void>(session);
+    static_cast<void>(options);
+    if (![scene isKindOfClass:UIWindowScene.class]) return;
+    self.window = [[UIWindow alloc] initWithWindowScene:static_cast<UIWindowScene*>(scene)];
     UIViewController* controller = [[UIViewController alloc] init];
     controller.view.backgroundColor = UIColor.systemBackgroundColor;
     UILabel* label = [[UILabel alloc] initWithFrame:controller.view.bounds];
@@ -35,7 +48,6 @@ extern "C" int mira_device_smoke();
         std::fflush(nullptr);
         std::exit(result);
     });
-    return YES;
 }
 @end
 

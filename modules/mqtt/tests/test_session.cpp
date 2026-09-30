@@ -422,7 +422,7 @@ void resume_reduced_limits() {
     CHECK(session.connect(1).has_value());
     broker.take(session);
     Connack ack{true, reason::success, {}};
-    ack.properties.receive_maximum = 1;
+    ack.properties.receive_maximum = std::uint16_t{1};
     CHECK(broker.send(session, ack).has_value());
     static_cast<void>(session.take_events());
     for (const auto id : ids) {
@@ -532,7 +532,7 @@ void replay_controls_bypass_publish_quota() {
     CHECK(session.connect(1).has_value());
     broker.take(session);
     Connack resumed{true, reason::success, {}};
-    resumed.properties.receive_maximum = 1;
+    resumed.properties.receive_maximum = std::uint16_t{1};
     CHECK(broker.send(session, resumed).has_value());
     auto wire = broker.take(session);
     CHECK(wire.size() == 2);

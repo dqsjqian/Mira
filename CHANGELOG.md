@@ -1,15 +1,14 @@
 # Changelog
 
-Mira follows [semantic versioning](https://semver.org). While the major
-version is 0, the minor version is where breaking changes land: a request for
-0.3 is not satisfied by 0.2, which the package-config version file encodes as
-`SameMinorVersion`.
+Version source, compatibility policy and consumption instructions are maintained
+in the [release guide](docs/RELEASES.md). Version headings below are historical
+records; they are not additional definitions of the current build version.
 
-## [Unreleased]
+## [1.0.0] — 2026-09-30
 
-These entries describe the `main` development tree, not the published v0.4.0
-archive used by the consumption examples. The existing 0.5.0 entry below is
-retained development history, not a release announcement for this work.
+This release includes the development work recorded below and the
+[September audit repairs](docs/AUDIT-2026-09-30.md). The earlier development
+milestone entry is retained as history, not a separately published release.
 
 ### Added
 
@@ -124,6 +123,17 @@ retained development history, not a release announcement for this work.
 
 ### Fixed
 
+- Structured task retirement and event-loop shutdown now protect coroutine and
+  continuation lifetimes during cancellation, reentrancy and allocation failure.
+- HTTP uploads, DoH and MQTT preserve terminal failures and release response or
+  stream ownership safely. DoH accounts for HTTP cache age in DNS TTLs.
+- Protocol parsers, event queues and buffers enforce limits before allocation;
+  WebSocket terminal handling and QUIC/H3 handshake test driving are corrected.
+- Installed versions derive from CMake, with major-version source compatibility
+  and exact-version/header consistency checks. CI test fixtures compile cleanly
+  with MSVC's warnings-as-errors policy.
+
+
 - QUIC session tickets now bind the actually loaded CA trust material, including
   X509 AUX trusted/rejected purposes and CRLs, instead of relying on a file path.
   Same-path CA replacement no longer restores an old session or enables 0-RTT.
@@ -142,6 +152,9 @@ retained development history, not a release announcement for this work.
 
 ### Verification boundaries
 
+- Audit validation and its limits are recorded in the [audit](docs/AUDIT-2026-09-30.md).
+  The following measurements are historical development baselines. Release CI
+  and archive checksums are linked from the published Release.
 - Final 2026-09-28 source including trust-bound ticket caching: local AppleClang
   Release, GCC and ASan+UBSan each passed 85/85; installed-consumer and dependency
   isolation checks passed. macOS LeakSanitizer was not run. Remote `d3424f0` CI
@@ -159,7 +172,7 @@ retained development history, not a release announcement for this work.
   device execution lacks a signing profile. Android device runs and multi-host
   validation have no evidence.
 
-## [0.5.0] — 2026-09-28
+## [0.5.0] — 2026-09-28 (development milestone)
 
 ### Added
 

@@ -14,11 +14,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Keep the validated Linux toolchain stable when ubuntu-latest changes its OS.
   # Architectural invariants first: cheap, and they fail loudest.
   discipline:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Layering, framework-independence, platform-fencing
         run: python3 tools/ci/check_layering.py
       - name: Verification runner invariants
@@ -43,13 +44,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  std: 23, backend: epoll }
+          - { os: ubuntu-24.04,  std: 23, backend: epoll }
           # Linux clang is a separate matrix entry: clang-18's __cpp_concepts
           # stays at 201907L, which makes libstdc++ hide std::expected behind
           # its feature-test gate even in C++23 mode. clang-19 is the first
           # release where the concepts macro matches the language mode, so it
           # is the oldest clang this library promises on Linux.
-          - { os: ubuntu-latest,  std: 23, backend: epoll-clang, cc: clang-19, cxx: clang++-19 }
+          - { os: ubuntu-24.04,  std: 23, backend: epoll-clang, cc: clang-19, cxx: clang++-19 }
           - { os: macos-latest,   std: 23, backend: kqueue }
           - { os: windows-latest, std: 23, backend: iocp }
     name: ${{ matrix.backend }} / c++${{ matrix.std }}
@@ -57,12 +58,12 @@ jobs:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install clang
         if: matrix.cxx
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.cc }}
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=${{ matrix.std }}
+        run: cmake -S . -B build ${{ runner.os == 'Windows' && '-DCMAKE_CONFIGURATION_TYPES=Debug' || '-DCMAKE_BUILD_TYPE=Debug' }} -DCMAKE_CXX_STANDARD=${{ matrix.std }}
       - name: Build
         run: cmake --build build --parallel --config Debug
       - name: Test
@@ -77,10 +78,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
         std: [23]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install OpenSSL on Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
@@ -118,7 +119,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "$env:GITHUB_WORKSPACE/build/interop-curl/prefix/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Configure TLS
-        run: cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=${{ matrix.std }} -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON ${{ env.MIRA_PLATFORM_PROTOCOL_FLAGS }}
+        run: cmake -S . -B build/tls ${{ runner.os == 'Windows' && '-DCMAKE_CONFIGURATION_TYPES=Debug' || '-DCMAKE_BUILD_TYPE=Debug' }} -DCMAKE_CXX_STANDARD=${{ matrix.std }} -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON ${{ env.MIRA_PLATFORM_PROTOCOL_FLAGS }}
       - name: Build TLS
         run: cmake --build build/tls --parallel --config Debug
       - name: Test TLS and HTTPS
@@ -148,9 +149,9 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the UCRT64 toolchain
-        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         with:
           msystem: UCRT64
           update: false
@@ -182,14 +183,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, cc: gcc-14, cxx: g++-14 }
+          - { os: ubuntu-24.04, cc: gcc-14, cxx: g++-14 }
           - { os: macos-latest, cc: clang, cxx: clang++ }
     env:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
       UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install OpenSSL on Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y g++-14 libssl-dev zlib1g-dev
@@ -238,13 +239,13 @@ jobs:
   # enough to keep in the required path.
   fuzz:
     needs: discipline
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       CC: clang-19
       CXX: clang++-19
       UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install clang 19
         # clang-19 minimum on Linux (see the epoll-clang entry in build). No
         # -stdlib=libc++: LLVM 19's libc++ still hides std::stop_token behind
@@ -312,10 +313,10 @@ jobs:
   # Run the official RFC6455 and RFC7692 corpus against both roles.
   websocket-conformance:
     needs: discipline
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install WebSocket build dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
       - name: Configure and build both conformance harnesses
@@ -330,7 +331,7 @@ jobs:
           --runtime docker --compression --fail-non-strict --output build/autobahn-results --timeout 2400
       - name: Preserve complete conformance evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: websocket-autobahn-results
           path: build/autobahn-results
@@ -346,9 +347,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install protocol toolchain on Linux
         if: runner.os == 'Linux'
         run: |
@@ -385,8 +386,7 @@ jobs:
           echo "MIRA_REQUIRE_MOSQUITTO=1" >> "$GITHUB_ENV"
       - name: Build pinned protocol dependencies
         run: python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
-      - name: Build independent HTTP3 curl (Linux)
-        if: runner.os == 'Linux'
+      - name: Build independent HTTP3 curl
         run: |
           python3 tools/ci/build_interop_curl.py --openssl-root "$OPENSSL_ROOT_DIR"
           echo "$PWD/build/interop-curl/prefix/bin" >> "$GITHUB_PATH"
@@ -398,27 +398,19 @@ jobs:
           -DMIRA_ENABLE_HTTP2=ON
           -DMIRA_ENABLE_HTTP3=ON -DMIRA_BUILD_BENCH=ON
           -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix"
-          -DCMAKE_INSTALL_INCLUDEDIR=include/Mira-0.5
+          -DCMAKE_INSTALL_INCLUDEDIR=include/mira-sdk
       - name: Build
         run: cmake --build build/protocols --parallel
-      - name: Report external HTTP/3 interoperability capability
-        shell: bash
-        run: |
-          curl --version
-          if ! curl --version | grep -q 'HTTP3'; then
-            echo '::warning::curl lacks HTTP3; external H3 interoperability is skipped (CTest code 77), not passed.'
-            echo 'External HTTP/3 interoperability: SKIPPED (curl lacks HTTP3). Native Mira client/server tests still run.' >> "$GITHUB_STEP_SUMMARY"
-          fi
+      - name: Report independent HTTP/3 client
+        run: build/interop-curl/prefix/bin/curl --version
       - name: Test POSIX protocols (Windows H2/H3 are not runtime-validated here)
         run: ctest --no-tests=error --test-dir build/protocols --output-on-failure
-      - name: Require independent HTTP3 interoperability (Linux)
-        if: runner.os == 'Linux'
+      - name: Require independent HTTP3 interoperability
         run: >
           python3 tools/ci/check_h3_interop.py build/protocols/mira_h3_server
           --strict --curl "$PWD/build/interop-curl/prefix/bin/curl"
           --openssl "$OPENSSL_ROOT_DIR/bin/openssl"
-      - name: Require independent Retry interoperability (Linux)
-        if: runner.os == 'Linux'
+      - name: Require independent Retry interoperability
         run: >
           python3 tools/ci/check_h3_interop.py build/protocols/mira_h3_multi_server
           --strict --multi-retry --curl "$PWD/build/interop-curl/prefix/bin/curl"
@@ -432,7 +424,7 @@ jobs:
           --output build/h3-fault-smoke.json
       - name: Preserve fault-smoke measurements
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: h3-fault-smoke-${{ matrix.os }}
           path: build/h3-fault-smoke.json
@@ -461,7 +453,7 @@ jobs:
     needs: discipline
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Configure for iOS
         run: >
           cmake -S . -B build/ios -G Xcode
@@ -472,7 +464,7 @@ jobs:
 
   android:
     needs: discipline
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       # Pinned rather than `$ANDROID_NDK_ROOT`, which is whichever NDK the
       # runner image happens to default to. `std::stop_token` is gated behind
@@ -482,7 +474,7 @@ jobs:
       # requirement rather than an incidental detail.
       MIRA_NDK_VERSION: 29.0.14206865
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the pinned NDK
         run: >
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager

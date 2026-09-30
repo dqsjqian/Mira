@@ -69,6 +69,17 @@ def main():
     args = parser.parse_args()
     build = args.build_dir.resolve()
     cache = cache_values(build)
+    version = cache['CMAKE_PROJECT_VERSION']
+    major, minor, patch = (int(part) for part in version.split('.'))
+    version_checks = f'''
+#include <mira/core/version.hpp>
+#include <string_view>
+static_assert(MIRA_VERSION_MAJOR == {major});
+static_assert(MIRA_VERSION_MINOR == {minor});
+static_assert(MIRA_VERSION_PATCH == {patch});
+static_assert(MIRA_VERSION == MIRA_VERSION_NUMBER({major}, {minor}, {patch}));
+static_assert(std::string_view{{MIRA_VERSION_STRING}} == "{version}");
+'''
     installed = ['core', 'transport', 'http', 'client', 'socks', 'dns', 'mqtt']
     for component, option in [('tls', 'TLS'), ('ws', 'WEBSOCKET'), ('http2', 'HTTP2'), ('http3', 'HTTP3')]:
         if cache.get('MIRA_ENABLE_' + option) == 'ON':
@@ -93,12 +104,13 @@ def main():
         data_dir = cache.get('CMAKE_INSTALL_DATADIR') or cache.get('CMAKE_INSTALL_DATAROOTDIR') or 'share'
         if not (prefix / data_dir / 'licenses' / 'Mira' / 'LICENSE').is_file():
             raise RuntimeError('Installed SDK is missing its LICENSE')
-        common = ['-G', cache['CMAKE_GENERATOR'],
-                  '-DCMAKE_BUILD_TYPE=' + args.config,
-                  '-DCMAKE_CONFIGURATION_TYPES=' + args.config]
+        common = ['-G', cache['CMAKE_GENERATOR']]
+        if cache.get('CMAKE_CONFIGURATION_TYPES'):
+            common.append('-DCMAKE_CONFIGURATION_TYPES=' + args.config)
+        else:
+            common.append('-DCMAKE_BUILD_TYPE=' + args.config)
         for key in ('CMAKE_CXX_COMPILER', 'CMAKE_TOOLCHAIN_FILE', 'CMAKE_CXX_FLAGS',
-                    'CMAKE_OSX_ARCHITECTURES', 'CMAKE_OSX_DEPLOYMENT_TARGET',
-                    'OPENSSL_ROOT_DIR'):
+                    'CMAKE_OSX_ARCHITECTURES', 'CMAKE_OSX_DEPLOYMENT_TARGET'):
             if cache.get(key):
                 common.append(f'-D{key}={cache[key]}')
         for key, flag in [('CMAKE_GENERATOR_PLATFORM', '-A'),
@@ -109,18 +121,29 @@ def main():
         common.extend(['-DCMAKE_PREFIX_PATH=' + prefixes,
                        '-DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF',
                        '-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF'])
-        if args.expect_http3_only:
-            common.append('-DCMAKE_DISABLE_FIND_PACKAGE_NGHTTP2=TRUE')
-
-        def case(name, find, *, source=None, links='core transport http',
-                 checks='', hidden=False, success=True, diagnostic=None, extra=()):
+        def case(name, find, *, source=None, links='transport http',
+                 checks='', hidden=False, success=True, diagnostic=None, disabled=(),
+                 requested_version=''):
             directory = root / name
             directory.mkdir()
-            text = ('cmake_minimum_required(VERSION 3.20)\n'
-                    'project(consumer LANGUAGES CXX)\n'
-                    f'find_package(Mira REQUIRED {find})\n' + checks + '\n')
+            # Isolation is a property of each test project. Some intentionally
+            # never call find_package for these dependencies, so define the
+            # policy here instead of passing unused CLI cache overrides.
+            hidden_packages = set(disabled)
+            if hidden:
+                hidden_packages.update(('OpenSSL', 'NGHTTP2', 'ZLIB'))
+            if args.expect_http3_only:
+                hidden_packages.add('NGHTTP2')
+            settings = ''.join(f'set(CMAKE_DISABLE_FIND_PACKAGE_{package} TRUE)\n'
+                               for package in sorted(hidden_packages))
+            if cache.get('OPENSSL_ROOT_DIR') and not hidden:
+                openssl_root = Path(cache['OPENSSL_ROOT_DIR']).as_posix()
+                settings += f'set(OPENSSL_ROOT_DIR [==[{openssl_root}]==])\n'
+            text = ('cmake_minimum_required(VERSION 3.21)\n'
+                    'project(consumer LANGUAGES CXX)\n' + settings +
+                    f'find_package(Mira {requested_version} REQUIRED {find})\n' + checks + '\n')
             if source:
-                (directory / 'main.cpp').write_text(source, encoding='utf-8')
+                (directory / 'main.cpp').write_text(version_checks + source, encoding='utf-8')
                 targets = ' '.join('Mira::' + name for name in links.split())
                 text += ('add_executable(consumer main.cpp)\n'
                          f'target_link_libraries(consumer PRIVATE {targets})\n'
@@ -128,16 +151,26 @@ def main():
                          'add_test(NAME installed_api COMMAND consumer)\n')
             (directory / 'CMakeLists.txt').write_text(text, encoding='utf-8')
             command = ['cmake', '-S', str(directory), '-B', str(directory / 'build'),
-                       *common, *extra]
-            if hidden:
-                command += ['-DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=TRUE',
-                            '-DCMAKE_DISABLE_FIND_PACKAGE_NGHTTP2=TRUE',
-                            '-DCMAKE_DISABLE_FIND_PACKAGE_ZLIB=TRUE']
+                       *common]
             run(command, success=success, diagnostic=diagnostic)
             if source and success:
                 run(['cmake', '--build', str(directory / 'build'), '--config', args.config])
                 run(['ctest', '--test-dir', str(directory / 'build'),
                      '--build-config', args.config, '--output-on-failure', '--no-tests=error'])
+
+        case('version-exact', 'COMPONENTS core transport http',
+             requested_version=version + ' EXACT', source=BASE_SOURCE, hidden=True,
+             checks=f'if(NOT Mira_VERSION STREQUAL "{version}")\n'
+                    '  message(FATAL_ERROR "Installed package version does not match the build")\nendif()')
+        case('version-compatible', 'COMPONENTS core', requested_version=f'{major}.0', hidden=True)
+        for name, requested in [('future-major', f'{major + 1}.0.0'),
+                                ('future-patch', f'{major}.{minor}.{patch + 1}')]:
+            case('version-' + name, 'COMPONENTS core', requested_version=requested,
+                 hidden=True, success=False, diagnostic='considered but not accepted')
+        if major > 0:
+            case('version-previous-major', 'COMPONENTS core',
+                 requested_version=f'{major - 1}.0.0', hidden=True,
+                 success=False, diagnostic='considered but not accepted')
 
         case('base', 'COMPONENTS core transport http', source=BASE_SOURCE, hidden=True,
              checks='''
@@ -177,11 +210,11 @@ int main() {
                      checks=f'if(NOT Mira_{component}_FOUND OR NOT TARGET Mira::{component})\n'
                             f'  message(FATAL_ERROR "Explicit component not loaded {component}")\nendif()')
         if 'ws' in installed:
-            no_zlib = ('-DCMAKE_DISABLE_FIND_PACKAGE_ZLIB=TRUE',)
-            case('ws-missing-zlib', 'COMPONENTS ws', extra=no_zlib, success=False,
+            no_zlib = ('ZLIB',)
+            case('ws-missing-zlib', 'COMPONENTS ws', disabled=no_zlib, success=False,
                  diagnostic="Mira component 'ws' is unavailable")
             case('ws-optional-missing-zlib', 'COMPONENTS core crypto OPTIONAL_COMPONENTS ws',
-                 extra=no_zlib, checks='''
+                 disabled=no_zlib, checks='''
 if(Mira_ws_FOUND OR TARGET Mira::ws OR NOT Mira_crypto_FOUND)
   message(FATAL_ERROR "Missing zlib must hide ws without hiding crypto")
 endif()

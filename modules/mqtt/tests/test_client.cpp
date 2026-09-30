@@ -275,7 +275,9 @@ struct ScriptedBroker {
     IoGate* write_gate = nullptr;
     Task<Result<std::size_t>> read_some(std::span<std::byte> out, OperationOptions = {}) {
         ++reads;
-        if (read_gate) co_await *read_gate;
+        // The controller may clear the member while this operation is parked.
+        // Keep the awaited gate's identity in the coroutine frame through resume.
+        if (auto* const gate = read_gate) co_await *gate;
         if (throw_read) throw std::runtime_error("scripted read failure");
         if (input.empty()) co_return fail(Errc::timed_out);
         const auto n = std::min(out.size(), input.front().size());
@@ -286,7 +288,7 @@ struct ScriptedBroker {
     }
     Task<Result<std::size_t>> write_some(std::span<const std::byte> bytes, OperationOptions = {}) {
         ++writes;
-        if (write_gate) co_await *write_gate;
+        if (auto* const gate = write_gate) co_await *gate;
         if (write_budget) {
             if (*write_budget == 0) {
                 if (throw_write) throw std::runtime_error("scripted write failure");

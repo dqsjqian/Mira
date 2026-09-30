@@ -7,5 +7,6 @@ target_include_directories(mira_crypto PUBLIC
 target_compile_features(mira_crypto PUBLIC cxx_std_23)
 target_link_libraries(mira_crypto PUBLIC Mira::core
     PRIVATE OpenSSL::Crypto $<BUILD_INTERFACE:Mira::warnings>)
-set_target_properties(mira_crypto PROPERTIES OUTPUT_NAME Mira-crypto EXPORT_NAME crypto)
+set_target_properties(mira_crypto PROPERTIES OUTPUT_NAME Mira-crypto
+    VERSION ${PROJECT_VERSION} EXPORT_NAME crypto)
 mira_install_module(mira_crypto)

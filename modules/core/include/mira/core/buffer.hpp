@@ -10,10 +10,9 @@
 //     buf.readable()               → span the parser inspects
 //     buf.consume(k)               → k bytes are fully parsed, drop them
 //
-// Contiguity is a deliberate v0.1 choice: HTTP/1.1 header parsing wants to run
-// `memchr` over an unbroken region, and a scatter/gather chain would complicate
-// every parser for a win that only shows up under HTTP/2 framing. When h2
-// lands it brings its own chained-buffer type rather than distorting this one.
+// Contiguity lets HTTP/1.1 header parsing run `memchr` over an unbroken region.
+// Protocols needing segmented storage can implement it separately without
+// complicating the contiguous parser interface.
 //
 // `consume()` does not memmove. Read bytes accumulate in front of the cursor
 // and are reclaimed lazily by `prepare()` — so the common "parse a request,

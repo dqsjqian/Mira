@@ -35,7 +35,7 @@ endif()
 
 if(MIRA_ENABLE_HTTP3)
     add_executable(bench_h3_soak h3_soak.cpp)
-    target_link_libraries(bench_h3_soak PRIVATE Mira::http3 Mira::transport Mira::warnings)
+    target_link_libraries(bench_h3_soak PRIVATE Mira::http3 Mira::warnings)
     target_compile_features(bench_h3_soak PRIVATE cxx_std_23)
 endif()
 

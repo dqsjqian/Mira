@@ -27,7 +27,8 @@ target_compile_features(mira_http3 PUBLIC cxx_std_23)
 # a dependency-free vocabulary target, never through the HTTP/2 engine.
 target_link_libraries(mira_http3 PUBLIC Mira::quic Mira::http_common
     PRIVATE mira_nghttp3 $<BUILD_INTERFACE:Mira::warnings>)
-set_target_properties(mira_http3 PROPERTIES OUTPUT_NAME Mira-http3 EXPORT_NAME http3)
+set_target_properties(mira_http3 PROPERTIES OUTPUT_NAME Mira-http3
+    VERSION ${PROJECT_VERSION} EXPORT_NAME http3)
 if(COMMAND mira_install_module)
     mira_install_module(mira_http3)
 endif()

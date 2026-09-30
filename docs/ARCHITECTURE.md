@@ -5,15 +5,16 @@
 An independent, coroutine-native C++23 networking library: a transport core,
 and protocols that ride on it. HTTP is one protocol family, not the purpose.
 
-This document describes the current `main` development tree. The published
-consumption pin remains v0.4.0; newer APIs and local verification below do not
-change that archive or certify a new release.
+This document describes its source revision. Version policy and release
+consumption live in the [shared release guide](RELEASES.md). Verification
+evidence applies only to the revision and configuration explicitly recorded.
 
 ### Design mandate (2026-09-23, updated 2026-09-28)
 
 - Design from networking requirements, not cpp-httplib feature parity or an
   existing consumer's API. Neither cpp-httplib nor a host framework constrains
-  the public interface. Consumers adapt later; breaking changes are permitted.
+  the public interface. Breaking source changes follow the major-version policy
+  in the release guide.
 - C++23 is the minimum baseline. The build requires C++23 and `Result<T>`
   aliases `std::expected<T, Error>` directly. C++20 compatibility is removed;
   each target toolchain still needs explicit validation.
@@ -792,7 +793,7 @@ work on Mira itself.
 | Platform scope | Desktop runtime targets; iOS host smoke/unsigned cross-build and Android cross-build | Device execution is not yet evidenced; new Windows H3/MinGW entry points also need runs; BSD has no dedicated CI evidence |
 | Readiness API | POSIX-only, behind an explicit macro | A platform extension, not part of the portable operation contract |
 | Execution model | Lazy `Task<T>`, single-threaded `TaskScope` spawn/join and independent-worker `LoopGroup` | Bounded root-task admission does not make one loop or its sockets multi-thread-safe; suspended tasks cannot be arbitrarily destroyed |
-| Library form | Compiled library with modular public headers | Keep implementation boundaries explicit; an ABI policy must be decided before stabilization |
+| Library form | Compiled library with modular public headers | Keep implementation boundaries explicit; the [release guide](RELEASES.md) defines source compatibility and requires rebuilding consumers |
 | Error model | `std::error_code` + `Result<T>` for operational failures | `Task` can still propagate body exceptions; this is not a no-exceptions guarantee |
 | Standard floor | C++23-only build; `Result<T>` directly aliases `std::expected<T, Error>` | Validate each toolchain and standard library; no C++20 compatibility mandate |
 | Buffer shape | Current `Buffer` is contiguous | Future segmented or borrowed-buffer designs need measured benefit and an explicit ownership contract |
@@ -845,11 +846,11 @@ interfaces nor another library's feature parity.
 The following records implementation milestones. Test counts are historical
 snapshots, not current totals or evidence of complete protocol/lifecycle safety.
 
-**v0.1 — seams.** Error model, `Task<T>`, `Buffer`, executor and stream
+**Stage 1 — seams.** Error model, `Task<T>`, `Buffer`, executor and stream
 concepts, warning policy, layering discipline, CI across C++20/C++23 and
 sanitizers.
 
-**v0.2 — the loop.** `EventLoop` with three backends (kqueue, epoll, IOCP),
+**Stage 2 — the loop.** `EventLoop` with three backends (kqueue, epoll, IOCP),
 completion-shaped `read`/`write`, timers, cross-thread `post`, and a
 `platform.hpp` that is the single home for platform detection. CI now builds
 and *runs* tests on all three backends, and cross-compiles for iOS and Android.
@@ -859,13 +860,13 @@ ASan/UBSan. Desktop epoll/IOCP runtime coverage comes from CI, not that local
 run. Neither the check count nor the existence of a CI job establishes current
 revision health or full backend lifecycle correctness.
 
-**v0.3 — the parser.** Incremental, strict HTTP/1.1 request parsing:
+**Stage 3 — the parser.** Incremental, strict HTTP/1.1 request parsing:
 `message.hpp` (HTTP message types, subject to review for future protocol reuse),
 `limits.hpp` (parser bounds), and a parser whose test suite is mostly published
 smuggling vectors. 119 checks, and the byte-at-a-time tests assert that network
 slicing cannot change the parse.
 
-**v0.4 — TCP.** `Endpoint`, `Listener`, `Socket`, `connect`, and an explicit
+**Stage 4 — TCP.** `Endpoint`, `Listener`, `Socket`, `connect`, and an explicit
 exclusive-bind policy. `ListenOptions::exclusive` expresses the intent to
 reject a second bind to an occupied endpoint; each backend must implement and
 test that intent using its platform's socket options. `SO_REUSEADDR` has
@@ -879,7 +880,7 @@ had been skipped there and IOCP's read/write path had never run. Loopback TCP
 runs everywhere, and it immediately found two bugs unreachable from a macOS
 machine — see "What CI found" above.
 
-**v0.5 — a working server.** Response serialisation and `serve_connection`,
+**Stage 5 — a working server.** Response serialisation and `serve_connection`,
 generic over the stream. The stack runs end to end over a real socket. Three
 rules live in the loop rather than in handlers, because breaking any of them
 corrupts the *next* request rather than the current one: the body is always

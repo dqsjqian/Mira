@@ -4,17 +4,17 @@
 //
 // Generated rather than hand-written so that the version cannot disagree with
 // the one the package config and the installed libraries carry. Editing this
-// file has no effect; change `project(Mira VERSION ...)` instead.
+// template does not change the version; change `project(Mira VERSION ...)` instead.
 //
 // The encoded form exists so that a consumer can compile against two versions
-// of Mira while the API is still moving:
+// of Mira:
 //
-//   #if MIRA_VERSION >= MIRA_VERSION_NUMBER(0, 3, 0)
+//   #if MIRA_VERSION_MAJOR >= 1
 //       // use the newer signature
 //   #endif
 //
-// While the major version is 0, breaking changes land in the minor version —
-// so the middle number is the one worth testing.
+// Breaking source changes increment the major version. Rebuild consumers when
+// changing SDKs; the package version does not promise binary ABI compatibility.
 
 #define MIRA_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
 #define MIRA_VERSION_MINOR @PROJECT_VERSION_MINOR@

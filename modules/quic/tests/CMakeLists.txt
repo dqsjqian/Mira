@@ -42,8 +42,9 @@ add_test(NAME quic_listener COMMAND test_quic_listener "${MIRA_QUIC_TEST_CERT}" 
 set_tests_properties(quic_listener PROPERTIES TIMEOUT 30)
 add_executable(test_quic_engine test_engine.cpp)
 # The native error-code assertions include ngtcp2 directly; inherit its
-# Windows static-library definition without exposing it to Mira consumers.
-target_link_libraries(test_quic_engine PRIVATE Mira::quic mira_ngtcp2)
+# Windows static-library definition through the adapter. This also keeps the
+# adapter before ngtcp2 in static link order without repeating ngtcp2.
+target_link_libraries(test_quic_engine PRIVATE Mira::quic mira_ngtcp2_ossl)
 foreach(mode normal chaos bad-host untrusted bad-alpn stream-limit)
     add_test(NAME quic_${mode} COMMAND test_quic_engine "${MIRA_QUIC_TEST_CERT}" "${MIRA_QUIC_TEST_KEY}" ${mode})
     set_tests_properties(quic_${mode} PROPERTIES TIMEOUT 30)

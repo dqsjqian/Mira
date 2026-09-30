@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(Mira
-    VERSION 0.5.0
+    VERSION 1.0.0
     DESCRIPTION "Coroutine-native C++23 networking library — transport, protocols, and nothing else"
     LANGUAGES CXX
 )
@@ -156,7 +156,7 @@ add_subdirectory(modules/client)
 if(MIRA_BUILD_TESTS AND MIRA_ENABLE_WEBSOCKET AND MIRA_ENABLE_HTTP2 AND MIRA_ENABLE_HTTP3)
     add_executable(mira_ws_connect_network modules/ws/tests/test_connect_network.cpp)
     target_link_libraries(mira_ws_connect_network PRIVATE
-        Mira::ws Mira::http2 Mira::http3 Mira::transport Mira::warnings)
+        Mira::ws Mira::http2 Mira::http3 Mira::warnings)
     add_test(NAME ws.connect_network COMMAND mira_ws_connect_network
         "${MIRA_QUIC_TEST_CERT}" "${MIRA_QUIC_TEST_KEY}")
     set_tests_properties(ws.connect_network PROPERTIES TIMEOUT 90)
@@ -178,7 +178,7 @@ endif()
 
 if(MIRA_BUILD_EXAMPLES)
     add_executable(mira_loop_group_server examples/loop_group_server.cpp)
-    target_link_libraries(mira_loop_group_server PRIVATE Mira::core Mira::transport Mira::warnings)
+    target_link_libraries(mira_loop_group_server PRIVATE Mira::transport Mira::warnings)
 
     add_executable(mira_echo_server examples/echo_server.cpp)
     target_link_libraries(mira_echo_server PRIVATE Mira::transport Mira::warnings)
@@ -233,11 +233,11 @@ if(MIRA_BUILD_EXAMPLES)
     endif()
     if(MIRA_ENABLE_HTTP3)
         add_executable(mira_h3_server examples/h3_server.cpp)
-        target_link_libraries(mira_h3_server PRIVATE Mira::http3 Mira::transport Mira::warnings)
+        target_link_libraries(mira_h3_server PRIVATE Mira::http3 Mira::warnings)
         add_executable(mira_h3_client examples/h3_client.cpp)
-        target_link_libraries(mira_h3_client PRIVATE Mira::http3 Mira::transport Mira::warnings)
+        target_link_libraries(mira_h3_client PRIVATE Mira::http3 Mira::warnings)
         add_executable(mira_h3_multi_server examples/h3_multi_server.cpp)
-        target_link_libraries(mira_h3_multi_server PRIVATE Mira::http3 Mira::transport Mira::warnings)
+        target_link_libraries(mira_h3_multi_server PRIVATE Mira::http3 Mira::warnings)
     endif()
 
     if(MIRA_BUILD_TESTS)
@@ -398,12 +398,11 @@ if(MIRA_INSTALL)
         INSTALL_DESTINATION ${MIRA_CMAKE_DESTINATION}
     )
 
-    # SameMinorVersion, not SameMajorVersion: while the major version is 0 the
-    # minor one is where breaking changes land, so 0.2 must not satisfy a
-    # request for 0.3. See CHANGELOG.md for the policy this encodes.
+    # Stable releases preserve source compatibility within a major version.
+    # Consumers needing an exact SDK can use find_package(... EXACT).
     write_basic_package_version_file(
         ${CMAKE_CURRENT_BINARY_DIR}/MiraConfigVersion.cmake
-        COMPATIBILITY SameMinorVersion
+        COMPATIBILITY SameMajorVersion
     )
 
     install(FILES
