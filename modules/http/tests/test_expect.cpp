@@ -661,15 +661,20 @@ struct FaultStream {
     }
 };
 
+Result<std::span<const std::byte>> throw_source_fault(bool allocation_failure) {
+    if (allocation_failure) throw std::bad_alloc{};
+    throw std::runtime_error("source fault");
+}
+
 Task<void> audit_callback_and_write_failures(EventLoop& loop) {
     test::section("upload exceptions always join the parked reader");
-    for (const bool throw_before_task : {false, true}) {
+    for (const bool allocation_failure : {false, true}) {
         FaultStream stream{loop};
         ClientConnection client{stream};
-        auto source = [throw_before_task]() -> Task<Result<std::span<const std::byte>>> {
-            co_await std::suspend_never{};
-            if (throw_before_task) throw std::bad_alloc{};
-            throw std::runtime_error("source fault");
+        auto source = [allocation_failure]() -> Task<Result<std::span<const std::byte>>> {
+            // Keep a return expression for non-void coroutine diagnostics;
+            // the helper throws only when this lazy task is actually resumed.
+            co_return throw_source_fault(allocation_failure);
         };
         bool caught = false;
         try { static_cast<void>(co_await client.exchange(loop, post(), Framing::content_length, 5, source)); }
