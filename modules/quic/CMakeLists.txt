@@ -1,7 +1,5 @@
-# Verified dependencies: ngtcp2 1.22.1 (MIT), OpenSSL 3.6.2 (Apache-2.0).
-# ngtcp2-1.22.1.tar.xz SHA256:
-# dfd2c68bd64b89847c611425b9487105c46e8447b5c21e6aeb00642c8fbe2ca8
-# Official source: https://github.com/ngtcp2/ngtcp2/releases/download/v1.22.1/ngtcp2-1.22.1.tar.xz
+# Source pins and hashes live in tools/ci/build_protocol_deps.py and CI.
+# THIRD_PARTY_NOTICES.md covers the selected libraries and embedded licenses.
 # The ossl QUIC TLS adapter is still marked experimental upstream; dependencies are not downloaded automatically.
 find_package(OpenSSL 3.5 REQUIRED COMPONENTS SSL Crypto)
 find_path(MIRA_NGTCP2_INCLUDE_DIR ngtcp2/ngtcp2_crypto_ossl.h REQUIRED)

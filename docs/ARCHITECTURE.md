@@ -741,8 +741,9 @@ not replace verification of a release candidate.
   payload bytes are all zero. One host, not multi-host/WAN or an RSS limit.
 - iOS host smoke and unsigned cross-build passed; signed device execution has
   not been validated. Android device runs, multi-host/WAN and longer resource
-  measurements remain without evidence. MinGW H2/H3 runtime tests do not establish
-  independent HTTP/3 curl interoperability on that toolchain.
+  measurements remain without evidence. MinGW passed independent HTTP/3 and Retry
+  CTest cases, but does not build a source-pinned curl in its job; that stricter
+  Windows client configuration is exercised by MSVC.
 
 ## What CI found that local testing could not
 

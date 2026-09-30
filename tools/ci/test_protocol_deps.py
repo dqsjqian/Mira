@@ -45,6 +45,73 @@ class InteropConfigurationTests(unittest.TestCase):
         self.assertFalse(any("STATICLIB" in item or "SCHANNEL" in item for item in flags))
 
 
+class ProtocolLicenseTests(unittest.TestCase):
+    def test_nested_terms_and_embedded_notices_survive_source_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prefix = root / "prefix"
+            primary = b"Upstream root license\n"
+            nested = b"Nested sfparse license\r\n"
+            notice = b"Nested runtime attribution\n"
+            header = "/* Copyright sfparse contributors; header terms. */"
+            embedded = "/* Copyright UTF-8 decoder author; embedded terms. */"
+            with tempfile.TemporaryDirectory(dir=root) as staging:
+                source = Path(staging)
+                (source / "COPYING").write_bytes(primary)
+                component = source / "lib/sfparse"
+                component.mkdir(parents=True)
+                (component / "COPYING").write_bytes(nested)
+                (component / "NOTICE.txt").write_bytes(notice)
+                (component / "sfparse.c").write_text(
+                    header + "\nint fixture;\n" + embedded + "\n", encoding="utf-8")
+                unused = source / "tests/dependency"
+                unused.mkdir(parents=True)
+                (unused / "COPYING").write_text("test-only license", encoding="utf-8")
+                (unused / "test.c").write_text("/* Copyright test-only author */", encoding="utf-8")
+                deps.install_dependency_licenses(source, prefix, "nghttp3")
+            self.assertFalse(source.exists())
+            installed = prefix / "share/licenses/nghttp3"
+            self.assertEqual((installed / "COPYING").read_bytes(), primary)
+            self.assertEqual((installed / "lib/sfparse/COPYING").read_bytes(), nested)
+            self.assertEqual((installed / "lib/sfparse/NOTICE.txt").read_bytes(), notice)
+            text = (installed / "SOURCE-NOTICES.txt").read_text(encoding="utf-8")
+            self.assertIn(header, text)
+            self.assertIn(embedded, text)
+            self.assertIn("lib/sfparse/sfparse.c", text)
+            self.assertNotIn("test-only", text)
+            self.assertFalse((installed / "tests").exists())
+
+    def test_ossl_adapter_notices_and_referenced_terms_are_installed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "COPYING").write_text("ngtcp2 root license", encoding="utf-8")
+            for relative, author in (
+                ("lib/ngtcp2_pcg.c", "PCG Project contributors"),
+                ("lib/ngtcp2_window_filter.c", "The Chromium Authors"),
+                ("crypto/shared.c", "shared crypto"),
+                ("crypto/shared.h", "shared declarations"),
+                ("crypto/ossl/ossl.c", "ossl adapter"),
+                ("crypto/includes/ngtcp2/ngtcp2_crypto_ossl.h", "ossl declarations"),
+                ("crypto/gnutls/gnutls.c", "disabled adapter"),
+            ):
+                path = source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"/* Copyright {author}; original notice. */\n", encoding="utf-8")
+            prefix = root / "prefix"
+            deps.install_dependency_licenses(source, prefix, "ngtcp2")
+            installed = prefix / "share/licenses/ngtcp2"
+            text = (installed / "SOURCE-NOTICES.txt").read_text(encoding="utf-8")
+            for author in ("PCG Project contributors", "The Chromium Authors", "shared crypto",
+                           "shared declarations", "ossl adapter", "ossl declarations"):
+                self.assertIn(author, text)
+            self.assertNotIn("disabled adapter", text)
+            resources = Path(deps.__file__).resolve().parent / "licenses"
+            for filename in ("quiche-LICENSE", "pcg-LICENSE-MIT.txt", "SOURCES.md"):
+                self.assertEqual((installed / filename).read_bytes(), (resources / filename).read_bytes())
+
+
 class ProtocolDebugSymbolsTests(unittest.TestCase):
     def test_symbols_survive_temporary_build_cleanup_beside_archives(self):
         with tempfile.TemporaryDirectory() as temporary:

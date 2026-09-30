@@ -139,6 +139,9 @@ milestone entry is retained as history, not a separately published release.
   with MSVC's warnings-as-errors policy.
 - Protocol dependency builds retain MSVC compiler PDBs beside installed static
   libraries so temporary build cleanup does not discard their debug information.
+- Protocol dependency packaging preserves embedded copyright and license notices,
+  including sfparse, its UTF-8 DFA, PCG and the Chromium window filter. The SDK
+  installs a third-party license inventory alongside Mira's MIT license.
 - QUIC session tickets now bind the actually loaded CA trust material, including
   X509 AUX trusted/rejected purposes and CRLs, instead of relying on a file path.
   Same-path CA replacement no longer restores an old session or enables 0-RTT.
@@ -174,8 +177,8 @@ milestone entry is retained as history, not a separately published release.
   overlap, and zero final connections/routes/tombstones/queued bytes/reserved
   payload bytes. This is one-machine evidence, not multi-host/WAN or an RSS cap.
 - Windows MSVC independent HTTP/3 curl and Retry checks, and MinGW H2/H3
-  runtime tests, passed in the hosted audit follow-up. This does not establish
-  MinGW independent HTTP/3 curl interoperability. iOS host smoke and unsigned
+  runtime and independent curl tests, passed in the hosted audit follow-up.
+  MinGW does not build its own source-pinned curl. iOS host smoke and unsigned
   cross-compilation passed; device execution lacks a signing profile. Android
   device runs and multi-host validation have no evidence.
 

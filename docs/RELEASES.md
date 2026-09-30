@@ -71,3 +71,8 @@ Package the tagged source tree, attach the archive and `SHA256SUMS`, then
 download and verify both. Release notes link the successful CI run and describe
 remaining validation limits. A historical run does not certify later code or
 build changes.
+
+For redistribution, review [third-party notices](../THIRD_PARTY_NOTICES.md).
+The source archive does not bundle external dependency implementations. Binary
+packages that include them must retain their applicable licenses and notices,
+including embedded components; Mira's MIT license does not replace those terms.

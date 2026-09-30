@@ -216,7 +216,7 @@ auto client = Mira::tls::Context::client({
 | iOS | kqueue | 宿主 smoke 与无签名交叉编译通过；缺少签名 profile，未完成真机运行 |
 | Android | epoll | 非 TLS 模块交叉编译，需 **NDK 29+**；无真机运行证据 |
 
-CI 同时覆盖安装包消费与依赖隔离、协议模糊测试、MQTT/mosquitto 互操作，以及包含压缩的官方 Autobahn 客户端/服务端测试。Linux、macOS 和 Windows MSVC 的协议任务均要求独立 HTTP/3 与 Retry 互操作成功；sanitizer 和 MinGW 等配置缺少独立 HTTP3 curl 时的跳过项单独计数。
+CI 同时覆盖安装包消费与依赖隔离、协议模糊测试、MQTT/mosquitto 互操作，以及包含压缩的官方 Autobahn 客户端/服务端测试。Linux、macOS 和 Windows MSVC 的协议任务均要求独立 HTTP/3 与 Retry 互操作成功；sanitizer 等缺少独立 HTTP3 curl 的配置将相应用例计为跳过。
 
 每个发布版本在 [Release](https://github.com/dqsjqian/Mira/releases) 中关联 CI 验证记录和源码校验和。修复与验证快照集中在[审核记录](docs/AUDIT-2026-09-30.md)，顶部 CI 徽章显示主线状态。macOS 未运行 LeakSanitizer；交叉编译不代表移动端真机验证。
 
@@ -423,7 +423,7 @@ python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak 
 
 ## 接下来：仍需验证的边界
 
-1. iOS 已通过宿主 smoke 和无签名交叉编译，真机缺签名 profile；Android 真机尚无证据。MinGW 已有 H2/H3 原生运行测试，独立 HTTP/3 curl 互操作在 Windows 上由 MSVC 配置验证。
+1. iOS 已通过宿主 smoke 和无签名交叉编译，真机缺签名 profile；Android 真机尚无证据。MinGW 已有 H2/H3 与独立 curl 互操作运行证据，但该任务不单独构建固定来源的 curl；Windows MSVC 的严格互操作任务会构建它。
 2. 更长时故障注入、真实多机/WAN 与进程内存硬上限仍待验。单机 loopback 和有限时长的 fuzz/soak 不代表这些边界已覆盖。
 3. QUIC validated migration/NAT rebinding、显式原始 QUIC 0-RTT、HTTP/3 0-RTT 与 H2/H3 Extended CONNECT 已在主线实现，但完整防重放保证与第三方 Extended CONNECT 互操作未交付/未验证；HTTP/3 0-RTT 目前只有同库引擎与真实 UDP 证据，尚无第三方 0-RTT 互操作。Retry 不保证 token 一次性使用，listener 不是互联网抗洪泛防护系统。
 4. **2026-09-29 阶段已交付**：HTTP/3 0-RTT、HTTP/1 `Expect: 100-continue` / 提前响应双工，以及独立 SOCKS5、DNS/DoH、MQTT 模块。仍开放：0-RTT 防重放存储、客户端记忆服务端 SETTINGS、打包好的 DoH over H2/H3 查询、MQTT over WebSocket 与会话持久化。gRPC/Redis/WebRTC 保持生态层边界，不将专业子系统全部塞进网络内核。
@@ -443,6 +443,8 @@ python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak 
 ## 📄 License
 
 [MIT](LICENSE) © 2026 Mira contributors
+
+MIT 适用于 Mira 自有代码；第三方组件保留各自许可证。依赖清单、嵌入代码归属及再分发要求见[第三方许可说明](THIRD_PARTY_NOTICES.md)。
 
 ---
 

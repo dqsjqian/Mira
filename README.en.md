@@ -216,7 +216,7 @@ No 408 is sent: announcing it would require a second budget the caller never gra
 | iOS | kqueue | Host smoke and unsigned cross-build passed; no device run without a signing profile |
 | Android | epoll | Non-TLS module cross-build, **NDK 29+**; no device-runtime evidence |
 
-CI also covers installed packages and dependency isolation, protocol fuzzing, MQTT/mosquitto interoperability, and official Autobahn client/server tests including compression. The Linux, macOS and Windows MSVC protocol jobs require independent HTTP/3 and Retry interoperability. Skips in configurations without an independent HTTP3 curl, including sanitizer and MinGW jobs, are counted separately.
+CI also covers installed packages and dependency isolation, protocol fuzzing, MQTT/mosquitto interoperability, and official Autobahn client/server tests including compression. The Linux, macOS and Windows MSVC protocol jobs require independent HTTP/3 and Retry interoperability. Configurations without an independent HTTP3 curl, such as the sanitizer jobs, count the corresponding cases as skipped.
 
 Each [Release](https://github.com/dqsjqian/Mira/releases) links CI evidence and its source checksum. Repair and validation snapshots are kept in the [audit record](docs/AUDIT-2026-09-30.md); the CI badge above tracks main. LeakSanitizer was not run on macOS, and cross-builds do not establish mobile-device execution.
 
@@ -430,7 +430,7 @@ Recorded 600-second report `build/all-main/sustained-600.json`: 13,548/13,548 re
 
 ## Next: remaining verification boundaries
 
-1. iOS host smoke and unsigned cross-compilation passed, but device execution lacks a signing profile; Android has no device evidence. MinGW runs native H2/H3 tests; independent HTTP/3 curl interoperability on Windows is exercised by MSVC.
+1. iOS host smoke and unsigned cross-compilation passed, but device execution lacks a signing profile; Android has no device evidence. MinGW has H2/H3 and independent curl interoperability results, but that job does not build its own source-pinned curl; the strict Windows MSVC interoperability job does.
 2. Longer fault injection, multi-host/WAN load and hard process-memory limits remain unverified. Single-machine loopback and bounded fuzz/soak runs do not establish that coverage.
 3. Validated QUIC migration/NAT rebinding, explicit raw-QUIC 0-RTT, HTTP/3 0-RTT and H2/H3 Extended CONNECT are implemented on main. Comprehensive anti-replay guarantees and independent Extended CONNECT interoperability remain undelivered/unverified; HTTP/3 0-RTT has same-library engine and real-UDP evidence but no third-party 0-RTT interoperability yet. Retry tokens are not guaranteed single-use; the listener is not an Internet flood-protection system.
 4. **Delivered in the 2026-09-29 phase**: HTTP/3 0-RTT, HTTP/1 `Expect: 100-continue` with duplex early responses, and independent SOCKS5, DNS/DoH and MQTT modules. Still open: a 0-RTT anti-replay store, remembered server SETTINGS on the client, a packaged DoH query over H2/H3, MQTT over WebSocket and session persistence. Keep gRPC/Redis/WebRTC in the ecosystem layer, not bundled into the network core.
@@ -450,6 +450,10 @@ Start from a reproducible problem, a crisp contract, or a targeted test. Keep mo
 ## 📄 License
 
 [MIT](LICENSE) © 2026 Mira contributors
+
+MIT applies to Mira's own code; third-party components retain their licenses.
+See [third-party notices](THIRD_PARTY_NOTICES.md) for dependencies, embedded
+attributions and redistribution requirements.
 
 ---
 

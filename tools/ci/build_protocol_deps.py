@@ -24,6 +24,7 @@ import hashlib
 import ntpath
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
+import re
 import shlex
 import shutil
 import subprocess
@@ -37,8 +38,9 @@ REPO = Path(__file__).resolve().parents[2]
 # ntpath.isreserved replaces PurePath.is_reserved in Python 3.13+.
 windows_reserved = getattr(ntpath, "isreserved", lambda name: PureWindowsPath(name).is_reserved())
 # SHA256 of the official GitHub release assets, also verified byte-for-byte
-# against local archives; all licenses are MIT.
-# The COPYING at the root of each release archive is the license text.
+# against local archives. Each root COPYING is MIT; embedded source notices
+# are also retained, including sfparse, its UTF-8 decoder and ngtcp2's PCG /
+# Chromium-derived code. Root COPYING alone is not a complete attribution list.
 DEPENDENCIES = (
     ("nghttp2", "1.70.0", "nghttp2/nghttp2",
      "e05cb1388eaca3830aded4ccf20044b6e1ac1a61411dcca11b0437c4285c8bc2"),
@@ -171,6 +173,57 @@ def install_compile_pdbs(build: Path, prefix: Path) -> None:
         print(f"Installed compiler debug symbols: {destination}", flush=True)
 
 
+def install_dependency_licenses(source: Path, prefix: Path, name: str) -> None:
+    """Keep upstream terms and embedded notices beside the built libraries."""
+    if name not in {dependency[0] for dependency in DEPENDENCIES}:
+        raise ValueError(f"Unknown protocol dependency: {name}")
+    # These pinned projects compile their runtime implementation from lib/.
+    # ngtcp2 additionally builds only the ossl adapter and shared crypto code;
+    # tests, examples and disabled TLS adapters are not part of these libraries.
+    roots = [source / "lib"]
+    if name == "ngtcp2":
+        roots += [source / relative for relative in (
+            "crypto/shared.c", "crypto/shared.h", "crypto/ossl",
+            "crypto/includes/ngtcp2/ngtcp2_crypto.h",
+            "crypto/includes/ngtcp2/ngtcp2_crypto_ossl.h",
+        )]
+    files = {source / "COPYING"}
+    for root in roots:
+        if root.is_dir():
+            files.update(path for path in root.rglob("*") if path.is_file())
+        elif root.is_file():
+            files.add(root)
+    license_dir = prefix / "share/licenses" / name
+    license_dir.mkdir(parents=True, exist_ok=True)
+    notices: dict[str, list[str]] = {}
+    for path in sorted(files):
+        relative = path.relative_to(source)
+        if path.name.split(".", 1)[0].upper() in ("COPYING", "LICENSE", "NOTICE"):
+            destination = license_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, destination)
+        elif path.name.endswith((".c", ".h", ".h.in")):
+            # Keep the entire original comment block, including notices that
+            # occur after implementation code (sfparse's UTF-8 DFA does this).
+            for block in re.findall(r"/\*.*?\*/", path.read_text(encoding="utf-8"), re.DOTALL):
+                if "copyright" in block.lower():
+                    notices.setdefault(block, []).append(relative.as_posix())
+    if not notices:
+        raise ValueError(f"No runtime copyright notices found in {source}")
+    text = [f"Upstream runtime source notices for {name}.\n"
+            "Original comment blocks are retained without changing their terms.\n"]
+    for block, paths in notices.items():
+        text.append("\nSource: " + ", ".join(paths) + "\n" + block + "\n")
+    (license_dir / "SOURCE-NOTICES.txt").write_text("".join(text), encoding="utf-8")
+    if name == "ngtcp2":
+        # These embedded sources refer to external license files absent from
+        # ngtcp2's archive. Keep immutable upstream copies in this repository;
+        # this build step never fetches license text from the network.
+        extra_licenses = Path(__file__).resolve().parent / "licenses"
+        for filename in ("quiche-LICENSE", "pcg-LICENSE-MIT.txt", "SOURCES.md"):
+            shutil.copyfile(extra_licenses / filename, license_dir / filename)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--path", type=Path, default=REPO / "build/protocol-deps",
@@ -248,15 +301,13 @@ def main() -> None:
             run(["cmake", "--install", str(build), "--config", args.config])
             if sys.platform == "win32":
                 install_compile_pdbs(build, prefix)
-            license_dir = prefix / "share/licenses" / name
-            license_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source / "COPYING", license_dir / "COPYING")
+            install_dependency_licenses(source, prefix, name)
     for library in ("nghttp2", "nghttp3", "ngtcp2", "ngtcp2_crypto_ossl"):
         filenames = ((f"{library}_static.lib", f"lib{library}_static.a")
                      if sys.platform == "win32" else (f"lib{library}.a",))
         if not any((prefix / "lib" / filename).is_file() for filename in filenames):
             raise ValueError(f"Expected static library not produced in {prefix / 'lib'}: {filenames}")
-    print(f"Done. Static libraries, headers, and MIT licenses are located in: {prefix}", flush=True)
+    print(f"Done. Static libraries, headers, licenses, and source notices are located in: {prefix}", flush=True)
     prefix_argument = f"-DCMAKE_PREFIX_PATH={prefix}"
     quoted_prefix = (subprocess.list2cmdline([prefix_argument]) if os.name == "nt"
                      else shlex.quote(prefix_argument))

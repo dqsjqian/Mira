@@ -366,7 +366,7 @@ if(MIRA_INSTALL)
     include(CMakePackageConfigHelpers)
 
     set(MIRA_CMAKE_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Mira)
-    install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/Mira)
+    install(FILES LICENSE THIRD_PARTY_NOTICES.md DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/Mira)
 
     install(EXPORT miraTargets
         FILE miraTargets.cmake
