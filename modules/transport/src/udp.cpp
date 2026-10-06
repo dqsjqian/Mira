@@ -105,6 +105,8 @@ PacketMetadata packet_metadata(EventLoop::DatagramResult& raw, std::uint16_t por
         }
 #endif
 #if defined(IPV6_PKTINFO)
+        // ifindex signedness differs across libcs (glibc unsigned, bionic and
+        // the kernel uapi int); cast explicitly to each destination field type.
         if (header->cmsg_level == IPPROTO_IPV6 && header->cmsg_type == IPV6_PKTINFO) {
             in6_pktinfo info{};
             if (control_value(*header, info)) {
@@ -113,10 +115,10 @@ PacketMetadata packet_metadata(EventLoop::DatagramResult& raw, std::uint16_t por
                 address.sin6_port = htons(port);
                 address.sin6_addr = info.ipi6_addr;
                 if (IN6_IS_ADDR_LINKLOCAL(&address.sin6_addr) || IN6_IS_ADDR_MULTICAST(&address.sin6_addr))
-                    address.sin6_scope_id = info.ipi6_ifindex;
+                    address.sin6_scope_id = static_cast<std::uint32_t>(info.ipi6_ifindex);
                 const auto endpoint = Endpoint::from_bytes({reinterpret_cast<const std::byte*>(&address), sizeof(address)});
                 if (endpoint) metadata.destination = *endpoint;
-                metadata.interface_index = info.ipi6_ifindex;
+                metadata.interface_index = static_cast<std::uint32_t>(info.ipi6_ifindex);
             }
         }
 #endif
@@ -294,7 +296,9 @@ Result<void> Socket::membership(Endpoint group, MulticastInterface interface, bo
         address.sin6_scope_id != interface.ipv6_index) return fail(Errc::invalid_argument);
     ipv6_mreq request{};
     request.ipv6mr_multiaddr = address.sin6_addr;
-    request.ipv6mr_interface = interface.ipv6_index != 0 ? interface.ipv6_index : address.sin6_scope_id;
+    request.ipv6mr_interface =
+        static_cast<decltype(request.ipv6mr_interface)>(interface.ipv6_index != 0 ? interface.ipv6_index
+                                                                                  : address.sin6_scope_id);
     return set_option(handle, IPPROTO_IPV6, join ? IPV6_JOIN_GROUP : IPV6_LEAVE_GROUP, request);
 }
 
@@ -392,15 +396,15 @@ Task<Result<std::size_t>> Socket::send(std::shared_ptr<State> state,
         } else {
 #if defined(IPV6_PKTINFO)
             in6_pktinfo info{};
-            info.ipi6_ifindex = packet.interface_index;
+            info.ipi6_ifindex = static_cast<decltype(info.ipi6_ifindex)>(packet.interface_index);
             if (packet.source) {
                 sockaddr_in6 address{};
                 std::memcpy(&address, packet.source->address_bytes().data(), sizeof(address));
                 info.ipi6_addr = address.sin6_addr;
                 if (address.sin6_scope_id != 0) {
-                    if (info.ipi6_ifindex != 0 && info.ipi6_ifindex != address.sin6_scope_id)
+                    if (info.ipi6_ifindex != 0 && static_cast<std::uint32_t>(info.ipi6_ifindex) != address.sin6_scope_id)
                         co_return fail(Errc::invalid_argument);
-                    info.ipi6_ifindex = address.sin6_scope_id;
+                    info.ipi6_ifindex = static_cast<decltype(info.ipi6_ifindex)>(address.sin6_scope_id);
                 }
             }
             control.append(IPPROTO_IPV6, IPV6_PKTINFO, info);

@@ -37,6 +37,8 @@ records; they are not additional definitions of the current build version.
 
 ### Fixed
 
+- Build warning-free under `-Wsign-conversion` with Android NDK bionic ifindex
+  signedness and under MSVC `/WX` heterogeneous optional comparisons.
 - Preserve buffered MQTT completion identifiers until their events are consumed;
   restore expiry notices without preventing a one-slot CONNACK handshake.
 - Keep H2/H3 tunnel input consumption independent of a blocked output flush.

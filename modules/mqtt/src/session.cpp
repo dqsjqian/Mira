@@ -441,14 +441,14 @@ Result<Session> Session::restore(ClientOptions options, std::span<const std::byt
     const auto equal = [](std::span<const std::byte> bytes, std::string_view value) {
         return std::ranges::equal(bytes, std::as_bytes(std::span(value.data(), value.size())));
     };
-    if (magic != 0x4d515331 || version != static_cast<std::uint32_t>(options.version) ||
+    if (magic != 0x4d515331u || version != static_cast<std::uint32_t>(options.version) ||
         !domain || !identity || !equal(*domain, scope) || !equal(*identity, options.client_id))
         return fail(Errc::invalid_argument);
     auto result = create(std::move(options));
     if (!result) return fail(result.error());
     auto& s = *result->impl_;
     const auto count = get();
-    if (!count || *count > 65535) return fail(Errc::invalid_argument);
+    if (!count || *count > 65535u) return fail(Errc::invalid_argument);
     std::set<std::uint16_t> identifiers;
     for (std::uint32_t n = 0; n < *count; ++n) {
         const auto stage = get();
