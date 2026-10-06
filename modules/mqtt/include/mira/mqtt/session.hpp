@@ -22,11 +22,14 @@
 // 5.0 DISCONNECT carrying the reason) and fail `receive`.
 
 #include "mira/mqtt/packet.hpp"
+#include "mira/core/stream.hpp"
 
 #include <limits>
 #include <memory>
 
 namespace Mira::mqtt {
+
+template<BoundedStream Stream> class Client;
 
 struct ClientOptions {
     Version version = Version::v5;
@@ -95,6 +98,25 @@ enum class SessionState { idle, connecting, connected, closed };
 class Session {
 public:
     static Result<Session> create(ClientOptions options);
+    /// Portable versioned checkpoint of pending QoS 1/2 publishes and inbound
+    /// QoS 2 release identifiers. The caller owns atomic durable storage and
+    /// must bind scope to broker identity + credentials/tenant policy. No secret
+    /// credentials are serialized, but message payloads may contain secrets.
+    /// Refuses undelivered events or pending subscription requests. Persist
+    /// before acknowledging a business transaction; this is not a WAL or an
+    /// exactly-once application transaction guarantee. QoS 0 is not persisted.
+    [[nodiscard]] Result<Bytes> checkpoint(std::string_view scope,
+                                          std::size_t max_bytes = 16 * 1024 * 1024) const;
+    /// Restores into idle state, then connect on a fresh transport. Requires
+    /// clean_start=false and matching version, client_id and nonempty scope.
+    /// Untrusted snapshots are bounded and validated before state is published.
+    /// Supply time elapsed since checkpoint for message expiry; expired outgoing
+    /// entries are surfaced as discarded events, not replayed. Broker session
+    /// expiry is authoritative in CONNACK. The snapshot stores no wall clock.
+    [[nodiscard]] static Result<Session> restore(ClientOptions options,
+        std::span<const std::byte> checkpoint, std::string_view scope,
+        std::size_t max_bytes = 16 * 1024 * 1024,
+        std::uint32_t elapsed_seconds = 0);
     Session(Session&&) noexcept;
     Session& operator=(Session&&) noexcept;
     ~Session();
@@ -108,9 +130,11 @@ public:
                          std::size_t externally_buffered_events = 0);
 
     /// Assigns the packet identifier (returned; 0 for QoS 0) and clears DUP.
-    Result<std::uint16_t> publish(Publish message);
-    Result<std::uint16_t> subscribe(std::vector<Subscription> subscriptions, Properties properties = {});
-    Result<std::uint16_t> unsubscribe(std::vector<std::string> filters, Properties properties = {});
+    Result<std::uint16_t> publish(Publish message, std::span<const std::uint16_t> retained_ids = {});
+    Result<std::uint16_t> subscribe(std::vector<Subscription> subscriptions, Properties properties = {},
+                                    std::span<const std::uint16_t> retained_ids = {});
+    Result<std::uint16_t> unsubscribe(std::vector<std::string> filters, Properties properties = {},
+                                      std::span<const std::uint16_t> retained_ids = {});
     /// Queue DISCONNECT and close. Unacknowledged publishes stay for a resume.
     Result<void> disconnect(std::uint8_t reason = reason::success, Properties properties = {});
     Result<void> auth(std::uint8_t reason, Properties properties);
@@ -138,9 +162,12 @@ public:
     [[nodiscard]] std::size_t server_maximum_packet_size() const noexcept;
 
 private:
+    template<BoundedStream Stream> friend class Client;
+    [[nodiscard]] Result<Bytes> checkpoint_impl(std::string_view scope, std::size_t max_bytes) const;
     struct Impl;
     explicit Session(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
+    bool client_owned_ = false;
 };
 
 }  // namespace Mira::mqtt

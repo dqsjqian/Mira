@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Interop-test the h2 prior-knowledge example: real curl speaking HTTP/2.
 
-The point of this file is external evidence: nghttp2 inside curl — an
-independent implementation of RFC 9113 — connects to Mira's http2 layer,
+The point of this file is external-client evidence: curl connects to Mira's
+http2 layer using the same nghttp2 engine family, not an independent RFC 9113
+engine implementation. It
 negotiates nothing (prior knowledge), exchanges a request, and the response
 must survive curl's own strictness about framing, HPACK and stream states.
 

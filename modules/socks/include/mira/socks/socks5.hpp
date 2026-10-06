@@ -9,8 +9,10 @@
 // positioned at the first tunnelled byte — a TLS ClientHello or an HTTP
 // request can follow on the same stream without a pushback buffer.
 //
-// Scope: CONNECT for clients; BIND and UDP ASSOCIATE are parsed on the proxy
-// side so it can refuse them, but not implemented. No GSSAPI, no SOCKS4.
+// Client commands include CONNECT, two-reply BIND and UDP ASSOCIATE.
+// Proxy authentication/requests and replies are transport-independent; relay
+// policy belongs to the caller. UDP fragmentation is explicitly unsupported.
+// No GSSAPI or SOCKS4.
 // Username/password travel in clear text (RFC 1929); run the proxy hop over a
 // trusted network or inside TLS.
 
@@ -29,6 +31,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 namespace Mira::socks {
 
@@ -221,12 +224,30 @@ bool valid_credential(std::string_view field) noexcept;
 
 }  // namespace detail
 
-/// Negotiate a CONNECT tunnel to `target` through the proxy on `stream`.
-/// Returns the proxy's reply on success; a non-success REP becomes the matching
-/// `socks::SocksError`. After success the stream carries the tunnel.
+/// Read one command response, including BIND's second peer-accepted response.
+/// Reads exactly its frame; tunnel bytes remain untouched.
 template<BoundedStream Stream>
-[[nodiscard]] Task<Result<Reply>> connect(Stream& stream, const Address& target,
-                                          const ClientOptions& options, OperationOptions io = {}) {
+[[nodiscard]] Task<Result<Reply>> read_reply(Stream& stream, OperationOptions io = {}) {
+    std::array<std::byte, 4> head{};
+    auto got = co_await detail::read_exact(stream, head, io);
+    if (!got) co_return fail(got.error());
+    if (head[0] != std::byte{5} || head[2] != std::byte{0})
+        co_return fail(make_error_code(SocksError::protocol_error));
+    const auto code = std::to_integer<std::uint8_t>(head[1]);
+    auto bound = co_await detail::read_address(stream, std::to_integer<std::uint8_t>(head[3]), io);
+    if (!bound) co_return fail(bound.error());
+    if (code != 0) co_return fail(reply_error(code));
+    co_return Reply{ReplyCode::succeeded, std::move(*bound)};
+}
+
+/// Negotiate one command. BIND returns its listening response; call read_reply
+/// again for the accepted peer. UDP ASSOCIATE's TCP connection must remain alive
+/// until all relay operations finish. The caller enforces relay lifetime/policy.
+template<BoundedStream Stream>
+[[nodiscard]] Task<Result<Reply>> negotiate(Stream& stream, Command command, const Address& target,
+                                            const ClientOptions& options, OperationOptions io = {}) {
+    if (command != Command::connect && command != Command::bind && command != Command::udp_associate)
+        co_return fail(Errc::invalid_argument);
     using detail::version;
     const bool password = options.credentials.has_value();
     if (!options.allow_no_auth && !password) co_return fail(Errc::invalid_argument);
@@ -275,7 +296,7 @@ template<BoundedStream Stream>
 
     std::string request;
     request.push_back(static_cast<char>(version));
-    request.push_back(static_cast<char>(Command::connect));
+    request.push_back(static_cast<char>(command));
     request.push_back(0x00);
     request += target.encode();
     sent = co_await detail::write_text(stream, request, io);
@@ -297,6 +318,34 @@ template<BoundedStream Stream>
     if (code != 0x00) co_return fail(reply_error(code));
     co_return Reply{ReplyCode::succeeded, std::move(*bound)};
 }
+
+/// CONNECT leaves the stream positioned at the first tunnel byte.
+template<BoundedStream Stream>
+[[nodiscard]] Task<Result<Reply>> connect(Stream& stream, const Address& target,
+                                          const ClientOptions& options, OperationOptions io = {}) {
+    co_return co_await negotiate(stream, Command::connect, target, options, io);
+}
+template<BoundedStream Stream>
+[[nodiscard]] Task<Result<Reply>> bind(Stream& stream, const Address& expected_peer,
+                                       const ClientOptions& options, OperationOptions io = {}) {
+    co_return co_await negotiate(stream, Command::bind, expected_peer, options, io);
+}
+template<BoundedStream Stream>
+[[nodiscard]] Task<Result<Reply>> udp_associate(Stream& control, const Address& local,
+                                                const ClientOptions& options, OperationOptions io = {}) {
+    co_return co_await negotiate(control, Command::udp_associate, local, options, io);
+}
+
+struct UdpPacket {
+    Address target;
+    std::span<const std::byte> payload;
+};
+/// RFC 1928 UDP encapsulation. The decoded payload borrows the input. All
+/// nonzero FRAG values are refused (no fragment buffering or reassembly).
+[[nodiscard]] Result<std::vector<std::byte>> encode_udp(const Address& target,
+    std::span<const std::byte> payload, std::size_t max_size = 65507);
+[[nodiscard]] Result<UdpPacket> decode_udp(std::span<const std::byte> packet,
+    std::size_t max_size = 65507);
 
 /// Proxy side: negotiate a method, authenticate, and read the request. The
 /// caller performs the command and answers with `reply`. A client offering no

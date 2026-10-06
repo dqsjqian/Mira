@@ -1,4 +1,5 @@
 #include "mira/ws/connection.hpp"
+#include "mira/ws/byte_stream.hpp"
 #include "mira/core/event_loop.hpp"
 #include "check.hpp"
 #include <algorithm>
@@ -317,10 +318,40 @@ Task<void> connection_tests() {
     CHECK(second_parsed && second_parsed->frame && second_parsed->frame->payload == text.payload);
 }
 }
+Task<void> byte_stream_boundaries() {
+    test::section("binary stream handles fragments, control frames and terminal text");
+    MemoryStream transport;
+    for (const auto& frame : {Frame{Opcode::binary, false, bytes("ab")},
+                              Frame{Opcode::ping, true, bytes("p")},
+                              Frame{Opcode::continuation, true, bytes("cd")},
+                              Frame{Opcode::text, true, bytes("not binary")}}) {
+        auto encoded = serialize(frame, Role::server);
+        CHECK(encoded.has_value());
+        transport.input.insert(transport.input.end(), encoded->begin(), encoded->end());
+    }
+    Connection connection{transport, Role::client};
+    CHECK(connection.adopt_extended_connect("websocket", 200).has_value());
+    ByteStream stream{connection, 2};
+    std::array<std::byte, 1> byte{};
+    std::string result;
+    for (int i = 0; i < 4; ++i) {
+        auto read = co_await stream.read_some(byte);
+        CHECK(read && *read == 1);
+        result.push_back(static_cast<char>(std::to_integer<unsigned char>(byte[0])));
+    }
+    CHECK(result == "abcd");
+    auto invalid = co_await stream.read_some(byte);
+    CHECK(!invalid && invalid.error() == ws::make_error_code(ws::Errc::protocol));
+    CHECK(transport.closed && connection.closed());
+    CHECK(!(co_await stream.write_some(byte)));
+}
 int main() {
     codec(); handshakes();
     auto loop = EventLoop::create();
     CHECK(loop.has_value());
-    if (loop) CHECK(loop->run_until_complete(connection_tests()).has_value());
+    if (loop) {
+        CHECK(loop->run_until_complete(connection_tests()).has_value());
+        CHECK(loop->run_until_complete(byte_stream_boundaries()).has_value());
+    }
     return Mira::test::summary();
 }

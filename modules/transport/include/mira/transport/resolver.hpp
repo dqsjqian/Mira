@@ -3,6 +3,7 @@
 #include "mira/core/event_loop.hpp"
 #include "mira/transport/endpoint.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -21,10 +22,23 @@ struct ResolveQuery {
     ResolveTransport transport{ResolveTransport::tcp};
 };
 
+/// getaddrinfo supplies no DNS TTL: these lifetimes are an explicit local policy.
+/// Caching is disabled by default; only stable EAI_NONAME failures are cached.
+struct ResolverCachePolicy {
+    std::size_t capacity{0};
+    std::chrono::milliseconds positive_lifetime{0};
+    std::chrono::milliseconds negative_lifetime{0};
+};
+
 struct ResolverOptions {
     std::size_t workers{2};
     std::size_t queue_capacity{64};
     std::size_t max_results{64};
+    ResolverCachePolicy cache{};
+    bool deduplicate_in_flight{true};
+    /// Includes the first caller; finished/cancelled waiters release quota.
+    /// queue_capacity counts distinct submitted jobs, not their waiters.
+    std::size_t max_waiters_per_query{64};
 };
 
 /// getaddrinfo EAI_* errors are independent of errno/Winsock socket errors.
@@ -33,8 +47,10 @@ struct ResolverOptions {
 [[nodiscard]] const std::error_category& resolver_category() noexcept;
 [[nodiscard]] Error resolver_error(int native_code) noexcept;
 
-/// Fixed-size thread-pool system resolver; performs no DNS caching, retries,
-/// or endpoint connection selection. Cancellation/timeout only ends the wait
+/// Fixed thread-pool system resolver with optional bounded LRU policy caching
+/// and in-flight deduplication. Keys compare hostname/service/family/transport
+/// exactly, preserving system NSS semantics. No retries or connection selection.
+/// Cancellation/timeout only ends the wait
 /// and cannot interrupt a system getaddrinfo already entered. The destructor
 /// cancels all waits and joins the worker threads, possibly waiting for the
 /// system call to return; it never detaches. resolve must be called on the
@@ -68,6 +84,11 @@ public:
     /// but the EventLoop must live until the wait begins.
     [[nodiscard]] Task<Result<Endpoints>> resolve(EventLoop& loop, ResolveQuery query,
                                                  OperationOptions options = {});
+
+    /// Clear cached entries and prevent already-submitted jobs from repopulating
+    /// stale results, without cancelling waiters. As with resolve, do not call
+    /// concurrently with moving or destroying this Resolver.
+    void clear_cache();
 
 private:
     class Impl;

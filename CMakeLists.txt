@@ -91,6 +91,8 @@ function(mira_install_module target)
     foreach(entry
             "mira_tls=miraTlsTargets"
             "mira_client_tls=miraClientTlsTargets"
+            "mira_client_http2=miraClientHttp2Targets"
+            "mira_client_http3=miraClientHttp3Targets"
             "mira_crypto=miraCryptoTargets"
             "mira_ws=miraWsTargets"
             "mira_http2=miraHttp2Targets"
@@ -160,6 +162,11 @@ if(MIRA_BUILD_TESTS AND MIRA_ENABLE_WEBSOCKET AND MIRA_ENABLE_HTTP2 AND MIRA_ENA
     add_test(NAME ws.connect_network COMMAND mira_ws_connect_network
         "${MIRA_QUIC_TEST_CERT}" "${MIRA_QUIC_TEST_KEY}")
     set_tests_properties(ws.connect_network PROPERTIES TIMEOUT 90)
+endif()
+
+if(MIRA_BUILD_TESTS AND MIRA_ENABLE_HTTP3 AND MIRA_ENABLE_WEBSOCKET)
+    add_executable(mira_h3_advanced_peer tools/ci/h3_advanced_peer.cpp)
+    target_link_libraries(mira_h3_advanced_peer PRIVATE Mira::http3 Mira::ws Mira::warnings)
 endif()
 
 # ── Benchmarks ──────────────────────────────────────────────────────────────
@@ -374,10 +381,12 @@ if(MIRA_INSTALL)
         DESTINATION ${MIRA_CMAKE_DESTINATION}
     )
 
-    foreach(optional_module IN ITEMS Tls ClientTls Crypto Ws Http2 Quic Http3)
+    foreach(optional_module IN ITEMS Tls ClientTls ClientHttp2 ClientHttp3 Crypto Ws Http2 Quic Http3)
         if(((optional_module STREQUAL "Tls" OR optional_module STREQUAL "ClientTls") AND MIRA_ENABLE_TLS)
            OR ((optional_module STREQUAL "Crypto" OR optional_module STREQUAL "Ws") AND MIRA_ENABLE_WEBSOCKET)
            OR (optional_module STREQUAL "Http2" AND MIRA_ENABLE_HTTP2)
+           OR (optional_module STREQUAL "ClientHttp2" AND MIRA_ENABLE_HTTP2 AND MIRA_ENABLE_TLS)
+           OR (optional_module STREQUAL "ClientHttp3" AND MIRA_ENABLE_HTTP3)
            OR ((optional_module STREQUAL "Quic" OR optional_module STREQUAL "Http3") AND MIRA_ENABLE_HTTP3))
             install(EXPORT mira${optional_module}Targets
                 FILE mira${optional_module}Targets.cmake

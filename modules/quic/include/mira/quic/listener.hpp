@@ -90,6 +90,16 @@ public:
             return std::unexpected(quic_error(-100000));
         auto payload = 2 * options.max_buffered_bytes + extra_payload;
         auto events = 8192 + extra_queue_entries;
+        if (options.max_datagram_frame_size) {
+            if (options.max_datagram_frame_size > 65527 || options.max_datagram_bytes == 0 ||
+                options.max_datagram_bytes > 64 * 1024 * 1024 || options.max_queued_datagrams == 0 ||
+                options.max_queued_datagrams > 4096 ||
+                options.max_datagram_bytes > std::numeric_limits<std::size_t>::max() - payload - detail::kClosePacket ||
+                options.max_queued_datagrams > std::numeric_limits<std::size_t>::max() - events)
+                return std::unexpected(quic_error(-100000));
+            payload += options.max_datagram_bytes;
+            events += options.max_queued_datagrams;
+        }
         if (payload + detail::kClosePacket > limits.max_payload_bytes || events > limits.max_queue_entries)
             return std::unexpected(quic_error(-100001));
         if (!factory) {
@@ -413,7 +423,18 @@ private:
     std::uint64_t clock_ = 0;
     Id next_id_ = 1, last_polled_ = 0;
     std::map<Id, Entry> entries_;
-    std::map<Bytes, Id> routes_;
+    struct CidLess {
+        bool operator()(const Bytes& left, const Bytes& right) const noexcept {
+            const auto common = (std::min)(left.size(), right.size());
+            for (std::size_t i = 0; i < common; ++i) {
+                if (left[i] != right[i]) return left[i] < right[i];
+            }
+            return left.size() < right.size();
+        }
+    };
+    // CIDs are short byte keys; avoid the library's vector<=> memcmp path
+    // whose unconstrained size triggers GCC 14 -Wstringop-overread at -O3.
+    std::map<Bytes, Id, CidLess> routes_;
 };
 
 using Listener = Dispatcher<>;

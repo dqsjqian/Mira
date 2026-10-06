@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Out-of-process TCP loopback benchmark; JSON output, no cross-library ranking.
 
-Run a Release mira_managed_echo_server and independent Python socket clients.
-Latency includes Python scheduling, client encoding and kernel I/O. RSS is the
-server's observed OS high-water mark (or peak working set), not allocator accounting.
+Run a Release TCP echo server and independent Python socket clients, using the
+PORT= startup protocol of mira_managed_echo_server or bench_libuv_echo_server.
+Latency includes Python scheduling, client encoding and kernel I/O. Linux RSS
+is the OS high-water mark; macOS RSS is a sampled peak, not allocator accounting
+or evidence of a cross-platform ranking.
 """
 from __future__ import annotations
 import argparse
@@ -27,6 +29,7 @@ def percentile(values, fraction):
 def exchange(port, iterations, payload):
     latency = []
     with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         for _ in range(iterations):
             start = time.perf_counter_ns()
             client.sendall(payload)
@@ -57,6 +60,7 @@ def rss_kib(pid):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", required=True)
+    parser.add_argument("--label", help="implementation/version label; never inferred automatically")
     parser.add_argument("--clients", type=int, default=8)
     parser.add_argument("--requests", type=int, default=1000, help="per client")
     parser.add_argument("--payload", type=int, default=1024)
@@ -68,7 +72,7 @@ def main():
     if not 1 <= args.payload <= 1048576 or not 0 <= args.slow_clients <= 256:
         parser.error("payload/slow-clients out of range")
     server = subprocess.Popen([args.server, "0", str(args.clients + args.slow_clients), "60000"],
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
     lines = queue.Queue()
     threading.Thread(target=lambda: lines.put(server.stdout.readline()), daemon=True).start()
     slow = []
@@ -97,6 +101,7 @@ def main():
         monitor.start()
         for _ in range(args.slow_clients):
             client = socket.create_connection(("127.0.0.1", port), timeout=2)
+            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
             client.setblocking(False)
             # Deliberately never read echoed bytes; send until the OS applies pressure.
@@ -118,7 +123,10 @@ def main():
             "scenario": "tcp-loopback-slow-reader" if slow else "tcp-loopback",
             "platform": platform.platform(), "machine": platform.machine(),
             "python": platform.python_version(), "cpu_count": os.cpu_count(),
-            "server": args.server, "clients": args.clients, "slow_clients": len(slow),
+            "server": args.server, "implementation_label": args.label,
+            "clients": args.clients, "slow_clients": len(slow),
+            "client_tcp_nodelay": True,
+            "server_arguments": ["0", str(args.clients + args.slow_clients), "60000"],
             "requests": len(samples), "payload_bytes": args.payload,
             "elapsed_seconds": seconds, "requests_per_second": len(samples) / seconds,
             "roundtrip_payload_mib_per_second": len(samples) * args.payload * 2 / seconds / 1048576,

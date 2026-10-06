@@ -296,6 +296,138 @@ void test_resolver_lifetime() {
     CHECK(loop.outstanding() == 0);
 }
 
+void test_cache_policy() {
+    test::section("DNS bounded policy cache, negative results, expiry and key isolation");
+    auto loop = EventLoop::create().value();
+    std::atomic<int> calls{0};
+    auto resolver = Resolver::create({.workers = 1,
+        .cache = {.capacity = 2, .positive_lifetime = 1h, .negative_lifetime = 1h}},
+        [&](const ResolveQuery& query, std::size_t) -> Answer {
+            ++calls;
+            if (query.hostname == "missing") return Resolver::Endpoints{};
+            if (query.hostname == "temporary") return fail(std::make_error_code(std::errc::io_error));
+            return Resolver::Endpoints{Endpoint::loopback(443)};
+        }).value();
+    Answer answer;
+    bool done = false;
+    const auto resolve = [&](ResolveQuery query) {
+        CHECK(loop.run_until_complete(collect(resolver.resolve(loop, std::move(query)), answer, done)).has_value());
+    };
+    resolve({"a", "443"});
+    resolve({"b", "443"});
+    resolve({"a", "443"});
+    CHECK(calls == 2);
+    resolve({"c", "443"});
+    resolve({"b", "443"});
+    CHECK(calls == 4);
+    resolve({"missing", "443"});
+    CHECK(!answer && &answer.error().category() == &resolver_category());
+    resolve({"missing", "443"});
+    CHECK(calls == 5);
+    resolve({"temporary", "443"});
+    resolve({"temporary", "443"});
+    CHECK(calls == 7);
+    resolve({"b", "443", Family::ipv4});
+    resolve({"b", "443", Family::ipv4, ResolveTransport::udp});
+    resolve({"b", "80", Family::ipv4, ResolveTransport::udp});
+    CHECK(calls == 10);
+    auto expiring = Resolver::create({.workers = 1,
+        .cache = {.capacity = 1, .positive_lifetime = 1ms, .negative_lifetime = 1ms}},
+        [&](const ResolveQuery& query, std::size_t) -> Answer {
+            ++calls;
+            if (query.hostname == "missing") return Resolver::Endpoints{};
+            return Resolver::Endpoints{Endpoint::loopback(443)};
+        }).value();
+    // Test hits with long lifetimes and expiry separately, without scheduling races.
+    const auto expire = [](EventLoop& target) -> Task<void> {
+        CHECK((co_await target.sleep_for(3ms)).has_value());
+    };
+    for (const std::string host : {"positive", "missing"}) {
+        CHECK(loop.run_until_complete(collect(expiring.resolve(loop, {host, "80"}), answer, done)).has_value());
+        CHECK(loop.run_until_complete(expire(loop)).has_value());
+        CHECK(loop.run_until_complete(collect(expiring.resolve(loop, {host, "80"}), answer, done)).has_value());
+    }
+    CHECK(calls == 14);
+    auto disabled = Resolver::create({.workers = 1}, [&](const ResolveQuery&, std::size_t) -> Answer {
+        ++calls;
+        return Resolver::Endpoints{Endpoint::loopback(443)};
+    }).value();
+    for (int repeat = 0; repeat < 2; ++repeat)
+        CHECK(loop.run_until_complete(collect(disabled.resolve(loop, {"same", "80"}), answer, done)).has_value());
+    CHECK(calls == 16);
+    resolver.clear_cache();
+    resolve({"b", "80", Family::ipv4, ResolveTransport::udp});
+    CHECK(calls == 17);
+    CHECK(!Resolver::create({.cache = {.positive_lifetime = -1ms}}));
+    CHECK(!Resolver::create({.max_waiters_per_query = 0}));
+}
+
+void test_shared_query_cancellation() {
+    test::section("DNS in-flight deduplication, independent cancellation and bounded waiters");
+    Gate gate;
+    auto resolver = Resolver::create({.workers = 1, .queue_capacity = 1,
+        .max_waiters_per_query = 2}, gate.backend()).value();
+    auto loop = EventLoop::create().value();
+    std::stop_source stop;
+    Answer first, second, excess, replacement;
+    bool first_done = false, second_done = false, excess_done = false, replacement_done = false;
+    start(resolver.resolve(loop, {"same", "443"}, {.stop = stop.get_token()}), first, first_done);
+    gate.wait_entered();
+    start(resolver.resolve(loop, {"same", "443"}), second, second_done);
+    start(resolver.resolve(loop, {"same", "443"}), excess, excess_done);
+    CHECK(excess_done && !excess && excess.error() == Errc::limit_exceeded);
+    stop.request_stop();
+    CHECK(pump(loop, first_done));
+    CHECK(!first && first.error() == Errc::cancelled);
+    CHECK(!second_done);
+    start(resolver.resolve(loop, {"same", "443"}), replacement, replacement_done);
+    gate.release();
+    CHECK(pump(loop, second_done));
+    CHECK(pump(loop, replacement_done));
+    CHECK(second.has_value() && replacement.has_value());
+    CHECK(gate.calls == 1);
+    CHECK(loop.outstanding() == 0);
+
+    Gate timeout_gate;
+    auto timeout_resolver = Resolver::create({.workers = 1}, timeout_gate.backend()).value();
+    first_done = false;
+    second_done = false;
+    start(timeout_resolver.resolve(loop, {"same", "443"}, {.deadline = Clock::now() + 3ms}), first, first_done);
+    timeout_gate.wait_entered();
+    start(timeout_resolver.resolve(loop, {"same", "443"}), second, second_done);
+    CHECK(pump(loop, first_done));
+    CHECK(!first && first.error() == Errc::timed_out);
+    CHECK(!second_done);
+    timeout_gate.release();
+    CHECK(pump(loop, second_done));
+    CHECK(second.has_value() && timeout_gate.calls == 1);
+
+    Gate separate_gate;
+    auto separate = Resolver::create({.workers = 1, .deduplicate_in_flight = false}, separate_gate.backend()).value();
+    first_done = false;
+    second_done = false;
+    start(separate.resolve(loop, {"same", "443"}), first, first_done);
+    separate_gate.wait_entered();
+    start(separate.resolve(loop, {"same", "443"}), second, second_done);
+    separate_gate.release();
+    CHECK(pump(loop, first_done));
+    CHECK(pump(loop, second_done));
+    CHECK(first.has_value() && second.has_value() && separate_gate.calls == 2);
+
+    Gate invalidation_gate;
+    auto cached = Resolver::create({.workers = 1,
+        .cache = {.capacity = 1, .positive_lifetime = 1h}}, invalidation_gate.backend()).value();
+    first_done = false;
+    second_done = false;
+    start(cached.resolve(loop, {"same", "443"}), first, first_done);
+    invalidation_gate.wait_entered();
+    cached.clear_cache();
+    invalidation_gate.release();
+    CHECK(pump(loop, first_done));
+    CHECK(loop.run_until_complete(collect(cached.resolve(loop, {"same", "443"}), second, second_done)).has_value());
+    CHECK(first.has_value() && second.has_value() && invalidation_gate.calls == 2);
+}
+
 }  // namespace
 
 int main() {
@@ -306,5 +438,7 @@ int main() {
     test_dedup_limit_and_exceptions();
     test_result_priority();
     test_resolver_lifetime();
+    test_cache_policy();
+    test_shared_query_cancellation();
     return test::summary();
 }

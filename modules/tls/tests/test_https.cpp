@@ -8,15 +8,18 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/ocsp.h>
 #include <openssl/ssl.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
@@ -25,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -72,7 +76,9 @@ Certificate generate_certificate(EVP_PKEY* key,
                                  long serial,
                                  X509* issuer = nullptr,
                                  EVP_PKEY* issuer_key = nullptr,
-                                 const char* ext_key_usage = "serverAuth") {
+                                 const char* ext_key_usage = "serverAuth",
+                                 const char* alt_names = "DNS:localhost,IP:127.0.0.1",
+                                 bool intermediate = false) {
     Certificate certificate{X509_new(), X509_free};
     require(certificate != nullptr);
     require(X509_set_version(certificate.get(), 2) == 1);
@@ -94,20 +100,63 @@ Certificate generate_certificate(EVP_PKEY* key,
     extension(certificate.get(),
               authority,
               NID_basic_constraints,
-              issuer != nullptr ? "critical,CA:FALSE" : "critical,CA:TRUE,pathlen:0");
+              issuer != nullptr && !intermediate ? "critical,CA:FALSE" : "critical,CA:TRUE,pathlen:1");
     extension(certificate.get(),
               authority,
               NID_key_usage,
-              issuer != nullptr ? "critical,digitalSignature" : "critical,keyCertSign,cRLSign");
+              issuer != nullptr && !intermediate ? "critical,digitalSignature" : "critical,keyCertSign,cRLSign");
     extension(certificate.get(), authority, NID_subject_key_identifier, "hash");
     if (issuer != nullptr) {
         extension(certificate.get(), authority, NID_authority_key_identifier, "keyid:always");
-        extension(certificate.get(), authority, NID_ext_key_usage, ext_key_usage);
-        extension(certificate.get(), authority, NID_subject_alt_name, "DNS:localhost,IP:127.0.0.1");
+        if (!intermediate) {
+            extension(certificate.get(), authority, NID_ext_key_usage, ext_key_usage);
+            extension(certificate.get(), authority, NID_subject_alt_name, alt_names);
+        }
     }
     require(X509_sign(certificate.get(), issuer_key != nullptr ? issuer_key : key, EVP_sha256()) >
             0);
     return certificate;
+}
+
+std::vector<std::byte> generate_ocsp(X509* subject, X509* issuer, X509* signer, EVP_PKEY* key,
+    int status = V_OCSP_CERTSTATUS_GOOD, long since = -60, long until = 3600,
+    const EVP_MD* digest = nullptr, bool duplicate = false, bool corrupt_signature = false,
+    long produced_offset = 0) {
+    std::unique_ptr<OCSP_CERTID, decltype(&OCSP_CERTID_free)> id{
+        OCSP_cert_to_id(digest ? digest : EVP_sha1(), subject, issuer), OCSP_CERTID_free};
+    std::unique_ptr<OCSP_BASICRESP, decltype(&OCSP_BASICRESP_free)> basic{
+        OCSP_BASICRESP_new(), OCSP_BASICRESP_free};
+    std::unique_ptr<ASN1_TIME, decltype(&ASN1_TIME_free)> previous{
+        X509_gmtime_adj(nullptr, since), ASN1_TIME_free};
+    std::unique_ptr<ASN1_TIME, decltype(&ASN1_TIME_free)> next{
+        until == 0 ? nullptr : X509_gmtime_adj(nullptr, until), ASN1_TIME_free};
+    require(id && basic && previous && (until == 0 || next));
+    for (int i = 0; i < (duplicate ? 2 : 1); ++i) {
+        require(OCSP_basic_add1_status(basic.get(), id.get(), status,
+            OCSP_REVOKED_STATUS_KEYCOMPROMISE, status == V_OCSP_CERTSTATUS_REVOKED ? previous.get() : nullptr,
+            previous.get(), next.get()) != nullptr);
+    }
+    if (produced_offset != 0) {
+        auto* produced = const_cast<ASN1_GENERALIZEDTIME*>(OCSP_resp_get0_produced_at(basic.get()));
+        require(produced != nullptr);
+        require(ASN1_GENERALIZEDTIME_adj(produced, std::time(nullptr), 0, produced_offset) != nullptr);
+    }
+    require(OCSP_basic_sign(basic.get(), signer, key, EVP_sha256(), nullptr,
+        produced_offset == 0 ? 0UL : OCSP_NOTIME) == 1);
+    if (corrupt_signature) {
+        auto* signature = const_cast<ASN1_OCTET_STRING*>(OCSP_resp_get0_signature(basic.get()));
+        require(signature && signature->length > 0);
+        signature->data[0] ^= 1;
+    }
+    std::unique_ptr<OCSP_RESPONSE, decltype(&OCSP_RESPONSE_free)> response{
+        OCSP_response_create(OCSP_RESPONSE_STATUS_SUCCESSFUL, basic.get()), OCSP_RESPONSE_free};
+    require(response != nullptr);
+    const int size = i2d_OCSP_RESPONSE(response.get(), nullptr);
+    require(size > 0);
+    std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+    auto* output = reinterpret_cast<unsigned char*>(bytes.data());
+    require(i2d_OCSP_RESPONSE(response.get(), &output) == size);
+    return bytes;
 }
 
 struct Certificates {
@@ -119,6 +168,26 @@ struct Certificates {
     std::string key;
     std::string client;
     std::string client_key;
+    std::string alpha;
+    std::string alpha_rotated;
+    std::string beta;
+    std::string untrusted_client;
+    std::string clean_crl;
+    std::string revoked_crl;
+    std::string expired_crl;
+    std::string wrong_signature_crl;
+    std::string unrelated_crl;
+    std::string chain;
+    std::string intermediate_crl;
+    std::string complete_crl;
+    std::vector<std::byte> ocsp_good;
+    std::vector<std::byte> ocsp_sha256;
+    std::vector<std::byte> ocsp_alpha;
+    std::vector<std::byte> ocsp_rotated;
+    std::vector<std::byte> ocsp_beta;
+    std::vector<std::byte> ocsp_chain;
+    std::vector<std::byte> ocsp_delegated;
+    std::vector<std::pair<std::string, std::vector<std::byte>>> bad_ocsp;
 
     ~Certificates() {
         std::error_code ignored;
@@ -142,6 +211,42 @@ struct Certificates {
         } else {
             require(PEM_write_bio_X509(output.get(), certificate) == 1);
         }
+        return path.string();
+    }
+
+    std::string write_crl(std::string_view name, X509* issuer, EVP_PKEY* signing_key,
+                          std::span<const long> revoked = {}, bool expired = false,
+                          bool append = false) {
+        const auto path = directory / name;
+        if (!append) files.push_back(path);
+        std::unique_ptr<X509_CRL, decltype(&X509_CRL_free)> crl{X509_CRL_new(), X509_CRL_free};
+        std::unique_ptr<ASN1_TIME, decltype(&ASN1_TIME_free)> previous{
+            X509_gmtime_adj(nullptr, -3600), ASN1_TIME_free};
+        std::unique_ptr<ASN1_TIME, decltype(&ASN1_TIME_free)> next{
+            X509_gmtime_adj(nullptr, expired ? -60 : 86400), ASN1_TIME_free};
+        require(crl && previous && next);
+        require(X509_CRL_set_version(crl.get(), 1) == 1);
+        require(X509_CRL_set_issuer_name(crl.get(), X509_get_subject_name(issuer)) == 1);
+        require(X509_CRL_set1_lastUpdate(crl.get(), previous.get()) == 1);
+        require(X509_CRL_set1_nextUpdate(crl.get(), next.get()) == 1);
+        for (const long value : revoked) {
+            std::unique_ptr<X509_REVOKED, decltype(&X509_REVOKED_free)> entry{
+                X509_REVOKED_new(), X509_REVOKED_free};
+            std::unique_ptr<ASN1_INTEGER, decltype(&ASN1_INTEGER_free)> serial{
+                ASN1_INTEGER_new(), ASN1_INTEGER_free};
+            require(entry && serial);
+            require(ASN1_INTEGER_set(serial.get(), value) == 1);
+            require(X509_REVOKED_set_serialNumber(entry.get(), serial.get()) == 1);
+            require(X509_REVOKED_set_revocationDate(entry.get(), previous.get()) == 1);
+            require(X509_CRL_add0_revoked(crl.get(), entry.get()) == 1);
+            entry.release();
+        }
+        require(X509_CRL_sort(crl.get()) == 1);
+        require(X509_CRL_sign(crl.get(), signing_key, EVP_sha256()) > 0);
+        std::unique_ptr<BIO, decltype(&BIO_free)> output{
+            BIO_new_file(path.string().c_str(), append ? "a" : "w"), BIO_free};
+        require(output != nullptr);
+        require(PEM_write_bio_X509_CRL(output.get(), crl.get()) == 1);
         return path.string();
     }
 
@@ -176,6 +281,84 @@ struct Certificates {
             client_key_pair.get(), "test client", 4, ca_cert.get(), ca_key.get(), "clientAuth");
         client = write("client.pem", client_cert.get());
         client_key = write("client-key.pem", nullptr, client_key_pair.get());
+        const auto alpha_cert = generate_certificate(server_key.get(), "alpha.test", 5,
+            ca_cert.get(), ca_key.get(), "serverAuth", "DNS:alpha.test");
+        const auto rotated = generate_certificate(server_key.get(), "alpha.test", 6,
+            ca_cert.get(), ca_key.get(), "serverAuth", "DNS:alpha.test");
+        const auto beta_cert = generate_certificate(server_key.get(), "beta.test", 7,
+            ca_cert.get(), ca_key.get(), "serverAuth", "DNS:beta.test");
+        alpha = write("alpha.pem", alpha_cert.get());
+        alpha_rotated = write("alpha-rotated.pem", rotated.get());
+        beta = write("beta.pem", beta_cert.get());
+        const auto untrusted = generate_certificate(client_key_pair.get(), "untrusted client", 8,
+            unrelated_cert.get(), unrelated_key.get(), "clientAuth");
+        untrusted_client = write("untrusted-client.pem", untrusted.get());
+        clean_crl = write_crl("clean-crl.pem", ca_cert.get(), ca_key.get());
+        const std::array<long, 2> revoked{3, 4};
+        revoked_crl = write_crl("revoked-crl.pem", ca_cert.get(), ca_key.get(), revoked);
+        expired_crl = write_crl("expired-crl.pem", ca_cert.get(), ca_key.get(), {}, true);
+        wrong_signature_crl = write_crl("wrong-signature-crl.pem", ca_cert.get(), unrelated_key.get());
+        unrelated_crl = write_crl("unrelated-crl.pem", unrelated_cert.get(), unrelated_key.get());
+        const auto intermediate_key = generate_key();
+        const auto intermediate_cert = generate_certificate(intermediate_key.get(), "Intermediate CA", 9,
+            ca_cert.get(), ca_key.get(), "serverAuth", "DNS:localhost", true);
+        const auto chained = generate_certificate(server_key.get(), "localhost", 10,
+            intermediate_cert.get(), intermediate_key.get());
+        chain = write("chain.pem", chained.get());
+        {
+            std::unique_ptr<BIO, decltype(&BIO_free)> output{BIO_new_file(chain.c_str(), "a"), BIO_free};
+            require(output != nullptr);
+            require(PEM_write_bio_X509(output.get(), intermediate_cert.get()) == 1);
+        }
+        intermediate_crl = write_crl("intermediate-crl.pem", intermediate_cert.get(), intermediate_key.get());
+        complete_crl = write_crl("complete-crl.pem", intermediate_cert.get(), intermediate_key.get());
+        static_cast<void>(write_crl("complete-crl.pem", ca_cert.get(), ca_key.get(), {}, false, true));
+        ocsp_good = generate_ocsp(server_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get());
+        ocsp_sha256 = generate_ocsp(server_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get(),
+            V_OCSP_CERTSTATUS_GOOD, -60, 3600, EVP_sha256());
+        ocsp_alpha = generate_ocsp(alpha_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get());
+        ocsp_rotated = generate_ocsp(rotated.get(), ca_cert.get(), ca_cert.get(), ca_key.get());
+        ocsp_beta = generate_ocsp(beta_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get());
+        ocsp_chain = generate_ocsp(chained.get(), intermediate_cert.get(), intermediate_cert.get(), intermediate_key.get());
+        const auto responder_key = generate_key();
+        const auto responder = generate_certificate(responder_key.get(), "OCSP responder", 11,
+            ca_cert.get(), ca_key.get(), "OCSPSigning");
+        ocsp_delegated = generate_ocsp(server_cert.get(), ca_cert.get(), responder.get(), responder_key.get());
+        bad_ocsp.emplace_back("revoked", generate_ocsp(server_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get(),
+            V_OCSP_CERTSTATUS_REVOKED));
+        bad_ocsp.emplace_back("unknown status", generate_ocsp(server_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get(),
+            V_OCSP_CERTSTATUS_UNKNOWN));
+        bad_ocsp.emplace_back("expired response", generate_ocsp(server_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get(),
+            V_OCSP_CERTSTATUS_GOOD, -7200, -3600));
+        bad_ocsp.emplace_back("future response", generate_ocsp(server_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get(),
+            V_OCSP_CERTSTATUS_GOOD, 3600, 7200));
+        bad_ocsp.emplace_back("missing nextUpdate", generate_ocsp(server_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get(),
+            V_OCSP_CERTSTATUS_GOOD, -60, 0));
+        bad_ocsp.emplace_back("stale response", generate_ocsp(server_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get(),
+            V_OCSP_CERTSTATUS_GOOD, -8 * 86400, 3600));
+        bad_ocsp.emplace_back("invalid time order", generate_ocsp(server_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get(),
+            V_OCSP_CERTSTATUS_GOOD, -60, -120));
+        bad_ocsp.emplace_back("serial mismatch", ocsp_alpha);
+        bad_ocsp.emplace_back("issuer mismatch", generate_ocsp(server_cert.get(), unrelated_cert.get(), ca_cert.get(), ca_key.get()));
+        bad_ocsp.emplace_back("corrupt signature", generate_ocsp(server_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get(),
+            V_OCSP_CERTSTATUS_GOOD, -60, 3600, nullptr, false, true));
+        bad_ocsp.emplace_back("unauthorized responder", generate_ocsp(server_cert.get(), ca_cert.get(), client_cert.get(), client_key_pair.get()));
+        bad_ocsp.emplace_back("untrusted responder", generate_ocsp(server_cert.get(), ca_cert.get(), unrelated_cert.get(), unrelated_key.get()));
+        bad_ocsp.emplace_back("duplicate status records", generate_ocsp(server_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get(),
+            V_OCSP_CERTSTATUS_GOOD, -60, 3600, nullptr, true));
+        bad_ocsp.emplace_back("future producedAt", generate_ocsp(server_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get(),
+            V_OCSP_CERTSTATUS_GOOD, -60, 3600, nullptr, false, false, 3600));
+        bad_ocsp.emplace_back("stale producedAt", generate_ocsp(server_cert.get(), ca_cert.get(), ca_cert.get(), ca_key.get(),
+            V_OCSP_CERTSTATUS_GOOD, -60, 3600, nullptr, false, false, -8 * 86400));
+        auto trailing = ocsp_good;
+        trailing.push_back(std::byte{0});
+        bad_ocsp.emplace_back("trailing DER garbage", std::move(trailing));
+        auto truncated = ocsp_good;
+        truncated.pop_back();
+        bad_ocsp.emplace_back("truncated DER", std::move(truncated));
+        bad_ocsp.emplace_back("non-DER response", std::vector<std::byte>{std::byte{1}, std::byte{2}});
+        bad_ocsp.emplace_back("tryLater status", std::vector<std::byte>{
+            std::byte{0x30}, std::byte{0x03}, std::byte{0x0a}, std::byte{0x01}, std::byte{0x03}});
     }
 };
 
@@ -1821,6 +2004,816 @@ void test_sni_names(const Certificates& certificates) {
     }
 }
 
+struct EngineHandshake {
+    bool complete = false;
+    Error server_error;
+    Error client_error;
+};
+
+void transfer_engines(tls::Engine& source, tls::Engine& destination) {
+    std::array<std::byte, 4096> bytes{};
+    while (source.output_pending() != 0 && destination.input_capacity() != 0) {
+        const auto count = source.drain(std::span{bytes}.first(
+            std::min(bytes.size(), destination.input_capacity())));
+        require(count && *count != 0);
+        const auto fed = destination.feed(std::span{bytes}.first(*count));
+        require(fed && *fed == *count);
+    }
+}
+
+EngineHandshake handshake_engines(tls::Engine& server, tls::Engine& client) {
+    EngineHandshake result;
+    for (int turn = 0; turn < 256; ++turn) {
+        const auto client_step = client.handshake();
+        if (!client_step) {
+            result.client_error = client_step.error();
+            return result;
+        }
+        transfer_engines(client, server);
+        const auto server_step = server.handshake();
+        if (!server_step) {
+            result.server_error = server_step.error();
+            return result;
+        }
+        transfer_engines(server, client);
+        if (client_step->status == tls::Engine::Status::complete &&
+            server_step->status == tls::Engine::Status::complete) {
+            result.complete = true;
+            return result;
+        }
+    }
+    throw std::runtime_error("TLS engine handshake exceeded its step budget");
+}
+
+EngineHandshake handshake_contexts(const tls::Context& server_context,
+                                    const tls::Context& client_context,
+                                    std::string_view hostname = "localhost",
+                                    std::string_view protocol = {}) {
+    auto server = tls::Engine::create(server_context);
+    auto client = tls::Engine::create(client_context, hostname);
+    require(server && client);
+    auto result = handshake_engines(*server, *client);
+    if (result.complete) {
+        require(server->negotiated_protocol() == protocol);
+        require(client->negotiated_protocol() == protocol);
+        const auto sent = server->write(bytes_of("verified"));
+        require(sent && sent->transferred == 8);
+        transfer_engines(*server, *client);
+        std::array<std::byte, 8> bytes{};
+        const auto read = client->read(bytes);
+        require(read && read->transferred == bytes.size());
+        require(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()) == "verified");
+    }
+    return result;
+}
+
+// The independent OpenSSL client verifies chain/identity and observes selection via serial numbers.
+struct VerifiedClient {
+    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> context{SSL_CTX_new(TLS_client_method()), SSL_CTX_free};
+    std::unique_ptr<SSL, decltype(&SSL_free)> ssl{nullptr, SSL_free};
+    BIO* incoming = nullptr;
+    BIO* outgoing = nullptr;
+
+    VerifiedClient(const Certificates& certificates, std::string_view hostname,
+                   std::string_view sni, bool tls12 = false, bool with_client_identity = false) {
+        require(context != nullptr);
+        require(SSL_CTX_load_verify_locations(context.get(), certificates.ca.c_str(), nullptr) == 1);
+        if (with_client_identity) {
+            require(SSL_CTX_use_certificate_chain_file(context.get(), certificates.client.c_str()) == 1);
+            require(SSL_CTX_use_PrivateKey_file(context.get(), certificates.client_key.c_str(), SSL_FILETYPE_PEM) == 1);
+        }
+        SSL_CTX_set_verify(context.get(), SSL_VERIFY_PEER, nullptr);
+        require(SSL_CTX_set_min_proto_version(context.get(), TLS1_2_VERSION) == 1);
+        if (tls12) require(SSL_CTX_set_max_proto_version(context.get(), TLS1_2_VERSION) == 1);
+        ssl.reset(SSL_new(context.get()));
+        require(ssl != nullptr);
+        incoming = BIO_new(BIO_s_mem());
+        outgoing = BIO_new(BIO_s_mem());
+        require(incoming && outgoing);
+        SSL_set_bio(ssl.get(), incoming, outgoing);
+        require(X509_VERIFY_PARAM_set1_host(SSL_get0_param(ssl.get()), hostname.data(), hostname.size()) == 1);
+        const std::string servername(sni);
+        if (!servername.empty()) require(SSL_ctrl(ssl.get(), SSL_CTRL_SET_TLSEXT_HOSTNAME,
+            TLSEXT_NAMETYPE_host_name, const_cast<char*>(servername.c_str())) == 1);
+        SSL_set_connect_state(ssl.get());
+    }
+
+    bool handshake(tls::Engine& server) {
+        std::array<std::byte, 4096> bytes{};
+        for (int turn = 0; turn < 256; ++turn) {
+            ERR_clear_error();
+            const int result = SSL_do_handshake(ssl.get());
+            const int error = result == 1 ? SSL_ERROR_NONE : SSL_get_error(ssl.get(), result);
+            if (error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE)
+                return false;
+            while (BIO_ctrl_pending(outgoing) != 0) {
+                const int count = BIO_read(outgoing, bytes.data(), static_cast<int>(bytes.size()));
+                require(count > 0);
+                const auto fed = server.feed(std::span{bytes}.first(static_cast<std::size_t>(count)));
+                require(fed && *fed == static_cast<std::size_t>(count));
+            }
+            const auto step = server.handshake();
+            if (!step) return false;
+            while (server.output_pending() != 0) {
+                const auto count = server.drain(bytes);
+                require(count && *count != 0);
+                require(BIO_write(incoming, bytes.data(), static_cast<int>(*count)) == static_cast<int>(*count));
+            }
+            if (result == 1 && step->status == tls::Engine::Status::complete) return true;
+        }
+        throw std::runtime_error("independent TLS client handshake incomplete");
+    }
+
+    long peer_serial() const {
+        X509* certificate = SSL_get0_peer_certificate(ssl.get());
+        require(certificate != nullptr);
+        return ASN1_INTEGER_get(X509_get_serialNumber(certificate));
+    }
+};
+
+void test_production_sni(const Certificates& certificates) {
+    test::section("strict SNI routing, default/unknown policies and independent certificate verification");
+    using Identity = tls::Context::ServerIdentity;
+    const std::array identities{
+        Identity{"alpha.test", certificates.alpha, certificates.key},
+        Identity{"beta.test", certificates.beta, certificates.key}};
+    tls::Context::ServerConfig config{.cert_file = certificates.server, .key_file = certificates.key,
+                                      .identities = identities};
+    auto server = tls::Context::server(config);
+    auto client = tls::Context::client(certificates.ca);
+    require(server && client);
+    CHECK(handshake_contexts(*server, *client, "alpha.test").complete);
+    CHECK(handshake_contexts(*server, *client, "ALPHA.TEST").complete);
+    CHECK(handshake_contexts(*server, *client, "beta.test").complete);
+    CHECK(handshake_contexts(*server, *client, "127.0.0.1").complete);
+    // Default SAN coverage of localhost must not bypass unknown-SNI rejection.
+    CHECK(handshake_contexts(*server, *client).server_error == tls::Errc::protocol_error);
+    for (const bool tls12 : {false, true}) {
+        auto engine = tls::Engine::create(*server);
+        require(engine.has_value());
+        VerifiedClient peer{certificates, "beta.test", "beta.test", tls12};
+        CHECK(peer.handshake(*engine));
+        CHECK(peer.peer_serial() == 7);
+    }
+    config.unknown_sni = tls::Context::SniPolicy::use_default;
+    require(server->reload_server(config).has_value());
+    CHECK(handshake_contexts(*server, *client).complete);
+    CHECK(handshake_contexts(*server, *client, "unknown.test").client_error ==
+          tls::Errc::certificate_verify_failed);
+    for (const auto malformed : {"alpha.test.", "sub.alpha.test", "alpha.test.evil", "-alpha.test",
+                                  "alpha..test", "*.alpha.test", "127.0.0.1", "alpha_test"}) {
+        auto engine = tls::Engine::create(*server);
+        require(engine.has_value());
+        VerifiedClient peer{certificates, "alpha.test", malformed};
+        CHECK(!peer.handshake(*engine));
+    }
+    config.missing_sni = tls::Context::SniPolicy::reject;
+    require(server->reload_server(config).has_value());
+    CHECK(handshake_contexts(*server, *client, "127.0.0.1").server_error == tls::Errc::protocol_error);
+    config.identities = {};
+    require(server->reload_server(config).has_value());
+    CHECK(handshake_contexts(*server, *client, "127.0.0.1").server_error == tls::Errc::protocol_error);
+    for (const auto invalid : {"*.test", "alpha.test.", "alpha..test", "-alpha.test", "alpha-.test",
+                               "127.0.0.1", "[::1]", "", "alpha_test"}) {
+        const Identity entry{invalid, certificates.alpha, certificates.key};
+        config.identities = {&entry, 1};
+        const auto rejected = tls::Context::server(config);
+        CHECK(!rejected && rejected.error() == Errc::invalid_argument);
+    }
+    const std::array<std::string, 3> invalid_names{
+        std::string("alpha.test\0evil", 15), std::string(64, 'a') + ".test", "\xC3\xA9.test"};
+    for (const auto& name : invalid_names) {
+        const Identity entry{name, certificates.alpha, certificates.key};
+        config.identities = {&entry, 1};
+        const auto rejected_name = tls::Context::server(config);
+        CHECK(!rejected_name && rejected_name.error() == Errc::invalid_argument);
+    }
+    const std::array duplicate{
+        Identity{"alpha.test", certificates.alpha, certificates.key},
+        Identity{"ALPHA.TEST", certificates.alpha, certificates.key}};
+    config.identities = duplicate;
+    CHECK(!tls::Context::server(config));
+    const Identity mismatch{"beta.test", certificates.alpha, certificates.key};
+    config.identities = {&mismatch, 1};
+    const auto rejected = tls::Context::server(config);
+    CHECK(!rejected && rejected.error() == tls::Errc::configuration_error);
+}
+
+void test_sni_session_isolation_version(const Certificates& certificates, bool tls12) {
+    test::section(tls12 ? "TLS 1.2 resumption cannot bypass SNI policy or cross identity domains"
+                       : "TLS 1.3 resumption cannot bypass SNI policy or cross identity domains");
+    const std::array identities{
+        tls::Context::ServerIdentity{"alpha.test", certificates.alpha, certificates.key},
+        tls::Context::ServerIdentity{"beta.test", certificates.beta, certificates.key}};
+    tls::Context::ServerConfig config{.cert_file = certificates.server, .key_file = certificates.key,
+                                      .identities = identities};
+    auto server = tls::Context::server(config);
+    require(server.has_value());
+    auto first = tls::Engine::create(*server);
+    require(first.has_value());
+    VerifiedClient original{certificates, "alpha.test", "alpha.test", tls12};
+    CHECK(original.handshake(*first));
+    if (!tls12) {
+        std::array<std::byte, 1> bytes{};
+        std::size_t count = 0;
+        ERR_clear_error();
+        const int result = SSL_read_ex(original.ssl.get(), bytes.data(), bytes.size(), &count);
+        const int error = SSL_get_error(original.ssl.get(), result);
+        CHECK(result == 0 && error == SSL_ERROR_WANT_READ);
+    }
+    std::unique_ptr<SSL_SESSION, decltype(&SSL_SESSION_free)> session{
+        SSL_get1_session(original.ssl.get()), SSL_SESSION_free};
+    require(session != nullptr);
+    CHECK(SSL_SESSION_is_resumable(session.get()) == 1);
+    {
+        auto engine = tls::Engine::create(*server);
+        require(engine.has_value());
+        VerifiedClient same{certificates, "alpha.test", "alpha.test", tls12};
+        std::unique_ptr<SSL_SESSION, decltype(&SSL_SESSION_free)> resumed{
+            SSL_SESSION_dup(session.get()), SSL_SESSION_free};
+        require(resumed != nullptr);
+        require(SSL_set_session(same.ssl.get(), resumed.get()) == 1);
+        CHECK(same.handshake(*engine));
+        CHECK(SSL_session_reused(same.ssl.get()) == 1);
+    }
+    {
+        auto engine = tls::Engine::create(*server);
+        require(engine.has_value());
+        VerifiedClient crossed{certificates, "beta.test", "beta.test", tls12};
+        std::unique_ptr<SSL_SESSION, decltype(&SSL_SESSION_free)> resumed{
+            SSL_SESSION_dup(session.get()), SSL_SESSION_free};
+        require(resumed != nullptr);
+        require(SSL_set_session(crossed.ssl.get(), resumed.get()) == 1);
+        CHECK(crossed.handshake(*engine));
+        CHECK(SSL_session_reused(crossed.ssl.get()) == 0);
+        CHECK(crossed.peer_serial() == 7);
+    }
+    {
+        auto engine = tls::Engine::create(*server);
+        require(engine.has_value());
+        VerifiedClient unknown{certificates, "alpha.test", "unknown.test", tls12};
+        std::unique_ptr<SSL_SESSION, decltype(&SSL_SESSION_free)> resumed{
+            SSL_SESSION_dup(session.get()), SSL_SESSION_free};
+        require(resumed != nullptr);
+        require(SSL_set_session(unknown.ssl.get(), resumed.get()) == 1);
+        CHECK(!unknown.handshake(*engine));
+    }
+    const tls::Context::ServerIdentity replacement{"alpha.test", certificates.alpha_rotated, certificates.key};
+    config.identities = {&replacement, 1};
+    CHECK(server->reload_server(config).has_value());
+    auto engine = tls::Engine::create(*server);
+    require(engine.has_value());
+    VerifiedClient rotated{certificates, "alpha.test", "alpha.test", tls12};
+    require(SSL_set_session(rotated.ssl.get(), session.get()) == 1);
+    CHECK(rotated.handshake(*engine));
+    CHECK(SSL_session_reused(rotated.ssl.get()) == 0);
+    CHECK(rotated.peer_serial() == 6);
+}
+
+void test_production_mtls_alpn(const Certificates& certificates) {
+    test::section("one configuration composes SNI, multi-ALPN, TLS 1.3 and mTLS");
+    const std::array<std::string_view, 2> server_protocols{"h2", "http/1.1"};
+    const std::array<std::string_view, 2> client_protocols{"http/1.1", "h2"};
+    const std::array identities{
+        tls::Context::ServerIdentity{"alpha.test", certificates.alpha, certificates.key},
+        tls::Context::ServerIdentity{"beta.test", certificates.beta, certificates.key}};
+    tls::Context::ServerConfig server_config{
+        .cert_file = certificates.server, .key_file = certificates.key,
+        .client_ca_file = certificates.ca, .min_version = "1.3",
+        .protocols = server_protocols, .identities = identities};
+    tls::Context::ClientConfig client_config{
+        .ca_file = certificates.ca, .cert_file = certificates.client, .key_file = certificates.client_key,
+        .protocols = client_protocols};
+    auto server = tls::Context::server(server_config);
+    auto client = tls::Context::client(client_config);
+    require(server && client);
+    CHECK(handshake_contexts(*server, *client, "alpha.test", "h2").complete);
+    CHECK(handshake_contexts(*server, *client, "beta.test", "h2").complete);
+    client_config.cert_file = {};
+    client_config.key_file = {};
+    client = tls::Context::client(client_config);
+    require(client.has_value());
+    CHECK(handshake_contexts(*server, *client, "alpha.test").server_error == tls::Errc::protocol_error);
+    client_config.cert_file = certificates.untrusted_client;
+    client_config.key_file = certificates.client_key;
+    client = tls::Context::client(client_config);
+    require(client.has_value());
+    CHECK(handshake_contexts(*server, *client, "beta.test").server_error == tls::Errc::certificate_verify_failed);
+    client_config.cert_file = certificates.client;
+    const std::array<std::string_view, 1> mismatch{"unknown"};
+    client_config.protocols = mismatch;
+    client = tls::Context::client(client_config);
+    require(client.has_value());
+    CHECK(handshake_contexts(*server, *client, "alpha.test").server_error == tls::Errc::protocol_error);
+    client_config.protocol = "h2";
+    CHECK(!tls::Context::client(client_config));
+    server_config.protocol = "h2";
+    CHECK(!tls::Context::server(server_config));
+}
+
+void test_certificate_reload(const Certificates& certificates) {
+    test::section("atomic certificate reload, rollback, copied input and retained old contexts");
+    const tls::Context::ServerIdentity original{"alpha.test", certificates.alpha, certificates.key};
+    tls::Context::ServerConfig config{.cert_file = certificates.server, .key_file = certificates.key,
+                                      .identities = {&original, 1}};
+    auto server = tls::Context::server(config);
+    require(server.has_value());
+    auto established = tls::Engine::create(*server);
+    auto pending = tls::Engine::create(*server);
+    require(established && pending);
+    VerifiedClient old_peer{certificates, "alpha.test", "alpha.test"};
+    CHECK(old_peer.handshake(*established));
+    CHECK(old_peer.peer_serial() == 5);
+    {
+        std::string hostname = "alpha.test";
+        std::string cert_file = certificates.alpha_rotated;
+        std::string key_file = certificates.key;
+        std::string protocol = "h2";
+        const tls::Context::ServerIdentity replacement{hostname, cert_file, key_file};
+        const std::array<std::string_view, 1> protocols{protocol};
+        config.identities = {&replacement, 1};
+        config.protocols = protocols;
+        CHECK(server->reload_server(config).has_value());
+        hostname.assign(128, 'x');
+        cert_file.clear();
+        key_file.clear();
+        protocol.clear();
+    }
+    auto updated = tls::Engine::create(*server);
+    require(updated.has_value());
+    const tls::Context::ServerIdentity invalid{"alpha.test", certificates.beta, certificates.key};
+    config.identities = {&invalid, 1};
+    config.protocols = {};
+    CHECK(!server->reload_server(config));
+    auto unchanged = tls::Engine::create(*server);
+    require(unchanged.has_value());
+    auto client = tls::Context::client(certificates.ca);
+    require(client.has_value());
+    CHECK(!client->reload_server(config));
+    // Engines not yet handshaken retain their snapshots/callbacks after owner destruction.
+    server = tls::Context::server(certificates.server, certificates.key);
+    require(server.has_value());
+    VerifiedClient delayed_peer{certificates, "alpha.test", "alpha.test"};
+    CHECK(delayed_peer.handshake(*pending));
+    CHECK(delayed_peer.peer_serial() == 5);
+    VerifiedClient new_peer{certificates, "alpha.test", "alpha.test"};
+    const std::array<unsigned char, 3> offer{2, 'h', '2'};
+    require(SSL_set_alpn_protos(new_peer.ssl.get(), offer.data(), static_cast<unsigned>(offer.size())) == 0);
+    CHECK(new_peer.handshake(*updated));
+    CHECK(new_peer.peer_serial() == 6);
+    CHECK(updated->negotiated_protocol() == "h2");
+    VerifiedClient unchanged_peer{certificates, "alpha.test", "alpha.test"};
+    CHECK(unchanged_peer.handshake(*unchanged));
+    CHECK(unchanged_peer.peer_serial() == 6);
+    CHECK(established->write(bytes_of("old connection stays alive")).has_value());
+    CHECK(old_peer.peer_serial() == 5);
+}
+
+void test_concurrent_certificate_reload(const Certificates& certificates) {
+    test::section("concurrent engine creation and complete immutable SNI/ALPN/mTLS snapshot reload");
+    const std::array<std::string_view, 2> protocols{"h2", "http/1.1"};
+    const std::array identities{
+        tls::Context::ServerIdentity{"alpha.test", certificates.alpha, certificates.key, certificates.ocsp_alpha},
+        tls::Context::ServerIdentity{"alpha.test", certificates.alpha_rotated, certificates.key, certificates.ocsp_rotated}};
+    tls::Context::ServerConfig config{.cert_file = certificates.server, .key_file = certificates.key,
+        .client_ca_file = certificates.ca, .protocols = protocols, .identities = {&identities[0], 1}};
+    auto server = tls::Context::server(config);
+    auto client = tls::Context::client(tls::Context::ClientConfig{
+        .ca_file = certificates.ca, .cert_file = certificates.client, .key_file = certificates.client_key,
+        .protocols = protocols, .ocsp = tls::Context::OcspPolicy::require});
+    require(server && client);
+    std::atomic<bool> start{false};
+    std::atomic<unsigned> failures{0};
+    std::atomic<unsigned> successes{0};
+    std::vector<std::jthread> workers;
+    for (int worker = 0; worker < 3; ++worker) {
+        workers.emplace_back([&] {
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (int iteration = 0; iteration < 24; ++iteration) {
+                try {
+                    if (handshake_contexts(*server, *client, "alpha.test", "h2").complete) ++successes;
+                    else ++failures;
+                } catch (...) { ++failures; }
+            }
+        });
+    }
+    std::jthread updater([&] {
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        for (unsigned iteration = 0; iteration < 24; ++iteration) {
+            try {
+                auto replacement = config;
+                replacement.identities = {&identities[iteration % identities.size()], 1};
+                if (!server->reload_server(replacement)) ++failures;
+            } catch (...) { ++failures; }
+        }
+    });
+    start.store(true, std::memory_order_release);
+    updater.join();
+    workers.clear();
+    CHECK(failures.load() == 0);
+    CHECK(successes.load() == 72);
+}
+
+void test_crl_verification(const Certificates& certificates) {
+    test::section("local CRL leaf/chain checks reject revoked, expired, missing and incorrectly signed data");
+    auto server = tls::Context::server(certificates.server, certificates.key);
+    require(server.has_value());
+    tls::Context::ClientConfig config{.ca_file = certificates.ca,
+                                     .revocation = {.crl_file = certificates.clean_crl}};
+    auto client = tls::Context::client(config);
+    require(client.has_value());
+    CHECK(handshake_contexts(*server, *client).complete);
+    for (const auto* file : {&certificates.revoked_crl, &certificates.expired_crl,
+                             &certificates.unrelated_crl, &certificates.wrong_signature_crl}) {
+        config.revocation.crl_file = *file;
+        client = tls::Context::client(config);
+        require(client.has_value());
+        CHECK(handshake_contexts(*server, *client).client_error == tls::Errc::certificate_verify_failed);
+    }
+    config.revocation.crl_file = certificates.ca;
+    CHECK(!tls::Context::client(config));
+    const auto missing = (certificates.directory / "missing-crl.pem").string();
+    config.revocation.crl_file = missing;
+    CHECK(!tls::Context::client(config));
+    server = tls::Context::server(certificates.chain, certificates.key);
+    require(server.has_value());
+    config.revocation.crl_file = certificates.intermediate_crl;
+    client = tls::Context::client(config);
+    require(client.has_value());
+    CHECK(handshake_contexts(*server, *client).complete);
+    config.revocation.mode = tls::Context::CrlMode::chain;
+    client = tls::Context::client(config);
+    require(client.has_value());
+    CHECK(handshake_contexts(*server, *client).client_error == tls::Errc::certificate_verify_failed);
+    config.revocation.crl_file = certificates.complete_crl;
+    client = tls::Context::client(config);
+    require(client.has_value());
+    CHECK(handshake_contexts(*server, *client).complete);
+    const tls::Context::ServerIdentity identity{"alpha.test", certificates.alpha, certificates.key};
+    tls::Context::ServerConfig server_config{.cert_file = certificates.server, .key_file = certificates.key,
+        .client_ca_file = certificates.ca, .identities = {&identity, 1},
+        .revocation = {.crl_file = certificates.clean_crl}};
+    server = tls::Context::server(server_config);
+    client = tls::Context::client(tls::Context::ClientConfig{
+        .ca_file = certificates.ca, .cert_file = certificates.client, .key_file = certificates.client_key});
+    require(server && client);
+    CHECK(handshake_contexts(*server, *client, "alpha.test").complete);
+    auto first = tls::Engine::create(*server);
+    require(first.has_value());
+    VerifiedClient first_peer{certificates, "alpha.test", "alpha.test", true, true};
+    CHECK(first_peer.handshake(*first));
+    std::unique_ptr<SSL_SESSION, decltype(&SSL_SESSION_free)> session{
+        SSL_get1_session(first_peer.ssl.get()), SSL_SESSION_free};
+    require(session != nullptr);
+    const unsigned char* ticket = nullptr;
+    std::size_t ticket_size = 0;
+    SSL_SESSION_get0_ticket(session.get(), &ticket, &ticket_size);
+    CHECK(ticket_size == 0);
+    auto second = tls::Engine::create(*server);
+    require(second.has_value());
+    VerifiedClient resumed{certificates, "alpha.test", "alpha.test", true, true};
+    require(SSL_set_session(resumed.ssl.get(), session.get()) == 1);
+    CHECK(resumed.handshake(*second));
+    CHECK(SSL_session_reused(resumed.ssl.get()) == 0);
+    server_config.revocation.crl_file = certificates.revoked_crl;
+    CHECK(server->reload_server(server_config).has_value());
+    CHECK(handshake_contexts(*server, *client, "alpha.test").server_error == tls::Errc::certificate_verify_failed);
+    server_config.client_ca_file = {};
+    CHECK(!tls::Context::server(server_config));
+}
+
+struct StaplingServer {
+    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> context{SSL_CTX_new(TLS_server_method()), SSL_CTX_free};
+    std::unique_ptr<SSL, decltype(&SSL_free)> ssl{nullptr, SSL_free};
+    std::vector<std::byte> response;
+    std::optional<std::vector<std::byte>> wire_replacement;
+    BIO* incoming = nullptr;
+    BIO* outgoing = nullptr;
+    bool requested = false;
+
+    static int staple(SSL* ssl, void* argument) noexcept {
+        auto& peer = *static_cast<StaplingServer*>(argument);
+        peer.requested = true;
+        if (peer.response.empty()) return SSL_TLSEXT_ERR_NOACK;
+        auto* bytes = static_cast<unsigned char*>(OPENSSL_memdup(peer.response.data(), peer.response.size()));
+        if (!bytes) return SSL_TLSEXT_ERR_ALERT_FATAL;
+        if (SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_STATUS_REQ_OCSP_RESP,
+                      static_cast<long>(peer.response.size()), bytes) != 1) {
+            OPENSSL_free(bytes);
+            return SSL_TLSEXT_ERR_ALERT_FATAL;
+        }
+        return SSL_TLSEXT_ERR_OK;
+    }
+
+    StaplingServer(const Certificates& certificates, std::span<const std::byte> bytes, bool tls12,
+                    bool chained = false) : response(bytes.begin(), bytes.end()) {
+        require(context != nullptr);
+        require(SSL_CTX_use_certificate_chain_file(context.get(),
+            (chained ? certificates.chain : certificates.server).c_str()) == 1);
+        require(SSL_CTX_use_PrivateKey_file(context.get(), certificates.key.c_str(), SSL_FILETYPE_PEM) == 1);
+        require(SSL_CTX_set_min_proto_version(context.get(), tls12 ? TLS1_2_VERSION : TLS1_3_VERSION) == 1);
+        require(SSL_CTX_set_max_proto_version(context.get(), tls12 ? TLS1_2_VERSION : TLS1_3_VERSION) == 1);
+        require(SSL_CTX_callback_ctrl(context.get(), SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB,
+                                      reinterpret_cast<void (*)()>(staple)) == 1);
+        require(SSL_CTX_ctrl(context.get(), SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB_ARG, 0, this) == 1);
+        ssl.reset(SSL_new(context.get()));
+        require(ssl != nullptr);
+        incoming = BIO_new(BIO_s_mem());
+        outgoing = BIO_new(BIO_s_mem());
+        require(incoming && outgoing);
+        SSL_set_bio(ssl.get(), incoming, outgoing);
+        SSL_set_accept_state(ssl.get());
+    }
+
+    std::vector<std::byte> replace_status_record(std::span<const std::byte> source) const {
+        std::vector<std::byte> output;
+        const auto append_length = [&](std::size_t value, unsigned width) {
+            for (unsigned i = width; i > 0; --i)
+                output.push_back(static_cast<std::byte>((value >> ((i - 1) * 8)) & 255));
+        };
+        const auto length = [](std::span<const std::byte> input) {
+            std::size_t value = 0;
+            for (const auto byte : input) value = (value << 8) | std::to_integer<unsigned>(byte);
+            return value;
+        };
+        bool replaced = false;
+        while (!source.empty()) {
+            require(source.size() >= 5);
+            const auto size = length(source.subspan(3, 2));
+            require(source.size() >= 5 + size);
+            const auto record = source.first(5 + size);
+            if (record[0] == std::byte{SSL3_RT_HANDSHAKE} && size >= 8 &&
+                record[5] == std::byte{SSL3_MT_CERTIFICATE_STATUS}) {
+                require(length(record.subspan(6, 3)) == size - 4);
+                const auto& replacement = *wire_replacement;
+                output.insert(output.end(), record.begin(), record.begin() + 3);
+                append_length(replacement.size() + 8, 2);
+                output.push_back(std::byte{SSL3_MT_CERTIFICATE_STATUS});
+                append_length(replacement.size() + 4, 3);
+                output.push_back(std::byte{TLSEXT_STATUSTYPE_ocsp});
+                append_length(replacement.size(), 3);
+                output.insert(output.end(), replacement.begin(), replacement.end());
+                replaced = true;
+            } else output.insert(output.end(), record.begin(), record.end());
+            source = source.subspan(5 + size);
+        }
+        require(replaced);
+        return output;
+    }
+
+    EngineHandshake handshake(tls::Engine& client) {
+        std::array<std::byte, 4096> bytes{};
+        EngineHandshake result;
+        for (int turn = 0; turn < 256; ++turn) {
+            const auto step = client.handshake();
+            if (!step) {
+                result.client_error = step.error();
+                return result;
+            }
+            while (client.output_pending() != 0) {
+                const auto count = client.drain(bytes);
+                require(count && *count != 0);
+                require(BIO_write(incoming, bytes.data(), static_cast<int>(*count)) == static_cast<int>(*count));
+            }
+            ERR_clear_error();
+            const int code = SSL_do_handshake(ssl.get());
+            const int error = code == 1 ? SSL_ERROR_NONE : SSL_get_error(ssl.get(), code);
+            if (error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
+                result.server_error = tls::make_error_code(tls::Errc::protocol_error);
+                return result;
+            }
+            std::vector<std::byte> flight;
+            while (BIO_ctrl_pending(outgoing) != 0) {
+                const int count = BIO_read(outgoing, bytes.data(), static_cast<int>(bytes.size()));
+                require(count > 0);
+                flight.insert(flight.end(), bytes.begin(), bytes.begin() + count);
+            }
+            if (wire_replacement && !flight.empty()) {
+                flight = replace_status_record(flight);
+                wire_replacement.reset();
+            }
+            if (!flight.empty()) {
+                const auto fed = client.feed(flight);
+                require(fed && *fed == flight.size());
+            }
+            if (code == 1 && step->status == tls::Engine::Status::complete) {
+                result.complete = true;
+                return result;
+            }
+        }
+        throw std::runtime_error("independent OCSP server handshake incomplete");
+    }
+};
+
+void check_independent_staple(VerifiedClient& peer, const Certificates& certificates,
+                             std::span<const std::byte> expected) {
+    const unsigned char* bytes = nullptr;
+    const long size = SSL_ctrl(peer.ssl.get(), SSL_CTRL_GET_TLSEXT_STATUS_REQ_OCSP_RESP, 0, &bytes);
+    CHECK(size == static_cast<long>(expected.size()));
+    require(size > 0 && bytes);
+    CHECK(std::equal(expected.begin(), expected.end(), reinterpret_cast<const std::byte*>(bytes)));
+    const auto* cursor = bytes;
+    std::unique_ptr<OCSP_RESPONSE, decltype(&OCSP_RESPONSE_free)> response{
+        d2i_OCSP_RESPONSE(nullptr, &cursor, size), OCSP_RESPONSE_free};
+    require(response && cursor == bytes + size);
+    require(OCSP_response_status(response.get()) == OCSP_RESPONSE_STATUS_SUCCESSFUL);
+    std::unique_ptr<OCSP_BASICRESP, decltype(&OCSP_BASICRESP_free)> basic{
+        OCSP_response_get1_basic(response.get()), OCSP_BASICRESP_free};
+    require(basic != nullptr);
+    std::unique_ptr<BIO, decltype(&BIO_free)> input{BIO_new_file(certificates.ca.c_str(), "r"), BIO_free};
+    require(input != nullptr);
+    Certificate issuer{PEM_read_bio_X509(input.get(), nullptr, nullptr, nullptr), X509_free};
+    require(issuer != nullptr);
+    std::unique_ptr<OCSP_CERTID, decltype(&OCSP_CERTID_free)> id{
+        OCSP_cert_to_id(EVP_sha1(), SSL_get0_peer_certificate(peer.ssl.get()), issuer.get()), OCSP_CERTID_free};
+    require(id != nullptr);
+    CHECK(OCSP_basic_verify(basic.get(), SSL_get0_verified_chain(peer.ssl.get()),
+        SSL_CTX_get_cert_store(peer.context.get()), 0) == 1);
+    int status = -1;
+    ASN1_GENERALIZEDTIME* previous = nullptr;
+    ASN1_GENERALIZEDTIME* next = nullptr;
+    CHECK(OCSP_resp_find_status(basic.get(), id.get(), &status, nullptr, nullptr, &previous, &next) == 1);
+    CHECK(status == V_OCSP_CERTSTATUS_GOOD);
+    CHECK(OCSP_check_validity(previous, next, 300, 7 * 86400) == 1);
+}
+
+void test_ocsp_client(const Certificates& certificates) {
+    test::section("OCSP request/require verifies independent server signature, issuer/serial, time and status");
+    using Policy = tls::Context::OcspPolicy;
+    for (const bool tls12 : {true, false}) {
+        for (const auto policy : {Policy::disabled, Policy::request, Policy::require}) {
+            auto context = tls::Context::client(tls::Context::ClientConfig{.ca_file = certificates.ca, .ocsp = policy});
+            require(context.has_value());
+            for (const auto* bytes : {&certificates.ocsp_good, &certificates.ocsp_sha256, &certificates.ocsp_delegated}) {
+                StaplingServer server{certificates, *bytes, tls12};
+                auto engine = tls::Engine::create(*context, "localhost");
+                require(engine.has_value());
+                CHECK(server.handshake(*engine).complete);
+                CHECK(server.requested == (policy != Policy::disabled));
+            }
+            StaplingServer absent{certificates, {}, tls12};
+            auto engine = tls::Engine::create(*context, "localhost");
+            require(engine.has_value());
+            const auto result = absent.handshake(*engine);
+            if (policy == Policy::require) CHECK(result.client_error == tls::Errc::certificate_verify_failed);
+            else CHECK(result.complete);
+            if (policy == Policy::disabled) continue;
+            for (const auto& [name, bytes] : certificates.bad_ocsp) {
+                test::section(name);
+                StaplingServer bad{certificates, bytes, tls12};
+                auto connection = tls::Engine::create(*context, "localhost");
+                require(connection.has_value());
+                const auto rejected = bad.handshake(*connection);
+#if OPENSSL_VERSION_NUMBER >= 0x30600000L
+                // OpenSSL 3.6 filters wrong serial/bad DER and strips trailing data on re-encoding.
+                // Raw TLS 1.2 injection below proves the client receives the negative bytes.
+                const bool normalized = name == "trailing DER garbage";
+                const bool omitted = name == "serial mismatch" || name == "truncated DER" || name == "non-DER response";
+                if (normalized || (omitted && policy == Policy::request)) {
+                    CHECK(rejected.complete);
+                    continue;
+                }
+#endif
+                test::report(!rejected.complete, name, __FILE__, __LINE__);
+                CHECK(rejected.client_error == tls::Errc::certificate_verify_failed);
+                CHECK(connection->output_pending() != 0);
+                const auto write = connection->write(bytes_of("must not send"));
+                CHECK(!write && write.error() == tls::Errc::invalid_state);
+            }
+        }
+        auto context = tls::Context::client(tls::Context::ClientConfig{
+            .ca_file = certificates.ca, .ocsp = Policy::require});
+        require(context.has_value());
+        StaplingServer intermediate{certificates, certificates.ocsp_chain, tls12, true};
+        auto engine = tls::Engine::create(*context, "localhost");
+        require(engine.has_value());
+        CHECK(intermediate.handshake(*engine).complete);
+        StaplingServer trusted_staple_wrong_name{certificates, certificates.ocsp_good, tls12};
+        engine = tls::Engine::create(*context, "wrong.test");
+        require(engine.has_value());
+        CHECK(trusted_staple_wrong_name.handshake(*engine).client_error == tls::Errc::certificate_verify_failed);
+        context = tls::Context::client(tls::Context::ClientConfig{
+            .ca_file = certificates.other_ca, .ocsp = Policy::require});
+        require(context.has_value());
+        StaplingServer trusted_staple_wrong_ca{certificates, certificates.ocsp_good, tls12};
+        engine = tls::Engine::create(*context, "localhost");
+        require(engine.has_value());
+        CHECK(trusted_staple_wrong_ca.handshake(*engine).client_error == tls::Errc::certificate_verify_failed);
+    }
+}
+
+void test_ocsp_wire_validation(const Certificates& certificates) {
+    test::section("raw TLS 1.2 CertificateStatus injection avoids OpenSSL 3.6 normalization masking negative cases");
+    for (const auto policy : {tls::Context::OcspPolicy::request, tls::Context::OcspPolicy::require}) {
+        auto context = tls::Context::client(tls::Context::ClientConfig{.ca_file = certificates.ca, .ocsp = policy});
+        require(context.has_value());
+        for (const auto& [name, bytes] : certificates.bad_ocsp) {
+            if (name != "trailing DER garbage" && name != "truncated DER" && name != "non-DER response" && name != "serial mismatch") continue;
+            StaplingServer server{certificates, certificates.ocsp_good, true};
+            server.wire_replacement = bytes;
+            auto engine = tls::Engine::create(*context, "localhost");
+            require(engine.has_value());
+            const auto result = server.handshake(*engine);
+            test::report(!result.complete, name, __FILE__, __LINE__);
+            CHECK(result.client_error == tls::Errc::certificate_verify_failed);
+        }
+    }
+}
+
+void test_ocsp_server(const Certificates& certificates) {
+    test::section("server OCSP independent verification, identity isolation, DER ownership, reload and rollback");
+    const std::array identities{
+        tls::Context::ServerIdentity{"alpha.test", certificates.alpha, certificates.key, certificates.ocsp_alpha},
+        tls::Context::ServerIdentity{"beta.test", certificates.beta, certificates.key, certificates.ocsp_beta}};
+    tls::Context::ServerConfig config{.cert_file = certificates.server, .key_file = certificates.key,
+        .identities = identities, .unknown_sni = tls::Context::SniPolicy::use_default,
+        .ocsp_response = certificates.ocsp_good};
+    auto context = tls::Context::server(config);
+    require(context.has_value());
+    for (const bool tls12 : {true, false}) {
+        for (const auto& [name, bytes] : std::array<std::pair<std::string_view, const std::vector<std::byte>*>, 3>{
+            { {"localhost", &certificates.ocsp_good}, {"alpha.test", &certificates.ocsp_alpha}, {"beta.test", &certificates.ocsp_beta} }}) {
+            auto engine = tls::Engine::create(*context);
+            require(engine.has_value());
+            VerifiedClient peer{certificates, name, name, tls12};
+            require(SSL_set_tlsext_status_type(peer.ssl.get(), TLSEXT_STATUSTYPE_ocsp) == 1);
+            CHECK(peer.handshake(*engine));
+            check_independent_staple(peer, certificates, *bytes);
+        }
+    }
+    auto old_engine = tls::Engine::create(*context);
+    require(old_engine.has_value());
+    {
+        auto copied_der = certificates.ocsp_rotated;
+        const tls::Context::ServerIdentity rotated{"alpha.test", certificates.alpha_rotated, certificates.key, copied_der};
+        config.identities = {&rotated, 1};
+        CHECK(context->reload_server(config).has_value());
+        std::fill(copied_der.begin(), copied_der.end(), std::byte{0});
+    }
+    auto new_engine = tls::Engine::create(*context);
+    require(new_engine.has_value());
+    const std::array<std::byte, 2> invalid{std::byte{1}, std::byte{2}};
+    const tls::Context::ServerIdentity invalid_identity{"alpha.test", certificates.alpha_rotated, certificates.key, invalid};
+    config.identities = {&invalid_identity, 1};
+    CHECK(!context->reload_server(config));
+    auto unchanged = tls::Engine::create(*context);
+    require(unchanged.has_value());
+    context = tls::Context::server(certificates.server, certificates.key);
+    for (auto* engine : {&*old_engine, &*new_engine, &*unchanged}) {
+        VerifiedClient peer{certificates, "alpha.test", "alpha.test"};
+        require(SSL_set_tlsext_status_type(peer.ssl.get(), TLSEXT_STATUSTYPE_ocsp) == 1);
+        CHECK(peer.handshake(*engine));
+        check_independent_staple(peer, certificates, engine == &*old_engine ? certificates.ocsp_alpha : certificates.ocsp_rotated);
+    }
+    config.identities = {};
+    auto required_client = tls::Context::client(tls::Context::ClientConfig{
+        .ca_file = certificates.ca, .ocsp = tls::Context::OcspPolicy::require});
+    require(required_client.has_value());
+    for (const auto& [name, bytes] : certificates.bad_ocsp) {
+        if (name != "expired response" && name != "serial mismatch" && name != "issuer mismatch" &&
+            name != "corrupt signature" && name != "revoked" && name != "unknown status") continue;
+        config.ocsp_response = bytes;
+        auto unvalidated_staple = tls::Context::server(config);
+        // The server publishes DER, not trust decisions; the client must still reject invalid status.
+        CHECK(unvalidated_staple.has_value());
+        require(unvalidated_staple.has_value());
+        CHECK(handshake_contexts(*unvalidated_staple, *required_client).client_error ==
+              tls::Errc::certificate_verify_failed);
+    }
+    auto trailing = certificates.ocsp_good;
+    trailing.push_back(std::byte{0});
+    config.ocsp_response = trailing;
+    CHECK(!tls::Context::server(config));
+    std::vector<std::byte> oversized(tls::Context::max_ocsp_response_bytes + 1);
+    config.ocsp_response = oversized;
+    CHECK(!tls::Context::server(config));
+    config.ocsp_response = certificates.ocsp_good;
+    const tls::Context::ServerIdentity unstapled{"alpha.test", certificates.alpha, certificates.key};
+    config.identities = {&unstapled, 1};
+    context = tls::Context::server(config);
+    auto requiring = tls::Context::client(tls::Context::ClientConfig{
+        .ca_file = certificates.ca, .ocsp = tls::Context::OcspPolicy::require});
+    require(context && requiring);
+    CHECK(handshake_contexts(*context, *requiring, "alpha.test").client_error == tls::Errc::certificate_verify_failed);
+    CHECK(handshake_contexts(*context, *requiring).complete);
+    const std::array<std::string_view, 2> protocols{"h2", "http/1.1"};
+    config.identities = identities;
+    config.ocsp_response = {};
+    context = tls::Context::server(config);
+    require(context.has_value());
+    CHECK(handshake_contexts(*context, *requiring, "alpha.test").complete);
+    CHECK(handshake_contexts(*context, *requiring).client_error == tls::Errc::certificate_verify_failed);
+    config.client_ca_file = certificates.ca;
+    config.protocols = protocols;
+    config.revocation.crl_file = certificates.clean_crl;
+    context = tls::Context::server(config);
+    requiring = tls::Context::client(tls::Context::ClientConfig{
+        .ca_file = certificates.ca, .cert_file = certificates.client, .key_file = certificates.client_key,
+        .protocols = protocols, .revocation = {.crl_file = certificates.clean_crl}, .ocsp = tls::Context::OcspPolicy::require});
+    require(context && requiring);
+    CHECK(handshake_contexts(*context, *requiring, "alpha.test", "h2").complete);
+}
+
 void test_configuration(const Certificates& certificates) {
     test::section("TLS configuration errors and error domains");
     const auto missing = (certificates.directory / "does-not-exist.pem").string();
@@ -1831,6 +2824,10 @@ void test_configuration(const Certificates& certificates) {
     const auto mismatched = tls::Context::server(certificates.ca, certificates.key);
     CHECK(!mismatched && mismatched.error() == tls::Errc::configuration_error);
     CHECK(tls::make_error_code(tls::Errc::truncated) != make_error_code(Errc::eof));
+    auto default_trust = tls::Context::client();
+    auto local_server = tls::Context::server(certificates.server, certificates.key);
+    require(default_trust && local_server);
+    CHECK(handshake_contexts(*local_server, *default_trust).client_error == tls::Errc::certificate_verify_failed);
 }
 
 }  // namespace
@@ -1865,6 +2862,16 @@ int main(int argc, char** argv) {
         Certificates certificates;
         certificates.create();
         test_configuration(certificates);
+        test_production_sni(certificates);
+        test_sni_session_isolation_version(certificates, true);
+        test_sni_session_isolation_version(certificates, false);
+        test_production_mtls_alpn(certificates);
+        test_certificate_reload(certificates);
+        test_concurrent_certificate_reload(certificates);
+        test_crl_verification(certificates);
+        test_ocsp_client(certificates);
+        test_ocsp_wire_validation(certificates);
+        test_ocsp_server(certificates);
         test_sni_names(certificates);
         test_duplex(certificates);
         test_deterministic_scheduling(certificates);

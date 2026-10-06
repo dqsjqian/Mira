@@ -120,7 +120,8 @@ backend                kqueue · epoll · IOCP
 
 This diagram describes runtime composition, not concrete header dependencies.
 HTTP/1 and TLS use core stream concepts and do not depend on TCP. Shared HTTP
-fields live in dependency-free `Mira::http_common`; H3 does not require H2.
+fields live in `Mira::http_common`, which also exports core-only session scheduling;
+H3 does not require H2.
 `Mira::socks` and `Mira::mqtt` depend on core only and run over any bounded
 stream (TCP, TLS, local); `Mira::dns` adds `Mira::http` for the DoH mapping.
 `Mira::client` is a separate composition target linking HTTP, SOCKS5 and transport;
@@ -546,7 +547,8 @@ early data. Raw QUIC 0-RTT additionally requires `EarlyDataPolicy::replay_safe`,
 a compatible cached ticket and explicit `open_early_stream` / `write_early`.
 Applications inspect `early_data_status` and own the replay-safety decision;
 rejected data is never replayed automatically at the QUIC layer. This provides
-no anti-replay guarantee. A server engine reports `accepted` once TLS accepted
+no anti-replay guarantee by default; explicit replay-store scope is described
+below. A server engine reports `accepted` once TLS accepted
 early data, the 0-RTT read key is installed and the 1-RTT write key exists; it
 may then open streams for 0.5-RTT responses, still bounded by ngtcp2's
 anti-amplification limit. `Options::early_data_context` is opaque application
@@ -589,8 +591,15 @@ carried 0-RTT data are surfaced with `Event::early_data`, and the application
 decides whether a safe-method request may run twice (RFC 8470: answer 425 if
 not). Early requests with unsafe methods, including extended CONNECT, are
 answered `425 Too Early` by the engine and never surfaced; their request body
-is consumed and discarded. There is no anti-replay store: a captured 0-RTT
-flight can be replayed to any server sharing the ticket domain.
+is consumed and discarded. With no explicit replay store, a captured early
+flight may be replayed within the ticket domain. `Options::replay_store` is
+bound to `ServerContext`; `MemoryReplayStore` implements bounded thread-safe
+atomic admission of authenticated ClientHello identities, rejecting duplicate,
+full, clock-rollback or storage-failure claims without evicting live records.
+All users of a ticket domain share the store. Cross-process/restart protection
+requires application-provided atomic durable storage and a common clock basis;
+do not restore old ticket keys with a fresh in-memory store. This is not
+business-transaction exactly-once or Retry token single-use enforcement.
 
 ### H2/H3 Extended CONNECT and WebSocket
 
@@ -606,10 +615,14 @@ retained output remain bounded. FIN and RESET stay distinct terminal states.
 `http2::ConnectStream<Driver>` / `http3::ConnectStream<Driver>` borrow accepted
 streams and stable engine/driver objects. Drivers supply
 `progress(OperationOptions)` / `flush(OperationOptions)` returning
-`Task<Result<void>>`, serialize connection I/O and honor budgets. One adapter
-allows one operation at a time, not a simultaneous read/write pair. The caller
-owns cross-stream scheduling and all borrowed lifetimes; do not mix direct body
-operations with adapter I/O. `finish` half-closes local output, while
+`Task<Result<void>>`, serialize connection I/O and honor budgets. Legacy drivers
+allow only one operation. The built-in `SessionDriver` owns independent read and
+write tasks (and QUIC expiry handling), enabling one read plus one write per
+adapter. Single-stream cancellation does not cancel shared wire I/O; consuming
+input only notifies output progress rather than waiting behind a blocked writer.
+Callers finish business tasks, stop and join the driver before destruction.
+All borrowed lifetimes remain explicit; do not mix direct body operations with
+adapter I/O. `finish` half-closes local output, while
 close/cancellation resets the stream. A connection-level driver failure can
 still affect other streams. Destruction during a pending operation aborts.
 
@@ -619,7 +632,7 @@ and optional permessage-deflate; lower-level field-only negotiation helpers
 also exist. After SETTINGS, accepted-stream and transport-security checks,
 pass the resulting `Negotiated` to `Connection::adopt_extended_connect`.
 No HTTP/1 Upgrade, nonce or accept-digest exchange runs on this path. These
-helpers do not perform network I/O or relax ConnectStream's single-operation
+helpers do not perform network I/O or change the selected driver's concurrency
 contract. The default compression policy remains disabled.
 
 ### SOCKS5, DNS/DoH and MQTT
@@ -629,7 +642,12 @@ any bounded stream, for both the client and the proxy side. Every message is
 read at its exact length, so after a handshake the stream is positioned at the
 first tunnelled byte and TLS or HTTP can follow without a pushback buffer.
 Addresses are parsed and formatted strictly; non-success replies become typed
-errors; the proxy side parses BIND and UDP ASSOCIATE only to refuse them.
+errors. BIND exposes its two responses; UDP ASSOCIATE has strict unfragmented
+UDP framing. `client::Socks5UdpSession` owns the control/socket pair and requires
+an explicitly joined control monitor; control EOF closes the relay. It filters
+relay source addresses, never resolves target names locally, and rejects
+unsupported fragments. Relay authorization and general proxy serving remain
+application policy.
 `client::dial_via_socks5` composes `tcp::dial` and `socks::connect` under one
 deadline and sends domain targets unresolved, so no lookup for the target
 leaks outside the tunnel. Credentials are clear text per RFC 1929.
@@ -643,8 +661,12 @@ trailing bytes are enforced. A, AAAA, CNAME/NS/PTR, MX, TXT, SOA and EDNS(0)
 RDATA. Encoding never compresses. The RFC 8484 helpers map GET/POST in both
 directions with strict base64url, media-type and status checks and HTTP error
 mapping; `doh::query` runs one exchange over an HTTP/1 `ClientConnection`,
-including over TLS, and HTTP/2/3 callers use the request/response helpers.
-Queries use id 0 and responses must answer the question.
+including over TLS. `doh::query_multiplexed` maps a bounded H2/H3 client request
+contract to the same status/media-type/size/identity/Age validation without
+coupling either protocol engine. Queries use id 0 and responses must answer
+the question. `query_udp` / `query_tcp` separately implement asynchronous
+wire exchanges on dedicated borrowed transports with explicit deadlines;
+server discovery, NSS, automatic TCP fallback and DNSSEC remain outside them.
 
 `Mira::mqtt` covers MQTT 3.1.1 and 5.0 in three layers. The codec encodes and
 decodes all fifteen packet types for both roles and refuses to emit anything
@@ -674,8 +696,16 @@ asynchronous authentication callback `(const Event&, OperationOptions)` so
 initial AUTH challenges can be answered before CONNACK; the method must match
 CONNECT throughout, and callback waits should honor the operation options.
 Received QoS 1 messages are
-acknowledged when surfaced. Out of scope: a broker, MQTT over WebSocket,
-outbound topic aliases, persistent session storage and reconnect policy.
+acknowledged when surfaced. `ws::ByteStream` adapts negotiated binary WebSocket
+messages to the client stream contract. Versioned `checkpoint/restore` serializes
+QoS 1/2 in-flight state and inbound QoS 2 release IDs, binding broker/tenant scope,
+client ID and version. Client-owned Session snapshots must use the queue-aware
+Client entry point, which refuses undelivered events and pending I/O. Expired
+completion IDs remain reserved until consumed; restoration separates expiry
+notices from the CONNACK handshake budget. Atomic disk storage, confidentiality,
+business transactions and clock persistence remain caller responsibilities.
+This is not a WAL or business exactly-once. A broker, outbound topic aliases
+and automatic reconnect policy are not included.
 
 ### Managed serving and grace shutdown
 
@@ -797,17 +827,82 @@ run is worth doing anyway. It turns a class of mistake that would otherwise
 cost a twenty-minute CI round trip into a local error message, without
 pretending to be verification.
 
+## Mainline production extensions
+
+- `client::Http2Client` / `Http3Client` own origin-keyed multiplexed transports,
+  TLS/QUIC and session scheduling. One origin shares connection establishment;
+  explicit origin/request caps return backpressure, never an unbounded queue.
+  Request stop/deadline is independent of other callers. Stop/close/join drains
+  connecting and active requests before destroying drivers and transports.
+  Optional CMake components carry only their own protocol dependency closure.
+  No automatic protocol downgrade or business-request retry is performed.
+- TLS server identity tables are immutable snapshots selected from the current
+  ClientHello. Reload loads and validates outside the publication lock; new
+  engines capture the replacement and existing engines retain their generation.
+  mTLS, ALPN and revocation policies are common to identities. Explicit OCSP
+  request/require validates the leaf's staple without online fetching; native
+  operating-system trust remains a separate, unimplemented policy.
+- QUIC PMTUD, UDP payload ceiling and congestion algorithm are configurable.
+  RFC 9221 DATAGRAM queues are independently bounded and drop overflow without
+  stalling reliable streams; this is not HTTP/3 DATAGRAM/WebTransport. qlog sinks
+  and connection statistics are opt-in, with callback lifetime/reentrancy rules.
+- System Resolver caches use caller-selected policy ages, never invented DNS
+  TTLs. In-flight coalescing preserves independent cancellation. Separate wire
+  queries have no resolver worker to join; they do not replace NSS automatically.
+- Operation observers and stream decorators report metadata, not payloads;
+  fixed-size metrics can be shared across loops. Sink implementations must be
+  nonblocking/noexcept and must not reenter or destroy observed owners.
+- Independent aioquic validates accepted/rejected early data and WebSocket
+  Extended CONNECT in the client-to-Mira-server direction. A 1,800-second,
+  16-client real-UDP fault snapshot completed 116,480 requests with zero final
+  connection/route/queue reservations; these are bounded loopback observations,
+  not WAN, every future revision or process-RSS certification.
+
 ## Next-phase goals
 
 The 2026-09-29 phase delivered HTTP/3 0-RTT, HTTP/1 `Expect: 100-continue` with
 duplex early-response handling, and the independent SOCKS5, DNS/DoH and MQTT
-modules; their boundaries are recorded above. Still open: an anti-replay store
-for 0-RTT, remembered server SETTINGS on the client, DoH over HTTP/2 and
-HTTP/3 as a packaged query, MQTT over WebSocket and session persistence,
-independent third-party interoperability for Extended CONNECT, device runs,
-and multi-host/WAN measurements. gRPC, Redis and WebRTC stay ecosystem layers
+modules; their boundaries are recorded above. Subsequent mainline work adds
+structured duplex H2/H3 scheduling, in-process replay admission, multiplexed
+DoH mapping, MQTT WebSocket/checkpoints, TLS identity/revocation configuration,
+UDP metadata and independent aioquic early-data/Extended CONNECT checks.
+Still open: remembered server SETTINGS, native system trust, distributed durable
+replay storage, Windows ancillary data, device runs and multi-host/WAN evidence. gRPC, Redis and WebRTC stay ecosystem layers
 above the network core. Release and downstream migrations remain separate from
 work on Mira itself.
+
+## Production composition additions (unreleased main)
+
+- `tls::Context` publishes immutable certificate/SNI snapshots. New engines
+  obtain the latest snapshot; existing engines retain theirs. Every identity
+  and generation has an isolated resumption scope. mTLS and multi-ALPN compose
+  in the same configuration. Local CRLs and explicit OCSP request/require
+  policy are bounded and offline; OpenSSL trust is not native OS policy.
+- Resolver caches are opt-in bounded local policy caches, not TTLs supplied by
+  getaddrinfo. In-flight callers have independent cancellation. Dedicated
+  `dns::query_udp/query_tcp` operations do not create background resolver
+  threads; server selection, automatic fallback and retry remain application
+  policy. UDP supports ASM membership and POSIX packet metadata/source control;
+  Windows ancillary data is explicitly unsupported.
+- QUIC exposes PMTUD/UDP payload and congestion settings, unreliable RFC 9221
+  DATAGRAM messages, qlog and connection statistics. DATAGRAM receive overflow
+  drops messages rather than consuming unbounded memory or blocking reliable
+  streams. This is not an HTTP/3 DATAGRAM or WebTransport implementation.
+- `ws::ByteStream` transports binary-stream protocols including MQTT. MQTT
+  checkpoint/restore binds format version, client ID and a caller-supplied
+  broker/tenant scope; pending delivery notices prevent unsafe snapshots and
+  identifier reuse. Durable atomic disk writes and business transactions are
+  outside the checkpoint format. SOCKS5 provides BIND replies and UDP ASSOCIATE
+  framing/lifetime composition; fragmented SOCKS UDP is refused.
+- `observe` decorates arbitrary result tasks; `ObservedStream` selects wire or
+  plaintext observation by placement. Notifications carry correlation, duration,
+  outcome and byte count, not payload data. Fixed-size metrics are thread-safe;
+  external sinks must be noexcept, non-blocking and safe for their sharing scope.
+- Independent aioquic-to-Mira validation covers authenticated H3, accepted and
+  rejected early data, and WebSocket Extended CONNECT binary/control/close.
+  Its direction and workload are explicit; this does not certify every stack.
+  A 1,800-second 16-client loopback fault snapshot completed 116,480 requests
+  and drained resource counters to zero. This is not multi-host/WAN evidence.
 
 ## Decisions on record
 

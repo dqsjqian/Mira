@@ -6,6 +6,13 @@ if(MIRA_ENABLE_WEBSOCKET)
     set_tests_properties(http2_connect PROPERTIES TIMEOUT 30)
 endif()
 
+add_executable(mira_test_http2_runtime test_session_runtime.cpp)
+target_link_libraries(mira_test_http2_runtime PRIVATE Mira::http2 Mira::transport Mira::warnings)
+add_test(NAME http2_runtime COMMAND mira_test_http2_runtime)
+set_tests_properties(http2_runtime PROPERTIES TIMEOUT 45)
+add_test(NAME http2_runtime_abandon COMMAND mira_test_http2_runtime --death)
+set_tests_properties(http2_runtime_abandon PROPERTIES WILL_FAIL TRUE TIMEOUT 10)
+
 add_executable(mira_test_http2 test_session.cpp)
 target_link_libraries(mira_test_http2 PRIVATE Mira::http2 Mira::warnings NGHTTP2::NGHTTP2)
 target_include_directories(mira_test_http2 PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)

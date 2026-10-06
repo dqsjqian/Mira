@@ -38,12 +38,22 @@ reasoning; this is a summary, not the specification.
 ## Additional transports and composition
 
 - `udp::Socket` preserves message boundaries with bounded send/receive,
-  truncation reporting, stop tokens and deadlines. `DatagramTransport` is a
-  separate concept: a UDP datagram is never represented as an `AsyncStream`.
+  truncation reporting, stop tokens and deadlines. ASM multicast membership,
+  outgoing interface, hops and loopback are explicit operations. POSIX packet
+  metadata includes destination/interface, traffic class and kernel receive
+  timestamp; `send_message` selects supported per-packet source information.
+  Unsupported metadata options fail explicitly on Windows. No SSM or batch API
+  is implied. `DatagramTransport` remains separate from `AsyncStream`.
 - `local::Socket` and `local::Listener` implement Unix-domain streams on
   supported POSIX platforms.
 - The resolver and `tcp::dial` compose bounded system name resolution with
-  family-interleaved connection attempts. DNS/DoH wire codecs live in `dns`.
+  family-interleaved connection attempts. Optional bounded positive/negative
+  policy caching and in-flight query coalescing preserve independent waiter
+  cancellation. Cache lifetimes are caller policy, not DNS TTL; `clear_cache`
+  prevents old in-flight results repopulating the cache. Entered `getaddrinfo`
+  calls still cannot be interrupted and destruction joins their workers.
+  `dns::query_udp` / `query_tcp` offer separately composed, deadline-bounded
+  wire exchanges without resolver threads, not automatic NSS/server discovery.
 - `tcp::serve` adds connection admission, structured handlers and staged
   shutdown. Resource reservations are accounting limits, not process-RSS caps.
 

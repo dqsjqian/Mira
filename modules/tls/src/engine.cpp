@@ -11,8 +11,10 @@ namespace Mira::tls {
 
 struct Engine::Impl {
     ResourceBudget::Reservation reservation;
+    std::shared_ptr<const ContextSnapshot> snapshot;
     SSL* ssl = nullptr;
     BIO* wire = nullptr;
+    OcspWireState ocsp;
     bool ready = false;
     bool failed = false;
     bool sent_shutdown = false;
@@ -39,7 +41,7 @@ struct Engine::Impl {
         default:
             failed = true;
             ERR_clear_error();
-            if (SSL_get_verify_result(ssl) != X509_V_OK)
+            if (ocsp.invalid || SSL_get_verify_result(ssl) != X509_V_OK)
                 return fail(make_error_code(Errc::certificate_verify_failed));
             return fail(make_error_code(Errc::protocol_error));
         }
@@ -65,9 +67,14 @@ Result<Engine> Engine::create(const Context& context, std::string_view peer_name
     }
     auto impl = std::make_unique<Impl>();
     impl->reservation = std::move(reservation);
+    impl->snapshot = context.impl_->load_snapshot();
     ERR_clear_error();
-    impl->ssl = SSL_new(context.impl_->handle);
+    impl->ssl = SSL_new(impl->snapshot->handle.get());
     if (!impl->ssl) return fail(make_error_code(Errc::configuration_error));
+    if (impl->snapshot->ocsp != Context::OcspPolicy::disabled) {
+        auto tracked = track_peer_ocsp(impl->ssl, impl->ocsp);
+        if (!tracked) return fail(tracked.error());
+    }
     BIO* internal = nullptr;
     ERR_clear_error();
     if (BIO_new_bio_pair(&internal, buffer_capacity, &impl->wire, buffer_capacity) != 1)
@@ -132,7 +139,13 @@ Result<Engine::Step> Engine::handshake() {
     ERR_clear_error();
     const int result = SSL_do_handshake(impl_->ssl);
     auto step = impl_->classify(result);
-    if (step && step->status == Status::complete) impl_->ready = true;
+    if (step && step->status == Status::complete) {
+        if (!verify_peer_ocsp(impl_->ssl, impl_->snapshot->ocsp)) {
+            impl_->failed = true;
+            return fail(make_error_code(Errc::certificate_verify_failed));
+        }
+        impl_->ready = true;
+    }
     if (step && step->status == Status::eof) {
         impl_->failed = true;
         return fail(make_error_code(Errc::protocol_error));

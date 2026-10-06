@@ -4,6 +4,66 @@ Version source, compatibility policy and consumption instructions are maintained
 in the [release guide](docs/RELEASES.md). Version headings below are historical
 records; they are not additional definitions of the current build version.
 
+## [Unreleased]
+
+### Added
+
+- Opt-in H2/H3 structured session drivers with independent input/output progress,
+  stream-local cancellation, bounded multi-request client sessions and duplex
+  Extended CONNECT. Owning per-origin H2/TLS and H3 client pools enforce explicit
+  origin/active limits and joined shutdown without business-request retries.
+  Legacy caller-provided drivers retain their exclusive contract.
+- TLS per-name certificate selection, immutable generation snapshots and atomic
+  server reload, combined mTLS/multi-ALPN policy and local fail-closed CRL checks.
+  Server OCSP stapling publishes caller-supplied DER responses; clients validate
+  strictly under request/require policies (signature, issuer/serial binding,
+  validity windows, status) with raw CertificateStatus checks against OpenSSL
+  re-encoding.
+- Explicit system-resolver policy caches, in-flight query coalescing, independent
+  cancellation and cache invalidation; separate asynchronous DNS UDP/TCP exchanges.
+- UDP ASM multicast and platform-explicit packet metadata/source selection.
+- QUIC configurable PMTUD/packet ceiling/congestion control, bounded RFC 9221
+  DATAGRAM receive queues, qlog sinks and connection statistics. An optional
+  bounded shared replay store rejects duplicate early flights and fails closed
+  on capacity or storage failure; distributed replay policy remains application-owned.
+- MQTT versioned, bounded session checkpoints with broker-scope/client/version
+  binding and expiry handling; client checkpoints refuse undelivered events.
+  Binary WebSocket byte streams compose with the MQTT client.
+- SOCKS5 BIND two-response negotiation, UDP ASSOCIATE, strict unfragmented UDP
+  encoding/decoding and an owning UDP association with explicit TCP monitoring.
+- Opt-in operation observation, stream decorators, cross-loop counters and fixed
+  latency histograms; focused ThreadSanitizer jobs and independent aioquic H3,
+  early-data acceptance/rejection and WebSocket Extended CONNECT validation.
+
+### Fixed
+
+- Preserve buffered MQTT completion identifiers until their events are consumed;
+  restore expiry notices without preventing a one-slot CONNACK handshake.
+- Keep H2/H3 tunnel input consumption independent of a blocked output flush.
+- Avoid redundant Apple SDK C-header include precedence over standalone libc++.
+
+Verification remains revision/configuration-specific. No new Release is implied
+by this development entry; mobile/WAN and unsupported platform extensions remain
+explicit acceptance boundaries.
+
+## [Unreleased]
+
+- Structured H2/H3 duplex session drivers, bounded concurrent client sessions,
+  owning per-origin H2TLS/H3 client pools, and opt-in full-duplex Extended CONNECT
+  adapters with per-stream cancellation.
+- TLS immutable SNI identity snapshots, atomic certificate reload, combined mTLS
+  and ALPN, local CRL policy and OCSP stapling/client verification.
+- Bounded resolver policy cache and request coalescing; explicit asynchronous DNS
+  UDP/TCP queries, UDP multicast and POSIX packet metadata/source selection.
+- QUIC PMTUD/payload/congestion configuration, RFC 9221 unreliable DATAGRAMs,
+  qlog/statistics, and optional atomic early-data replay admission storage.
+- WebSocket binary byte-stream adapter, MQTT checkpoint/restore and delivery-ID
+  protection, SOCKS5 BIND/UDP ASSOCIATE and owning UDP relay lifecycle.
+- Protocol-neutral DoH multiplexed mapping, operation tracing and fixed metrics,
+  focused ThreadSanitizer CI and independent aioquic advanced interoperability.
+- Optional libuv TCP reference benchmark and revision-scoped longer fault-soak
+  evidence. These do not establish a universal cross-library performance ranking.
+
 ## [1.0.0] — 2026-09-30
 
 This release includes the development work recorded below and the

@@ -14,6 +14,9 @@
 
 #if MIRA_HAS_READINESS_API
     #include <poll.h>
+    #include <net/if.h>
+    #include <netinet/in.h>
+    #include <sys/socket.h>
 #endif
 
 using namespace Mira;
@@ -318,6 +321,109 @@ void close_lifetimes() {
     CHECK(shutdown_done);
     CHECK(!shutdown_socket);
 }
+Task<void> packet_metadata_test(EventLoop& loop, Family family) {
+    test::section("UDP pktinfo, traffic class, kernel timestamp and per-packet source");
+    auto receiver = udp::Socket::bind(loop, Endpoint::any(0, family),
+        {.receive_packet_info = true, .receive_traffic_class = true, .receive_timestamp = true});
+#if MIRA_PLATFORM_WINDOWS
+    CHECK(!receiver && receiver.error() == std::errc::not_supported);
+    auto sender = udp::Socket::bind(loop, Endpoint::any(0, family)).value();
+    const auto unsupported = co_await sender.send_message(bytes("x"), Endpoint::loopback(9, family),
+        {.source = Endpoint::loopback(0, family)}, budget());
+    CHECK(!unsupported && unsupported.error() == std::errc::not_supported);
+#else
+    CHECK(receiver.has_value());
+    if (!receiver) co_return;
+    auto sender = udp::Socket::bind(loop, Endpoint::any(0, family)).value();
+    const auto peer = Endpoint::loopback(receiver->local_endpoint()->port(), family);
+    const auto before = std::chrono::system_clock::now();
+    const auto sent = co_await sender.send_message(bytes("metadata"), peer,
+        {.source = Endpoint::loopback(0, family), .traffic_class = std::uint8_t{0x2a}}, budget());
+    CHECK(sent.has_value());
+    if (!sent) co_return;
+    std::array<std::byte, 32> buffer{};
+    const auto packet = co_await receiver->receive_from(buffer, budget());
+    CHECK(packet.has_value());
+    if (!packet) co_return;
+    CHECK(packet->size == 8);
+    CHECK(packet->peer == Endpoint::loopback(sender.local_endpoint()->port(), family));
+    CHECK(packet->metadata.destination == peer);
+    CHECK(packet->metadata.interface_index && *packet->metadata.interface_index > 0);
+    CHECK(packet->metadata.traffic_class == std::uint8_t{0x2a});
+    CHECK(packet->metadata.timestamp.has_value());
+    CHECK(packet->metadata.timestamp && *packet->metadata.timestamp >= before - 1s);
+    CHECK(packet->metadata.timestamp && *packet->metadata.timestamp <= std::chrono::system_clock::now() + 1s);
+    CHECK(!packet->metadata.truncated);
+    const auto reply = co_await receiver->send_message(bytes("reply"), packet->peer,
+        {.source = Endpoint::loopback(0, family),
+         .interface_index = *packet->metadata.interface_index}, budget());
+    CHECK(reply.has_value());
+    CHECK((co_await sender.receive_from(buffer, budget())).has_value());
+    const auto invalid = co_await sender.send_message(bytes("x"), peer,
+        {.source = Endpoint::loopback(9, family)}, budget());
+    CHECK(!invalid && invalid.error() == Errc::invalid_argument);
+#endif
+}
+
+void multicast_ipv6_options(EventLoop& loop) {
+    test::section("UDP IPv6 multicast interface, hop limit and membership");
+    auto socket = udp::Socket::bind(loop, Endpoint::any(0, Family::ipv6)).value();
+    CHECK(socket.set_multicast_hops(7).has_value());
+    CHECK(socket.set_multicast_loopback(false).has_value());
+#if MIRA_HAS_READINESS_API
+    int hops = -1;
+    socklen_t size = sizeof(hops);
+    CHECK(::getsockopt(socket.native_handle(), IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &hops, &size) == 0);
+    CHECK(hops == 7);
+    unsigned enabled = 1;
+    size = sizeof(enabled);
+    CHECK(::getsockopt(socket.native_handle(), IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &enabled, &size) == 0);
+    CHECK(enabled == 0);
+    auto index = ::if_nametoindex("lo0");
+    if (index == 0) index = ::if_nametoindex("lo");
+    CHECK(index != 0);
+    if (index != 0) {
+        udp::MulticastInterface interface{.ipv6_index = index};
+        CHECK(socket.set_multicast_interface(interface).has_value());
+        const auto group = Endpoint::parse("ff02::114", 0).value();
+        CHECK(socket.join_multicast(group, interface).has_value());
+        CHECK(socket.leave_multicast(group, interface).has_value());
+    }
+#endif
+}
+
+Task<void> multicast_test(EventLoop& loop) {
+    test::section("UDP IPv4 multicast membership, outgoing interface, TTL and leave");
+    auto receiver = udp::Socket::bind(loop, Endpoint::any(0), {.reuse_address = true}).value();
+    const auto group = Endpoint::parse("239.255.42.99", receiver.local_endpoint()->port()).value();
+    udp::MulticastInterface interface{.ipv4_address = Endpoint::loopback(0)};
+    CHECK(!receiver.join_multicast(Endpoint::loopback(0), interface));
+    CHECK(!receiver.set_multicast_hops(256));
+    CHECK(receiver.join_multicast(group, interface).has_value());
+    auto sender = udp::Socket::bind(loop, Endpoint::any(0)).value();
+    CHECK(sender.set_multicast_interface(interface).has_value());
+    CHECK(sender.set_multicast_hops(0).has_value());
+    CHECK(sender.set_multicast_loopback(true).has_value());
+#if MIRA_HAS_READINESS_API
+    unsigned char hops = 255;
+    socklen_t size = sizeof(hops);
+    CHECK(::getsockopt(sender.native_handle(), IPPROTO_IP, IP_MULTICAST_TTL, &hops, &size) == 0);
+    CHECK(hops == 0);
+    in_addr selected{};
+    size = sizeof(selected);
+    CHECK(::getsockopt(sender.native_handle(), IPPROTO_IP, IP_MULTICAST_IF, &selected, &size) == 0);
+    CHECK(ntohl(selected.s_addr) == 0x7f000001U);
+#endif
+    CHECK((co_await sender.send_to(bytes("group"), group, budget())).has_value());
+    std::array<std::byte, 32> buffer{};
+    const auto packet = co_await receiver.receive_from(buffer, budget());
+    CHECK(packet.has_value() && packet->size == 5);
+    CHECK(receiver.leave_multicast(group, interface).has_value());
+    CHECK((co_await sender.send_to(bytes("left"), group, budget())).has_value());
+    const auto left = co_await receiver.receive_from(buffer, {.deadline = Clock::now() + 20ms});
+    CHECK(!left && left.error() == Errc::timed_out);
+}
+
 }  // namespace
 
 int main() {
@@ -343,7 +449,13 @@ int main() {
         auto created = EventLoop::create();
         auto& loop = created.value();
         CHECK(loop.run_until_complete(packets(loop, family)).has_value());
+        CHECK(loop.run_until_complete(packet_metadata_test(loop, family)).has_value());
         CHECK(loop.outstanding() == 0);
+    }
+    {
+        auto loop = EventLoop::create().value();
+        CHECK(loop.run_until_complete(multicast_test(loop)).has_value());
+        if (ipv6_usable) multicast_ipv6_options(loop);
     }
     concurrency_and_cancel();
     close_lifetimes();

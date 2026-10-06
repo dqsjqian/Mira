@@ -26,6 +26,14 @@ std::span<const std::byte> wire(const quic::Bytes& bytes) {
 void check(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
 }
+struct ReplayProbe final : quic::ReplayStore {
+    std::shared_ptr<quic::MemoryReplayStore> memory = require(quic::MemoryReplayStore::create());
+    unsigned calls = 0;
+    bool claim(const std::array<std::byte, 32>& key, std::uint64_t now, std::uint64_t expires) noexcept override {
+        ++calls;
+        return memory->claim(key, now, expires);
+    }
+};
 void sessions(const char* certificate, const char* key) {
     quic::Options co, so;
     co.local = transport::Endpoint::loopback(44120);
@@ -41,6 +49,8 @@ void sessions(const char* certificate, const char* key) {
     so.service_scope = co.service_scope;
     so.early_data = quic::EarlyDataPolicy::replay_safe;
     so.early_data_context = "app-settings-v1";
+    const auto replay_probe = std::make_shared<ReplayProbe>();
+    so.replay_store = replay_probe;
     so.server_context = require(quic::ServerContext::create(so));
     std::uint64_t now = 1'000'000'000;
     {
@@ -71,6 +81,7 @@ void sessions(const char* certificate, const char* key) {
         } else check(!client.open_early_stream(), "default-off early stream accepted");
         auto initial = require(client.poll(now));
         auto server = require(Engine::accept(so, initial, now));
+        std::vector<quic::Bytes> captured_flight;
         std::size_t delivered = 0;
         bool before_handshake = false;
         for (int n = 0; n < 400; ++n) {
@@ -81,6 +92,8 @@ void sessions(const char* certificate, const char* key) {
                 for (int burst = 0; burst < 32; ++burst) {
                     auto packet = require(sender->poll(now));
                     if (packet.empty()) break;
+                    if (attempt == 2 && sender == &client && replay_probe->calls == 0)
+                        captured_flight.push_back(packet);
                     require(receiver.receive(packet, now));
                     for (auto& event : server.take_events()) {
                         if (event.kind != quic::Event::Kind::data) continue;
@@ -95,8 +108,25 @@ void sessions(const char* certificate, const char* key) {
         check(client.session_reused() == (attempt == 1 || early), "TLS session reuse mismatch");
         check((server.early_data_status() == quic::EarlyDataStatus::accepted) == (attempt == 2),
               "server early-data status does not match what TLS accepted");
-        if (attempt == 2) check(delivered == payload.size() && before_handshake &&
-            client.early_data_status() == quic::EarlyDataStatus::accepted, "real 0RTT was not accepted");
+        if (attempt == 2) {
+            check(delivered == payload.size() && before_handshake &&
+                client.early_data_status() == quic::EarlyDataStatus::accepted, "real 0RTT was not accepted");
+            check(replay_probe->calls == 1 && replay_probe->memory->size() == 1,
+                  "authenticated early flight never reached replay store");
+            auto replay = require(Engine::accept(so, initial, now));
+            for (const auto& captured : captured_flight) require(replay.receive(captured, now));
+            // Exact captured early flight, new connection but same ticket domain.
+            // Flush TLS acceptance decisions without ever delivering fresh client data.
+            for (int flight = 0; flight < 32; ++flight) {
+                auto reply = require(replay.poll(now));
+                if (reply.empty()) break;
+            }
+            check(replay_probe->calls == 2, "captured early flight did not exercise replay admission");
+            check(replay.early_data_status() != quic::EarlyDataStatus::accepted,
+                  "captured 0RTT flight was accepted twice");
+            for (auto& event : replay.take_events())
+                check(event.kind != quic::Event::Kind::data, "replayed early application bytes escaped");
+        }
         else check(delivered == 0, "rejected/default-off early data was delivered or replayed");
         if (attempt == 3) check(client.early_data_status() == quic::EarlyDataStatus::rejected &&
             client.write_capacity() == co.max_buffered_bytes, "early rejection retained retry payload");

@@ -564,9 +564,76 @@ void identifiers() {
         static_cast<void>(session.take_output(0));
     }
     CHECK(unique && session.inflight() == 65534);
+    CHECK(session.publish(publish("t", QoS::at_least_once)).error() == Errc::would_block);
+    const auto acknowledged = session.take_events();
+    CHECK(acknowledged.size() == 1 && acknowledged[0].packet_id == 2);
     const auto reused = session.publish(publish("t", QoS::at_least_once));
     CHECK(reused && *reused == 2);
     CHECK(session.publish(publish("t", QoS::at_least_once)).error() == Errc::would_block);
+}
+
+void persistence() {
+    test::section("versioned bounded session checkpoint survives process reconstruction");
+    for (const auto version : {Version::v311, Version::v5}) {
+        Broker broker;
+        broker.version = version;
+        ClientOptions options;
+        options.version = version;
+        options.client_id = "durable-client";
+        options.clean_start = false;
+        auto session = connected(broker, options);
+        const auto a = *session.publish(publish("a", QoS::at_least_once));
+        const auto b = *session.publish(publish("b", QoS::exactly_once));
+        const auto c = *session.publish(publish("c", QoS::exactly_once));
+        broker.take(session);
+        CHECK(broker.send(session, Ack{PacketType::pubrec, c, reason::success, {}}).has_value());
+        CHECK(broker.send(session, publish("incoming", QoS::exactly_once, 700)).has_value());
+        static_cast<void>(session.take_events());
+        broker.take(session);
+        auto image = session.checkpoint("broker-A/user-1");
+        CHECK(image.has_value());
+        if (!image) continue;
+        CHECK(!session.checkpoint("broker-A/user-1", 32));
+        CHECK(!Session::restore(options, *image, "broker-B/user-1"));
+        auto wrong = options;
+        wrong.client_id = "other";
+        CHECK(!Session::restore(wrong, *image, "broker-A/user-1"));
+        for (std::size_t n = 0; n < image->size(); ++n)
+            CHECK(!Session::restore(options, std::span<const std::byte>{*image}.first(n), "broker-A/user-1"));
+        auto extra = *image;
+        extra.push_back(std::byte{0});
+        CHECK(!Session::restore(options, extra, "broker-A/user-1"));
+        auto restored = Session::restore(options, *image, "broker-A/user-1");
+        CHECK(restored && restored->state() == SessionState::idle && restored->inflight() == 3);
+        if (!restored) continue;
+        CHECK(restored->connect(0).has_value());
+        broker.take(*restored);
+        CHECK(broker.send(*restored, Connack{true, reason::success, {}}).has_value());
+        auto sent = broker.take(*restored);
+        CHECK(sent.size() == 3);
+        if (sent.size() == 3) {
+            CHECK(std::get<Publish>(sent[0]).packet_id == a && std::get<Publish>(sent[0]).dup);
+            CHECK(std::get<Publish>(sent[1]).packet_id == b && std::get<Publish>(sent[1]).dup);
+            CHECK(std::get<Ack>(sent[2]).packet_id == c && std::get<Ack>(sent[2]).type == PacketType::pubrel);
+        }
+        static_cast<void>(restored->take_events());
+        CHECK(broker.send(*restored, Ack{PacketType::pubrel, 700, reason::success, {}}).has_value());
+        sent = broker.take(*restored);
+        CHECK(sent.size() == 1 && std::get<Ack>(sent[0]).type == PacketType::pubcomp);
+        CHECK(restored->take_events().empty());
+        if (version == Version::v5) {
+            auto expiring = publish("expire", QoS::at_least_once);
+            expiring.properties.message_expiry_interval = 10;
+            const auto id = *restored->publish(std::move(expiring));
+            image = restored->checkpoint("broker-A/user-1");
+            auto aged = Session::restore(options, *image, "broker-A/user-1", 1024 * 1024, 10);
+            CHECK(aged && aged->inflight() == 3);
+            if (aged) {
+                const auto notices = aged->take_events();
+                CHECK(notices.size() == 1 && notices[0].discarded && notices[0].packet_id == id);
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -584,5 +651,6 @@ int main() {
     bounded_lifecycle_and_auth();
     replay_controls_bypass_publish_quota();
     identifiers();
+    persistence();
     return test::summary();
 }

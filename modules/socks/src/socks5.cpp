@@ -5,6 +5,54 @@
 
 namespace Mira::socks {
 
+Result<std::vector<std::byte>> encode_udp(const Address& target,
+    std::span<const std::byte> payload, std::size_t max_size) {
+    if (max_size > 65507 || max_size < 10 ||
+        (target.kind() == Address::Kind::domain && target.name().empty())) return fail(Errc::invalid_argument);
+    const auto address = target.encode();
+    if (address.size() + 3 > max_size || payload.size() > max_size - address.size() - 3)
+        return fail(std::make_error_code(std::errc::message_size));
+    std::vector<std::byte> result(3, std::byte{0});
+    const auto wire = std::as_bytes(std::span(address.data(), address.size()));
+    result.insert(result.end(), wire.begin(), wire.end());
+    result.insert(result.end(), payload.begin(), payload.end());
+    return result;
+}
+Result<UdpPacket> decode_udp(std::span<const std::byte> packet, std::size_t max_size) {
+    if (max_size > 65507 || packet.size() > max_size) return fail(std::make_error_code(std::errc::message_size));
+    if (packet.size() < 4 || packet[0] != std::byte{0} || packet[1] != std::byte{0})
+        return fail(make_error_code(SocksError::protocol_error));
+    if (packet[2] != std::byte{0}) return fail(Errc::not_supported);
+    const auto type = std::to_integer<std::uint8_t>(packet[3]);
+    std::size_t offset = 4, length = 0;
+    if (type == 1) length = 4;
+    else if (type == 4) length = 16;
+    else if (type == 3) {
+        if (packet.size() < 5) return fail(make_error_code(SocksError::protocol_error));
+        length = std::to_integer<std::size_t>(packet[4]);
+        if (length == 0) return fail(make_error_code(SocksError::protocol_error));
+        ++offset;
+    } else return fail(make_error_code(SocksError::address_type_not_supported));
+    if (packet.size() - offset < length + 2) return fail(make_error_code(SocksError::protocol_error));
+    const auto port = static_cast<std::uint16_t>((std::to_integer<unsigned>(packet[offset + length]) << 8) |
+                                                std::to_integer<unsigned>(packet[offset + length + 1]));
+    Address address;
+    if (type == 1) {
+        std::array<std::uint8_t, 4> ip{};
+        for (std::size_t i = 0; i < ip.size(); ++i) ip[i] = std::to_integer<std::uint8_t>(packet[offset + i]);
+        address = Address::ipv4(ip, port);
+    } else if (type == 4) {
+        std::array<std::uint8_t, 16> ip{};
+        for (std::size_t i = 0; i < ip.size(); ++i) ip[i] = std::to_integer<std::uint8_t>(packet[offset + i]);
+        address = Address::ipv6(ip, port);
+    } else {
+        auto decoded = Address::domain({reinterpret_cast<const char*>(packet.data() + offset), length}, port);
+        if (!decoded) return fail(decoded.error());
+        address = std::move(*decoded);
+    }
+    return UdpPacket{std::move(address), packet.subspan(offset + length + 2)};
+}
+
 namespace {
 
 class Category final : public std::error_category {

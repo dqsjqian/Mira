@@ -1328,6 +1328,16 @@ Task<Result<std::size_t>> EventLoop::send_to(
         std::move(submit), detail::cancel_through(impl), options.stop);
 }
 
+Task<Result<std::size_t>> EventLoop::send_message(
+    NativeHandle handle, std::span<const std::byte> source,
+    std::span<const std::byte> address, std::span<const std::byte> control,
+    OperationOptions options) {
+    if (!impl_ || impl_->shutting_down()) co_return fail(Errc::cancelled);
+    if (const auto rejected = detail::rejected_before_submit(options)) co_return fail(*rejected);
+    if (!control.empty()) co_return fail(std::make_error_code(std::errc::not_supported));
+    co_return co_await send_to(handle, source, address, options);
+}
+
 // ── timers and scheduling ────────────────────────────────────────────────────
 
 Task<Result<void>> EventLoop::wait_for(NativeHandle, bool, OperationOptions) {

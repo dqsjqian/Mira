@@ -37,6 +37,12 @@ public:
         }
     }
     bool closed() const noexcept { return failed_ || (close_sent_ && close_received_); }
+    /// Terminal local abort, not a WebSocket closing handshake. A closable
+    /// borrowed transport is closed to wake companion I/O; callers still join
+    /// all outstanding tasks before destroying either object.
+    void abort(Error error = Mira::make_error_code(Mira::Errc::cancelled)) {
+        static_cast<void>(terminate(error));
+    }
     std::string_view subprotocol() const noexcept { return negotiated_.subprotocol; }
     const CompressionParameters& compression_parameters() const noexcept { return negotiated_.compression; }
 

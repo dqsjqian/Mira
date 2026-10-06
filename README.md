@@ -122,7 +122,7 @@ flowchart TB
 | `Mira::tls` | 同事件循环全双工 TLS 流、独立请求期限、证书与主机名验证、mTLS、多协议 ALPN |
 | `Mira::ws` / `Mira::crypto` | WebSocket/WSS、子协议、RFC7692 有界压缩、安全 nonce/mask、Extended CONNECT 字段协商 |
 | `Mira::http` | HTTP/1 解析、序列化、单连接服务、流式请求/响应、`Expect: 100-continue` 双工交换；仅依赖流契约 |
-| `Mira::client` / `Mira::client_tls` | 独立 HTTP/1 / HTTPS 连接池组合与 `dial_via_socks5`，拥有 DNS/TCP/可选 TLS 与会话生命周期 |
+| `Mira::client` / `Mira::client_tls` | HTTP/1 / HTTPS 池与 SOCKS5 组合；可选 `client_http2` / `client_http3` 拥有式多路客户端，显式关闭并 join 生命周期 |
 | `Mira::http2` | 可选 nghttp2 Session、多流、Extended CONNECT 与 `ConnectStream` |
 | `Mira::quic` / `Mira::http3` | QUIC v1、显式迁移/会话恢复、nghttp3/QPACK、Extended CONNECT、HTTP/3 0-RTT（票据域绑定 SETTINGS） |
 | `Mira::socks` | SOCKS5（RFC 1928/1929）客户端与代理握手，按报文精确读长，跑在任意有界流上 |
@@ -227,17 +227,17 @@ CI 同时覆盖安装包消费与依赖隔离、协议模糊测试、MQTT/mosqui
 | 执行与生命周期 | 惰性 `Task`、`TaskScope` join、可靠 continuation 投递、有界应用投递、独立线程 `LoopGroup` |
 | 取消与截止时间 | `OperationOptions` 贯穿 `EventLoop` → TCP → TLS → HTTP 全栈 |
 | TCP | IPv4/IPv6、交错候选 `dial`、短读写、独占绑定、grace drain / cancel / join |
-| UDP | IPv4/IPv6、零长数据报、截断报错并消费整包、取消与 deadline |
-| DNS | 有界工作线程、系统 getaddrinfo、结果去重、总 deadline；独立 DNS 报文编解码与 DoH GET/POST |
-| TLS | OpenSSL 3、证书链与 DNS/IP 验证、mTLS、多协议 ALPN、关闭通知 |
+| UDP | IPv4/IPv6、零长数据报、截断、取消/deadline、ASM 组播；POSIX 目的地址/接口/流量类别/内核时间戳及逐包选源，未支持的平台选项明确拒绝 |
+| DNS | 有界系统解析、策略正负缓存、同查询去重、独立等待者取消；独立异步 UDP/TCP DNS 查询与 DoH GET/POST、多路会话映射 |
+| TLS | OpenSSL 3、证书链与 DNS/IP 验证、mTLS + 多 ALPN、SNI 多证书与原子配置更新、本地 CRL、关闭通知 |
 | WebSocket/WSS | 子协议协商、分片与控制帧、UTF-8、可选 permessage-deflate、TCP/TLS 同 loop 双工 |
 | 本地传输 / SSE | POSIX Unix-domain socket；基于 HTTP/1 chunked 的 SSE 与 Last-Event-ID 示例 |
 | HTTP/1 | 增量解析、keep-alive、HEAD、chunked、流式上传/响应、`Expect: 100-continue` 与提前响应双工、独立 HTTP/HTTPS 池组合 |
 | HTTP/2 | nghttp2、HPACK、多流、消费驱动窗口、显式 Extended CONNECT |
 | QUIC/H3 | ngtcp2 + nghttp3 + OpenSSL ossl；validated migration、QUIC 会话恢复/显式 0-RTT、HTTP/3 0-RTT（0.5-RTT 应答、拒绝后同流 ID 重提、不安全方法自动 425）、QPACK、Extended CONNECT、两阶段 GOAWAY |
-| SOCKS5 | CONNECT 客户端与代理、用户名/密码、握手后流恰好停在隧道首字节、域名目标不在本地解析 |
+| SOCKS5 | CONNECT、BIND 两次响应、UDP ASSOCIATE 与有界无分片 UDP 封装；用户名/密码、精确握手读长、目标域名不在本地解析 |
 | MQTT | 3.1.1 / 5.0、QoS 0/1/2 双向流程、CONNACK 限额、主题别名、keep-alive 监督、增强认证、会话恢复重发 |
-| 安全与资源 | 协议级限额、有界 TLS BIO、跨 loop 共享预算；非进程 RSS 上限 |
+| 安全与资源 | 协议限额、有界 TLS BIO、跨 loop 预算、可选 0-RTT 反重放存储；操作追踪/指标、QUIC qlog；非进程 RSS 上限 |
 
 `stop()` 只请求 `run()` 返回；逐操作取消是 `OperationOptions` 的职责 —— 每一层职责清晰、互不越界。
 
@@ -325,7 +325,7 @@ Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` �
 - **连接生命周期**：`client::HttpClient` / `HttpsClient` 组合解析、`tcp::dial` 与每 origin 有界连接池，客户端实例及固定 TLS 配置彼此隔离；`Session::recycle()` 要求响应完全 drain、连接可复用且无留存 session task，否则拒绝。默认析构丢弃，不自动重放业务请求；`tcp::connect_with_retry` 也只重试建连。`tcp::serve(loop, ...)` 停止接入并关闭 listener，先给 `grace_period` 排空，再协作 cancel 与 join；grace 只限定何时请求取消，不保证不合作 handler 的返回时限。
 - **WebSocket/WSS**：`MIRA_ENABLE_WEBSOCKET=ON`，独立 `Mira::ws` + OpenSSL Crypto（安全 nonce/mask、RFC6455 SHA-1 握手）+ zlib；分片、增量 UTF-8、ping/pong/close、消息限额、双向独立互操作。TCP 和 TLS/WSS 均支持同一事件循环上一读一写并行，握手与关闭独占；每个 TLS 请求有独立期限，取消或超时令整个 TLS 会话永久失效并唤醒同伴，不取消后重放密文。`Stream::create` 显式接收事件循环，`close()` 终止包装器但不拥有底层流。支持可选子协议协商与 permessage-deflate，并可经显式协商的 H2/H3 Extended CONNECT 承载；隧道适配器的并发契约与 TCP/TLS 双工不同，见下文。
 - **SSE / 本地流**：`mira_sse_server` 演示 chunked SSE、事件 ID 与 Last-Event-ID 恢复；`transport::local` 提供 POSIX filesystem Unix-domain socket，Windows 显式 `not_supported`，不自动删除调用方路径。
-- **HTTP/3 0-RTT**：两端 `EarlyDataPolicy::replay_safe`。持票客户端创建即 `early_ready()`，GET/HEAD/OPTIONS 整体请求随 0-RTT 发出；服务端接受后在握手完成前以 0.5-RTT 应答，实测一个往返完成。服务端拒绝时，TLS 保证其未处理任何早期数据，引擎按原顺序重提安全请求并复现相同流 ID，调用方只看到一次正常响应。早期请求在事件上带 `early_data` 标记，不安全方法由引擎直接答 `425 Too Early` 且不上交应用。票据域通过 `early_data_context` 绑定服务端 SETTINGS，SETTINGS 不一致的服务端无法创建。无防重放存储，详见下文。
+- **HTTP/3 0-RTT**：两端 `EarlyDataPolicy::replay_safe`。持票客户端创建即 `early_ready()`，GET/HEAD/OPTIONS 整体请求随 0-RTT 发出；服务端接受后在握手完成前以 0.5-RTT 应答，实测一个往返完成。服务端拒绝时，TLS 保证其未处理任何早期数据，引擎按原顺序重提安全请求并复现相同流 ID，调用方只看到一次正常响应。早期请求在事件上带 `early_data` 标记，不安全方法由引擎直接答 `425 Too Early` 且不上交应用。票据域通过 `early_data_context` 绑定服务端 SETTINGS，SETTINGS 不一致的服务端无法创建。可显式共享有界 `MemoryReplayStore` 或注入原子认领存储，默认仍要求应用可安全重放，详见下文。
 - **HTTP/1 `Expect: 100-continue` 与双工上传**：`ClientConnection::exchange` 边上传边读取 1xx/最终响应；先等 100、最终响应或 `continue_timeout`，中途收到 ≥300 或关闭即停发剩余 body，提前 2xx 且保持连接则允许上传完成；进行中的写不会为提前响应被取消（TLS 下取消会毁掉会话）。服务端对缓冲 handler 立即答 100，流式 handler 首次读取时答 100，拒收时关闭而不排空，未知期望答 417。
 - **SOCKS5 / DoH**：`Mira::socks` 为 CONNECT 客户端与代理提供 RFC 1929 认证与严格地址处理，`client::dial_via_socks5` 一个 deadline 贯穿拨号与握手；`Mira::dns` 以“字节皆不可信”解码 DNS 报文，DoH 双向映射 GET/POST，`doh::query` 可跑在 HTTP/1 over TLS 上。示例与 curl、独立 Python 对端互通。
 - **MQTT 3.1.1 / 5.0**：编解码器覆盖全部 15 种报文与两种角色，绝不编出自身解码器会拒收的字节；`Session` 无套接字实现 QoS 1/2 收发、CONNACK 限额、入站主题别名、PINGRESP 监督、增强认证与按原顺序重发的会话恢复；`Client<Stream>` 借用调用方的流，一个读者与串行写者并发，`keep_alive(loop)` 是定时写者，不依赖会毁掉 TLS 会话的读超时。`mira_mqtt_client` 与独立 Python broker 及 mosquitto 互通，CI 强制 mosquitto 用例并对编解码器做模糊测试。
@@ -344,9 +344,20 @@ ctest --test-dir build/ws --output-on-failure
 
 真实网络基准：`python3 tools/bench/network_bench.py --server build/release/mira_managed_echo_server --clients 8 --requests 1000 --slow-clients 4`，输出吞吐、p50/p99、峰值 RSS 采样和环境 JSON。负载发生器使用独立进程 Python sockets；loopback 数字不是跨库性能排名，也不是公网性能。
 
+### 生产组合补充（主线，尚未单独发布）
+
+- **并发 H2/H3**：`SessionDriver` 以独立收发任务和 QUIC 到期任务驱动同一连接；`ClientSession` 提供有界并发请求。`client::Http2Client` / `Http3Client` 提供每 origin 独立的拥有式多路连接池，分别通过 `Mira::client_http2` / `client_http3` 消费；H2 严格 ALPN=h2，H3 使用固定 peer 的 1-RTT 建连，不自动重放业务请求。`client::Http2Client` / `Http3Client` 拥有每 origin 的传输/安全/会话对象，同源建连去重，`max_origins` / `max_active` 满时显式背压；分别链接 `Mira::client_http2` / `Mira::client_http3`，不隐式降级或重放业务请求。单流取消不取消共享 TLS 读取。`ConnectStream` 搭配该驱动支持一读一写并发；原有自定义 driver 仍保持独占契约。先结束业务任务，再 `stop()` / `join()`，不能析构仍在运行的驱动。
+- **TLS 生产配置**：精确 SNI 多证书路由、完整配置的 mTLS+多 ALPN、`reload_server` 原子发布新快照；每个域/每一代票据隔离。可选本地 CRL 与 OCSP stapling/严格客户端状态校验，不自动联网获取。默认仍是 OpenSSL trust，不冒充原生 Keychain/Windows 信任策略。
+- **解析与 UDP**：系统 Resolver 增加有界正负策略缓存和同查询去重；`dns::query_udp/query_tcp` 是无需后台线程的专用连接查询，TCP fallback 由调用方显式组合。UDP 支持 ASM 组播和 POSIX 包元信息/逐包选源；Windows 非空 ancillary 选项明确不支持。
+- **QUIC**：显式 PMTUD、UDP payload 上限与 Cubic/Reno/BBR 选择；RFC 9221 DATAGRAM（不是 H3 DATAGRAM/WebTransport）、有界接收丢弃、qlog 与连接统计。`ReplayStore` 可原子认领早期 ClientHello，内置共享 `MemoryReplayStore` 容量满即拒绝早期数据、不驱逐活跃记录；内存保护不等于跨进程/重启持久防重放。
+- **协议组合**：`ws::ByteStream` 支持 MQTT 等二进制流协议；MQTT checkpoint/restore 带版本、client ID、调用者 scope 和过期处理，磁盘原子持久化与业务事务由应用负责。SOCKS5 新增 BIND 双响应、UDP ASSOCIATE 及严格 UDP 封装，分片明确不支持。`dns::doh::query_multiplexed` 可组合 H2/H3 客户端。
+- **可观测性**：`observe` / `ObservedStream` 输出关联 ID、完成状态、时延与字节数；`OperationMetrics` 提供跨 loop 原子计数和固定桶延迟分布，不记录负载或凭据，不强制引入日志/遥测供应商。
+
+独立 aioquic 客户端→Mira 服务端已实测 H3、0-RTT 接受/拒绝回退和 WebSocket Extended CONNECT；`tools/ci/check_h3_aioquic.py` 可复现。30 分钟、16 客户端的故障注入快照完成 116,480/116,480 请求，87,360 个短流在慢响应重叠时完成，最终资源计数归零。上述均为明确配置下的 loopback 证据，不是所有未来提交、WAN 或全球性能排名。
+
 ### 主线 API 的使用边界
 
-- **QUIC 路径与早期数据**：validated 模式必须使用带 `quic::Path` 的 `receive` 与 `poll_datagram` / `close_datagram`；客户端 `initiate_migration()` 发起验证，应用须保留验证期间所需的两条路径并按返回路径发送。CID 命中不等于通过地址验证。有界内存 `SessionCache` 限制条目、字节、单 ticket 大小与存活期，`ServerContext` 显式共享服务端 ticket 域。普通 `open_stream` / `write` 不发送早期数据；只有 `EarlyDataPolicy::replay_safe` 加 `open_early_stream` / `write_early` 才尝试原始 QUIC 0-RTT。调用方负责保证操作可安全重放；库不提供防重放保证，原始 QUIC 层拒绝后不自动重放。HTTP/3 0-RTT 的契约见下文专节。
+- **QUIC 路径与早期数据**：validated 模式必须使用带 `quic::Path` 的 `receive` 与 `poll_datagram` / `close_datagram`；客户端 `initiate_migration()` 发起验证，应用须保留验证期间所需的两条路径并按返回路径发送。CID 命中不等于通过地址验证。有界内存 `SessionCache` 限制条目、字节、单 ticket 大小与存活期，`ServerContext` 显式共享服务端 ticket 域。普通 `open_stream` / `write` 不发送早期数据；只有 `EarlyDataPolicy::replay_safe` 加 `open_early_stream` / `write_early` 才尝试原始 QUIC 0-RTT。调用方负责保证操作可安全重放；默认不提供反重放保证，显式共享 `ReplayStore` 的保证范围见下文，原始 QUIC 层拒绝后不自动重放。HTTP/3 0-RTT 的契约见下文专节。
 - **拨号与上传**：`tcp::dial` 对解析后的去重候选交错 IPv4/IPv6，在总 deadline 内错峰、有界并发建连，返回前取消并 join 落败尝试；系统 `getaddrinfo` 仍在线程池完成，不是独立异步 A/AAAA 查询。HTTP/1 `begin` → `send_body` → `finish` 支持 content-length/chunked 上传、逐块背压与贯穿上传/生产者停顿/响应的预算；这一组是 **send-first**；需要 `Expect: 100-continue` 或上传同时读取提前响应时改用双工 `exchange`，它要求流允许一读一写同时在途（Mira TCP/TLS/本地流均满足），既不读也不关闭的对端仍由 deadline 或 stop 兜底。
 - **执行与预算**：`EventLoop::post` 保留可靠 continuation 通道；应用准入走 `try_post` / `BoundedExecutor`，满额返回 `would_block`，后者故意不满足 `Executor`。投递配额在调用前释放，不约束回调新建的异步任务。`LoopGroup` 每 worker 拥有独立线程亲和 loop，配额覆盖排队及未完成根任务；socket 必须在所属 worker 创建/使用，不迁移已关联 socket。共享 `ResourceBudget` 是计量配额，不覆盖全部分配器、第三方状态或进程 RSS。
 - **TLS 管理服务示例**：同时启用 TLS/H2 后运行 `build/protocols/mira_https_managed_server cert.pem key.pem 8444 64 16 5000 1000 1000`。它分别限制连接/握手、设置握手 deadline、按协商后的 ALPN 分发 H1/H2、拒绝缺失/未知 ALPN，并演示 grace drain / cancel / join；每连接处理一个 H1 请求或一批 H2 请求，不是通用生产服务器。
@@ -357,9 +368,9 @@ QUIC 会话恢复与 0-RTT 要求显式 `ca_file`：缓存键绑定 OpenSSL 实�
 
 在 `http2::Limits` / `http3::Limits` 中显式设置 `enable_connect_protocol = true`；客户端须等实际对端 `SETTINGS_ENABLE_CONNECT_PROTOCOL`，再以 `request_stream` 提交 `:method = CONNECT`、`:protocol`、`:scheme`、`:authority`、`:path`。服务端以 `respond_stream` 接受，只有成功的 2xx 才成为隧道；**204 返回 `not_supported`**，因为当前固定版本的引擎依赖把它视为无 body。普通 CONNECT 代理不在此能力范围。
 
-`http2::ConnectStream<Driver>` / `http3::ConnectStream<Driver>` 借用已接受流；driver 的 `progress(OperationOptions)` / `flush(OperationOptions)` 必须串行驱动连接并遵守取消与 deadline。**每个适配器同一时刻只允许一个操作**，跨流调度和对象/缓冲区存活由调用方负责，不能混用直接 body 操作；`finish()` 半关闭本地输出，`close()`/取消仅 reset 该流，不保证底层 driver 的连接级故障只影响单流。
+`http2::ConnectStream<Driver>` / `http3::ConnectStream<Driver>` 借用已接受流；driver 的 `progress(OperationOptions)` / `flush(OperationOptions)` 必须串行驱动连接并遵守取消与 deadline。**自定义 legacy driver 同时只允许一个操作；内置 `SessionDriver` 允许一读一写并发且独占连接收发调度**，跨流调度和对象/缓冲区存活由调用方负责，不能混用直接 body 操作；`finish()` 半关闭本地输出，`close()`/取消仅 reset 该流，不保证底层 driver 的连接级故障只影响单流。
 
-WebSocket 用 `extended_connect_request` / `accept_extended_connect` / `validate_extended_connect` 校验字段并协商子协议与 PMD，再把 `Negotiated` 交给 `Connection::adopt_extended_connect`；不执行 HTTP/1 Upgrade 或 nonce 握手。`ws.connect_network` 最新实跑 TCP H2 / UDP H3 × 压缩关闭/开启共 4 场景通过。这是同库真实网络证据，不是第三方 Extended CONNECT 互操作；该用例已移除首个 Initial flight 丢包设置，不能作为 PTO 恢复证据。
+WebSocket 用 `extended_connect_request` / `accept_extended_connect` / `validate_extended_connect` 校验字段并协商子协议与 PMD，再把 `Negotiated` 交给 `Connection::adopt_extended_connect`；不执行 HTTP/1 Upgrade 或 nonce 握手。`ws.connect_network` 最新实跑 TCP H2 / UDP H3 × 压缩关闭/开启共 4 场景通过。该用例是同库真实网络证据，已移除首个 Initial flight 丢包设置，不能作为 PTO 恢复证据。独立 `tools/ci/check_h3_aioquic.py` 使用不同 QUIC/TLS/QPACK 引擎，另行验证 H3、0-RTT 接受/拒绝回退和 WebSocket Extended CONNECT 的二进制/ping/close；当前方向为 aioquic 客户端到 Mira 服务端，不能推论反向或所有第三方实现。
 
 ### WebSocket 子协议与压缩
 
@@ -390,7 +401,7 @@ auto get = co_await h3->request(get_fields);             // 安全方法：随 0
 auto post = co_await h3->request(post_fields, body, io); // 其他：先完成握手（受 io 约束）再 1-RTT
 ```
 
-客户端不记忆服务端 SETTINGS，早期请求一律按默认值（QPACK 动态表 0、无 Extended CONNECT），RFC 9114 §7.2.4.2 允许且任何合规服务端都能接受。兼容性判断落在服务端：`http3::Engine::create` / `make_server` 拒绝 SETTINGS 与票据域不一致的配置，而其他 `ServerContext` 签发的票据本就无法解密。服务端应用对带 `early_data` 的安全方法请求仍须自行判断能否执行两次（RFC 8470，不能则答 425）；没有防重放存储，截获的 0-RTT 首包可被重放到共享票据域的任一服务端。
+客户端不记忆服务端 SETTINGS，早期请求一律按默认值（QPACK 动态表 0、无 Extended CONNECT），RFC 9114 §7.2.4.2 允许且任何合规服务端都能接受。兼容性判断落在服务端：`http3::Engine::create` / `make_server` 拒绝 SETTINGS 与票据域不一致的配置，而其他 `ServerContext` 签发的票据本就无法解密。服务端应用对带 `early_data` 的安全方法请求仍须自行判断能否执行两次（RFC 8470，不能则答 425）；未配置 `ReplayStore` 时，截获的 0-RTT 首包可被重放到共享票据域的任一服务端；配置时所有共享票据域的实例须使用同一原子存储，内置内存实现不跨进程、不跨重启保留。
 
 ### MQTT
 
@@ -406,7 +417,7 @@ auto events = co_await client->receive();                 // 消息、发布完�
 // keep_alive(loop) 是定时写者：与 receive 在同一 loop 并发，TLS 下同样安全
 ```
 
-流由调用方拥有并在客户端之后销毁；客户端从不关闭它。超出服务端 Receive Maximum、包标识耗尽或输出预算满时返回 `would_block`，不暗中排队；对端违规时 5.0 以带原因的 DISCONNECT 关闭会话。收到的 QoS 1 消息在上交时即确认。断线后在新流上 `reconnect`：`clean_start = false` 且服务端报告会话仍在时，未确认的 PUBLISH（DUP）与 PUBREL 按原顺序重发，否则以 `discarded` 事件报告。不含 broker、MQTT over WebSocket、出站主题别名、会话持久化与重连策略。
+流由调用方拥有并在客户端之后销毁；客户端从不关闭它。超出服务端 Receive Maximum、包标识耗尽或输出预算满时返回 `would_block`，不暗中排队；对端违规时 5.0 以带原因的 DISCONNECT 关闭会话。收到的 QoS 1 消息在上交时即确认。断线后在新流上 `reconnect`：`clean_start = false` 且服务端报告会话仍在时，未确认的 PUBLISH（DUP）与 PUBREL 按原顺序重发，否则以 `discarded` 事件报告。可通过 `ws::ByteStream` 承载 MQTT over WebSocket，`checkpoint/restore` 保存恢复 QoS 状态；不含 broker、出站主题别名、磁盘存储后端与自动重连策略。快照不是 WAL，也不保证应用事务 exactly-once。
 
 ### Retry 真实 UDP 故障验收
 
@@ -425,8 +436,8 @@ python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak 
 
 1. iOS 已通过宿主 smoke 和无签名交叉编译，真机缺签名 profile；Android 真机尚无证据。MinGW 已有 H2/H3 与独立 curl 互操作运行证据，但该任务不单独构建固定来源的 curl；Windows MSVC 的严格互操作任务会构建它。
 2. 更长时故障注入、真实多机/WAN 与进程内存硬上限仍待验。单机 loopback 和有限时长的 fuzz/soak 不代表这些边界已覆盖。
-3. QUIC validated migration/NAT rebinding、显式原始 QUIC 0-RTT、HTTP/3 0-RTT 与 H2/H3 Extended CONNECT 已在主线实现，但完整防重放保证与第三方 Extended CONNECT 互操作未交付/未验证；HTTP/3 0-RTT 目前只有同库引擎与真实 UDP 证据，尚无第三方 0-RTT 互操作。Retry 不保证 token 一次性使用，listener 不是互联网抗洪泛防护系统。
-4. **2026-09-29 阶段已交付**：HTTP/3 0-RTT、HTTP/1 `Expect: 100-continue` / 提前响应双工，以及独立 SOCKS5、DNS/DoH、MQTT 模块。仍开放：0-RTT 防重放存储、客户端记忆服务端 SETTINGS、打包好的 DoH over H2/H3 查询、MQTT over WebSocket 与会话持久化。gRPC/Redis/WebRTC 保持生态层边界，不将专业子系统全部塞进网络内核。
+3. aioquic→Mira 的 H3 0-RTT 接受/拒绝及 WebSocket Extended CONNECT 已有独立协议栈实测；反向角色、更多实现及真实 WAN 矩阵仍待扩展。内置防重放存储限同进程共享，分布式持久化后端未交付。Retry 不保证 token 一次性使用，listener 不是互联网抗洪泛系统。
+4. 客户端记忆服务端 SETTINGS、原生系统信任、Windows UDP ancillary、SSM 组播及自动 DNS fallback 等仍开放。io_uring/内核零拷贝/定制分配器按真实瓶颈选择，不以功能名代替性能证据。gRPC/Redis/WebRTC 保持生态层边界。
 
 设计依据与验收要求见[架构文档](docs/ARCHITECTURE.md)。
 

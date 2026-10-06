@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <deque>
+#include <list>
 #include <mutex>
 #include <new>
 #include <stop_token>
@@ -131,15 +132,28 @@ Error resolver_error(int native_code) noexcept { return {native_code, resolver_c
 
 class Resolver::Impl {
 public:
+    struct Waiter {
+        std::mutex mutex;
+        std::stop_source completion;
+        bool user_cancelled{false};
+        bool abandoned{false};
+    };
+
     struct Job {
         explicit Job(ResolveQuery value) : query(std::move(value)) {}
         ResolveQuery query;
         std::mutex mutex;
-        std::stop_source completion;
         std::optional<Result<Endpoints>> result;
-        bool user_cancelled{false};
-        bool abandoned{false};
+        // Access waiters only under State::mutex; cancellation is per waiter.
+        std::vector<std::shared_ptr<Waiter>> waiters;
+        bool cacheable{true};
         bool shutdown{false};
+    };
+
+    struct CacheEntry {
+        ResolveQuery query;
+        Result<Endpoints> result;
+        Clock::time_point expires;
     };
 
     struct State {
@@ -149,12 +163,45 @@ public:
         std::condition_variable ready;
         std::deque<std::shared_ptr<Job>> queue;
         std::vector<std::shared_ptr<Job>> active;
+        std::list<CacheEntry> cache;
         bool closing{false};
 
         State(ResolverOptions value, Backend resolve) : options(value), backend(std::move(resolve)) {
             active.reserve(options.workers);
         }
     };
+
+    static bool same_query(const ResolveQuery& a, const ResolveQuery& b) noexcept {
+        return a.hostname == b.hostname && a.service == b.service &&
+               a.family == b.family && a.transport == b.transport;
+    }
+
+    static bool waiting(const std::shared_ptr<Waiter>& waiter) {
+        const std::lock_guard lock{waiter->mutex};
+        return !waiter->abandoned && !waiter->user_cancelled;
+    }
+
+    static void prune_waiters(Job& job) {
+        std::erase_if(job.waiters, [](const auto& waiter) { return !waiting(waiter); });
+    }
+
+    static void cache_result(State& shared, const Job& job, const Result<Endpoints>& result) {
+        const auto& policy = shared.options.cache;
+        auto lifetime = std::chrono::milliseconds::zero();
+        if (result) lifetime = policy.positive_lifetime;
+        else if (result.error() == resolver_error(EAI_NONAME)) lifetime = policy.negative_lifetime;
+        if (policy.capacity == 0 || lifetime <= lifetime.zero() || shared.closing || !job.cacheable) return;
+        const auto now = Clock::now();
+        std::erase_if(shared.cache, [&](const auto& entry) {
+            return entry.expires <= now || same_query(entry.query, job.query);
+        });
+        // Cache allocation failure must not lose a completed result or kill a worker.
+        try {
+            shared.cache.push_front({job.query, result, now + lifetime});
+            while (shared.cache.size() > policy.capacity) shared.cache.pop_back();
+        } catch (const std::bad_alloc&) {
+        }
+    }
 
     std::shared_ptr<State> state;
     std::vector<std::thread> threads;
@@ -193,7 +240,7 @@ public:
             const std::lock_guard lock{job->mutex};
             job->shutdown = true;
         }
-        job->completion.request_stop();
+        for (const auto& waiter : job->waiters) waiter->completion.request_stop();
     }
 
     static void work(const std::shared_ptr<State>& shared) noexcept {
@@ -209,10 +256,13 @@ public:
             }
             bool skip = false;
             {
-                const std::lock_guard lock{job->mutex};
-                skip = job->abandoned || job->user_cancelled || job->shutdown;
+                const std::lock_guard lock{shared->mutex};
+                prune_waiters(*job);
+                skip = shared->closing || job->waiters.empty();
+                if (skip) std::erase(shared->active, job);
             }
-            if (!skip) {
+            if (skip) continue;
+            {
                 Result<Endpoints> result = fail(std::make_error_code(std::errc::io_error));
                 try {
                     result = shared->backend(job->query, shared->options.max_results);
@@ -235,14 +285,15 @@ public:
                 } catch (...) {
                     result = fail(std::make_error_code(std::errc::io_error));
                 }
+                const std::lock_guard state_lock{shared->mutex};
                 {
-                    const std::lock_guard lock{job->mutex};
-                    if (!job->abandoned && !job->shutdown) job->result.emplace(std::move(result));
+                    const std::lock_guard job_lock{job->mutex};
+                    if (!job->shutdown) {
+                        cache_result(*shared, *job, result);
+                        job->result.emplace(std::move(result));
+                    }
                 }
-            }
-            job->completion.request_stop();
-            {
-                const std::lock_guard lock{shared->mutex};
+                for (const auto& waiter : job->waiters) waiter->completion.request_stop();
                 std::erase(shared->active, job);
             }
         }
@@ -260,40 +311,68 @@ public:
             co_return fail(Errc::invalid_argument);
         }
         if (!shared) co_return fail(Errc::cancelled);
-        auto job = std::make_shared<Job>(std::move(query));
-        std::stop_callback user_cancel{options.stop, [job] {
-            {
-                const std::lock_guard lock{job->mutex};
-                job->user_cancelled = true;
+        auto waiter = std::make_shared<Waiter>();
+        struct WaitGuard {
+            std::shared_ptr<Waiter> waiter;
+            ~WaitGuard() {
+                const std::lock_guard lock{waiter->mutex};
+                waiter->abandoned = true;
             }
-            job->completion.request_stop();
+        } guard{waiter};
+        std::shared_ptr<Job> job;
+        std::stop_callback user_cancel{options.stop, [waiter] {
+            {
+                const std::lock_guard lock{waiter->mutex};
+                waiter->user_cancelled = true;
+            }
+            waiter->completion.request_stop();
         }};
         {
             const std::lock_guard lock{shared->mutex};
             if (shared->closing) co_return fail(Errc::cancelled);
-            // Cancelled queued jobs do not consume quota of later requests.
+            const auto now = Clock::now();
+            std::erase_if(shared->cache, [&](const auto& entry) { return entry.expires <= now; });
+            const auto cached = std::find_if(shared->cache.begin(), shared->cache.end(),
+                [&](const auto& entry) { return same_query(query, entry.query); });
+            if (cached != shared->cache.end()) {
+                shared->cache.splice(shared->cache.begin(), shared->cache, cached);
+                co_return shared->cache.front().result;
+            }
             std::erase_if(shared->queue, [](const auto& pending) {
-                const std::lock_guard pending_lock{pending->mutex};
-                return pending->abandoned || pending->user_cancelled;
+                prune_waiters(*pending);
+                return pending->waiters.empty();
             });
-            if (shared->queue.size() >= shared->options.queue_capacity) co_return fail(Errc::limit_exceeded);
-            shared->queue.push_back(job);
+            if (shared->options.deduplicate_in_flight) {
+                for (const auto& pending : shared->queue)
+                    if (same_query(query, pending->query)) { job = pending; break; }
+                if (!job) for (const auto& pending : shared->active)
+                    if (same_query(query, pending->query)) { job = pending; break; }
+            }
+            if (job) {
+                prune_waiters(*job);
+                if (job->waiters.size() >= shared->options.max_waiters_per_query)
+                    co_return fail(Errc::limit_exceeded);
+                job->waiters.push_back(waiter);
+            } else {
+                if (shared->queue.size() >= shared->options.queue_capacity)
+                    co_return fail(Errc::limit_exceeded);
+                job = std::make_shared<Job>(std::move(query));
+                job->waiters.push_back(waiter);
+                shared->queue.push_back(job);
+            }
         }
         shared->ready.notify_one();
         const auto waited = co_await loop.sleep_until(Clock::time_point::max(),
-            {.stop = job->completion.get_token(), .deadline = options.deadline});
-        const std::lock_guard lock{job->mutex};
-        job->abandoned = true;
-        if (job->result) {
-            // GCC 14 ( -O2/-O3 ) inlines the expected<vector, error_code>
-            // move through the optional here and reports _M_end_of_storage
-            // as possibly uninitialized — a false positive: the value was
-            // fully constructed before it was stored, and the optional is
-            // engaged. See the -Wmaybe-uninitialized reports on moved
-            // std::expected with vector payloads (GCC 14, PR108661 family).
-            co_return std::move(*job->result);
+            {.stop = waiter->completion.get_token(), .deadline = options.deadline});
+        bool user_cancelled = false;
+        {
+            const std::lock_guard lock{waiter->mutex};
+            waiter->abandoned = true;
+            user_cancelled = waiter->user_cancelled;
         }
-        if (job->user_cancelled) co_return fail(Errc::cancelled);
+        const std::lock_guard lock{job->mutex};
+        if (job->result) co_return *job->result;
+        if (user_cancelled) co_return fail(Errc::cancelled);
         if (!waited && waited.error() == Errc::timed_out) co_return fail(Errc::timed_out);
         co_return fail(Errc::cancelled);
     }
@@ -301,7 +380,12 @@ public:
 
 Result<Resolver> Resolver::create(ResolverOptions options, Backend backend) {
     if (options.workers == 0 || options.workers > 64 || options.queue_capacity == 0 ||
-        options.queue_capacity > 65536 || options.max_results == 0 || options.max_results > 4096) {
+        options.queue_capacity > 65536 || options.max_results == 0 || options.max_results > 4096 ||
+        options.max_waiters_per_query == 0 || options.max_waiters_per_query > 65536 ||
+        options.cache.capacity > 65536 || options.cache.positive_lifetime.count() < 0 ||
+        options.cache.negative_lifetime.count() < 0 ||
+        options.cache.positive_lifetime > std::chrono::hours{24 * 365} ||
+        options.cache.negative_lifetime > std::chrono::hours{24 * 365}) {
         return fail(Errc::invalid_argument);
     }
     try {
@@ -317,6 +401,15 @@ Resolver::Resolver(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl))
 Resolver::Resolver(Resolver&&) noexcept = default;
 Resolver& Resolver::operator=(Resolver&&) noexcept = default;
 Resolver::~Resolver() = default;
+
+void Resolver::clear_cache() {
+    if (!impl_) return;
+    const auto& state = impl_->state;
+    const std::lock_guard lock{state->mutex};
+    state->cache.clear();
+    for (const auto& job : state->queue) job->cacheable = false;
+    for (const auto& job : state->active) job->cacheable = false;
+}
 
 Task<Result<Resolver::Endpoints>> Resolver::resolve(EventLoop& loop, ResolveQuery query,
                                                     OperationOptions options) {

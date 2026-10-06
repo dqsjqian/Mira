@@ -233,6 +233,33 @@ jobs:
       - name: Test
         run: ctest --no-tests=error --test-dir build/asan --output-on-failure
 
+  # Validate shared budgets, executor handoff and resolver coordination with
+  # a race detector, separately from address/undefined instrumentation.
+  thread-sanitizer:
+    needs: discipline
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    env:
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install compiler on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang-19
+      - name: Configure race detection
+        shell: bash
+        run: >
+          cmake -S . -B build/tsan -DCMAKE_BUILD_TYPE=Debug -DMIRA_BUILD_EXAMPLES=OFF
+          ${{ runner.os == 'Linux' && '-DCMAKE_CXX_COMPILER=clang++-19' || '' }}
+          -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+      - name: Build focused concurrency tests
+        run: cmake --build build/tsan --parallel --target mira_core_tests mira_runtime_tests mira_observe_tests mira_task_scope_tests mira_resolver_tests
+      - name: Run focused concurrency tests
+        run: ctest --test-dir build/tsan --no-tests=error --output-on-failure -R '^(core|runtime|observe|task_scope|resolver)$'
+
   # The negative space of the parsers gets explored continuously, not just
   # when a maintainer remembers to run the fuzzer. A short, capped smoke pass
   # on Linux: enough to catch regressions the unit suite's shapes miss, cheap
@@ -410,6 +437,23 @@ jobs:
           python3 tools/ci/check_h3_interop.py build/protocols/mira_h3_server
           --strict --curl "$PWD/build/interop-curl/prefix/bin/curl"
           --openssl "$OPENSSL_ROOT_DIR/bin/openssl"
+      - name: Build independent aioquic validation environment
+        run: |
+          python3 -m venv build/aioquic-venv
+          build/aioquic-venv/bin/python -m pip install aioquic==1.3.0
+      - name: Verify independent H3 early data and Extended CONNECT
+        run: >
+          build/aioquic-venv/bin/python tools/ci/check_h3_aioquic.py
+          --server build/protocols/mira_h3_advanced_peer
+          --certificate build/protocols/modules/quic/tests/cert.pem
+          --key build/protocols/modules/quic/tests/key.pem
+          --output build/aioquic-interop.json
+      - name: Preserve independent stack evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aioquic-interop-${{ matrix.os }}
+          path: build/aioquic-interop.json
+          if-no-files-found: error
       - name: Require independent Retry interoperability
         run: >
           python3 tools/ci/check_h3_interop.py build/protocols/mira_h3_multi_server

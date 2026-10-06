@@ -16,6 +16,8 @@
 #include "mira/dns/message.hpp"
 #include "mira/http/client.hpp"
 #include "mira/http/message.hpp"
+#include "mira/http/fields.hpp"
+#include <charconv>
 
 #include <cstddef>
 #include <algorithm>
@@ -99,6 +101,51 @@ template<BoundedStream Stream>
     if (!response) co_return fail(response.error());
     if (!answers(question, *response)) co_return fail(DnsError::mismatched_response);
     co_return std::move(*response);
+}
+
+/// One HTTPS exchange on an H2/H3-style multiplexed client or ClientSession.
+/// Client::request owns the headers/body and returns {.headers, .body}; its
+/// configured response cap must also be bounded (recommended <= 65535).
+/// Caller establishes authenticated TLS/h3; this helper cannot certify a
+/// transport from its shape. No H2/H3 engine dependency is introduced here.
+template<class Client>
+[[nodiscard]] Task<Result<Message>> query_multiplexed(Client& client, std::string authority,
+    std::string path, Message question, Method method = Method::get,
+    OperationOptions io = {}, Limits limits = {}) {
+    limits.max_message_size = (std::min)(limits.max_message_size, std::size_t{65535});
+    if (io.stop.stop_requested()) co_return fail(Errc::cancelled);
+    if (io.deadline && Clock::now() >= *io.deadline) co_return fail(Errc::timed_out);
+    question.header.id = 0;
+    auto wire = encode(question);
+    if (!wire) co_return fail(wire.error());
+    if (wire->size() > limits.max_message_size) co_return fail(DnsError::too_large);
+    auto head = method == Method::get ? make_get(authority, path, *wire) : make_post(authority, path);
+    if (!head) co_return fail(head.error());
+    http::Headers fields{{":method", method == Method::get ? "GET" : "POST"},
+                         {":scheme", "https"}, {":authority", authority}, {":path", head->target},
+                         {"accept", std::string(media_type)}};
+    std::vector<std::byte> body;
+    if (method == Method::post) {
+        body = std::move(*wire);
+        fields.push_back({"content-type", std::string(media_type)});
+    }
+    auto reply = co_await client.request(std::move(fields), std::move(body), io);
+    if (!reply) co_return fail(reply.error());
+    http::Response response;
+    unsigned statuses = 0;
+    for (const auto& field : reply->headers) {
+        if (field.name == ":status") {
+            const auto parsed = std::from_chars(field.value.data(), field.value.data() + field.value.size(), response.status);
+            if (++statuses != 1 || field.value.size() != 3 || parsed.ec != std::errc{} ||
+                parsed.ptr != field.value.data() + field.value.size()) co_return fail(DnsError::bad_status);
+        } else if (!field.name.empty() && field.name.front() == ':') co_return fail(DnsError::bad_status);
+        else response.headers.append(field.name, field.value);
+    }
+    if (statuses != 1) co_return fail(DnsError::bad_status);
+    auto decoded = parse_response(response, reply->body, limits);
+    if (!decoded) co_return fail(decoded.error());
+    if (!answers(question, *decoded)) co_return fail(DnsError::mismatched_response);
+    co_return std::move(*decoded);
 }
 
 }  // namespace Mira::dns::doh

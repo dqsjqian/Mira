@@ -96,6 +96,40 @@ class RetryValidation {
 enum class MigrationPolicy { fixed_peer, validated };
 enum class EarlyDataPolicy { disabled, replay_safe };
 enum class EarlyDataStatus { not_attempted, pending, accepted, rejected };
+enum class CongestionControl { cubic, reno, bbr };
+/// Called synchronously on the engine thread, including during destruction.
+/// The sink must not reenter the engine. Data is borrowed only for this call.
+class QlogSink {
+public:
+    virtual ~QlogSink() = default;
+    virtual void write(std::span<const std::byte> data, bool final) noexcept = 0;
+};
+/// Atomic anti-replay admission keyed by a service scope and the ClientHello
+/// random after TLS authenticates the resumed session's PSK binder. Implementations shared by ticket-domain members must
+/// claim atomically, retain until expires, and fail closed on storage failure.
+/// Callbacks are synchronous and must not block the event loop or reenter QUIC.
+class ReplayStore {
+public:
+    virtual ~ReplayStore() = default;
+    virtual bool claim(const std::array<std::byte, 32>& key, std::uint64_t now,
+                       std::uint64_t expires) noexcept = 0;
+};
+/// In-process, thread-safe bounded store. Full/clock rollback/allocation failure
+/// reject early data; live entries are never evicted. Share the same instance
+/// across all in-process engines using the same ServerContext. Restart loses
+/// memory, so do not restore old ticket keys after restart with a fresh store.
+class MemoryReplayStore final : public ReplayStore {
+public:
+    static Result<std::shared_ptr<MemoryReplayStore>> create(std::size_t max_entries = 4096);
+    ~MemoryReplayStore();
+    bool claim(const std::array<std::byte, 32>& key, std::uint64_t now,
+               std::uint64_t expires) noexcept override;
+    [[nodiscard]] std::size_t size() const noexcept;
+private:
+    struct Impl;
+    explicit MemoryReplayStore(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+};
 class SessionCache;
 class ServerContext;
 struct Path {
@@ -137,6 +171,42 @@ struct Options {
     // binds it immutably, so every ticket it issues was issued under identical application
     // settings; engines sharing the context must match exactly. At most 1024 bytes.
     std::string early_data_context;
+    /// Conservative defaults retained; opt in to discovery up to this ceiling.
+    /// Supported ceiling: 1200..65527 bytes (UDP payload, not link MTU).
+    std::size_t max_udp_payload = 1200;
+    bool path_mtu_discovery = false;
+    CongestionControl congestion_control = CongestionControl::cubic;
+    /// RFC 9221 maximum received DATAGRAM frame size, including frame overhead.
+    /// Zero disables receiving DATAGRAMs; this is not an HTTP/3 DATAGRAM mapping.
+    std::size_t max_datagram_frame_size = 0;
+    /// Independent bounded, lossy application receive queue. Overflow drops the
+    /// new DATAGRAM (and counts it), never blocks reliable stream progress.
+    std::size_t max_queued_datagrams = 64;
+    std::size_t max_datagram_bytes = 256 * 1024;
+    std::shared_ptr<QlogSink> qlog;
+    /// Optional server-side replay protection, bound immutably to ServerContext.
+    /// No store means replay-safe application semantics remain mandatory.
+    std::shared_ptr<ReplayStore> replay_store;
+};
+
+struct Datagram {
+    Bytes data;
+    bool early_data = false;
+};
+struct DatagramWrite {
+    Packet packet;
+    /// false may still accompany a control packet, which must be sent.
+    bool accepted = false;
+};
+struct Statistics {
+    std::uint64_t smoothed_rtt_ns = 0;
+    std::uint64_t congestion_window = 0;
+    std::uint64_t bytes_in_flight = 0;
+    std::uint64_t packets_sent = 0, packets_received = 0, packets_lost = 0;
+    std::uint64_t bytes_sent = 0, bytes_received = 0;
+    std::uint64_t datagrams_sent = 0, datagrams_received = 0, datagrams_dropped = 0;
+    std::size_t path_udp_payload = 0;
+    std::size_t buffered_stream_bytes = 0, queued_datagrams = 0, queued_datagram_bytes = 0;
 };
 
 struct SessionCacheLimits {
@@ -225,6 +295,14 @@ public:
     /// Returns an owning-buffer datagram; empty means no packet for now. Call in a loop until empty or the scheduling budget is reached.
     Result<Bytes> poll(std::uint64_t now);
     Result<Packet> poll_datagram(std::uint64_t now);
+    /// Emit one unreliable RFC 9221 message after handshake, without retaining
+    /// or retransmitting application bytes. Send any returned packet even when
+    /// accepted is false, then drive input/timers before retrying the message.
+    /// Refuses oversize/unsupported messages without making the connection fail.
+    Result<DatagramWrite> send_datagram(std::span<const std::byte> bytes, std::uint64_t now);
+    std::vector<Datagram> take_datagrams();
+    [[nodiscard]] std::size_t max_datagram_payload() const noexcept;
+    [[nodiscard]] Statistics statistics() const noexcept;
     // Validate before client migration; retain both endpoints until path validation completes.
     Result<void> initiate_migration(const Path& path, std::uint64_t now);
     Path active_path() const;

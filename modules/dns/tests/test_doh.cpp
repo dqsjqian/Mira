@@ -202,7 +202,47 @@ struct Zone {
     }
 };
 
+struct Multiplexed {
+    struct Response { http::Headers headers; std::vector<std::byte> body; };
+    bool bad = false;
+    Task<Result<Response>> request(http::Headers headers, std::vector<std::byte> body, OperationOptions io) {
+        if (io.stop.stop_requested()) co_return fail(Errc::cancelled);
+        http::Request mapped;
+        mapped.method = http::Method::get;
+        for (const auto& field : headers) {
+            if (field.name == ":method") mapped.method = field.value == "POST" ? http::Method::post : http::Method::get;
+            else if (field.name == ":path") mapped.target = field.value;
+            else if (!field.name.starts_with(':')) mapped.headers.append(field.name, field.value);
+        }
+        auto wire = doh::decode_request(mapped, body);
+        if (!wire) co_return fail(wire.error());
+        auto question = decode(*wire);
+        if (!question) co_return fail(question.error());
+        question->header.qr = true;
+        if (bad) question->header.id = 7;
+        auto encoded = encode(*question);
+        if (!encoded) co_return fail(encoded.error());
+        co_return Response{{{":status", "200"}, {"content-type", std::string(doh::media_type)}}, std::move(*encoded)};
+    }
+};
+Task<void> multiplexed_mapping() {
+    test::section("DoH multiplexed HTTP field mapping and response identity");
+    Multiplexed client;
+    for (const auto method : {doh::Method::get, doh::Method::post}) {
+        auto question = make_query(*Name::parse("mira.test"), type::a);
+        CHECK_VALUE(question);
+        if (!question) continue;
+        auto answer = co_await doh::query_multiplexed(client, "localhost", "/dns-query", *question, method);
+        CHECK(answer && answer->header.id == 0 && answer->header.qr);
+        client.bad = true;
+        auto mismatch = co_await doh::query_multiplexed(client, "localhost", "/dns-query", *question, method);
+        CHECK(!mismatch && mismatch.error() == make_error_code(DnsError::mismatched_response));
+        client.bad = false;
+    }
+}
+
 Task<void> loopback(EventLoop& loop) {
+    co_await multiplexed_mapping();
     test::section("DoH over real TCP: GET, POST, keep-alive, mismatch");
     for (const bool wrong : {false, true}) {
         auto listener = transport::tcp::Listener::bind(loop, transport::Endpoint::loopback(0));
@@ -255,6 +295,45 @@ Task<void> loopback(EventLoop& loop) {
     }
 }
 
+struct MultiplexedPeer {
+    struct Response { http::Headers headers; std::vector<std::byte> body; };
+    bool bad_status = false;
+    Task<Result<Response>> request(http::Headers fields, std::vector<std::byte> body, OperationOptions io) {
+        CHECK(!io.stop.stop_requested());
+        http::Request mapped;
+        for (const auto& field : fields) {
+            if (field.name == ":method") mapped.method = http::method_from_token(field.value);
+            else if (field.name == ":path") mapped.target = field.value;
+            else if (field.name == ":scheme") CHECK(field.value == "https");
+            else if (field.name == ":authority") mapped.headers.append("host", field.value);
+            else mapped.headers.append(field.name, field.value);
+        }
+        auto wire = doh::decode_request(mapped, body);
+        if (!wire) co_return fail(wire.error());
+        auto question = decode(*wire);
+        if (!question) co_return fail(question.error());
+        CHECK(question->header.id == 0);
+        question->header.qr = true;
+        question->header.rcode = rcode::nxdomain;
+        auto encoded = encode(*question);
+        if (!encoded) co_return fail(encoded.error());
+        co_return Response{{{":status", bad_status ? "20x" : "200"},
+                            {"content-type", "application/dns-message"}}, std::move(*encoded)};
+    }
+};
+Task<void> multiplexed_status_validation() {
+    test::section("DoH GET/POST over multiplexed request contract");
+    MultiplexedPeer peer;
+    auto question = make_query(*Name::parse("mira.test"), type::aaaa, {.id = 12});
+    for (const auto method : {doh::Method::get, doh::Method::post}) {
+        const auto result = co_await doh::query_multiplexed(peer, "localhost", "/dns-query", *question, method);
+        CHECK(result && result->header.rcode == rcode::nxdomain);
+    }
+    peer.bad_status = true;
+    const auto invalid = co_await doh::query_multiplexed(peer, "localhost", "/dns-query", *question);
+    CHECK(!invalid && invalid.error() == DnsError::bad_status);
+}
+
 }  // namespace
 
 int main() {
@@ -264,5 +343,6 @@ int main() {
     auto loop = EventLoop::create();
     if (!loop) return 1;
     if (!loop->run_until_complete(loopback(*loop))) return 1;
+    if (!loop->run_until_complete(multiplexed_status_validation())) return 1;
     return test::summary();
 }

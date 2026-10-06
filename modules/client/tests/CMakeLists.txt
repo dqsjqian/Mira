@@ -1,3 +1,44 @@
+if(TARGET mira_client_http2 OR TARGET mira_client_http3)
+    find_program(MIRA_MULTIPLEX_OPENSSL openssl HINTS "${OPENSSL_ROOT_DIR}/bin" REQUIRED)
+    set(MIRA_MULTIPLEX_CERT "${CMAKE_CURRENT_BINARY_DIR}/multiplex-cert.pem")
+    set(MIRA_MULTIPLEX_KEY "${CMAKE_CURRENT_BINARY_DIR}/multiplex-key.pem")
+    set(MIRA_MULTIPLEX_OTHER "${CMAKE_CURRENT_BINARY_DIR}/multiplex-other.pem")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/multiplex-openssl.cnf" "[req]\ndistinguished_name=dn\n[dn]\n")
+    foreach(identity multiplex multiplex-other)
+        if(identity STREQUAL "multiplex")
+            set(cert "${MIRA_MULTIPLEX_CERT}")
+            set(key "${MIRA_MULTIPLEX_KEY}")
+        else()
+            set(cert "${MIRA_MULTIPLEX_OTHER}")
+            set(key "${CMAKE_CURRENT_BINARY_DIR}/multiplex-other-key.pem")
+        endif()
+        execute_process(COMMAND "${MIRA_MULTIPLEX_OPENSSL}" req -x509 -newkey rsa:2048 -nodes
+            -config "${CMAKE_CURRENT_BINARY_DIR}/multiplex-openssl.cnf"
+            -keyout "${key}" -out "${cert}" -days 2 -subj /CN=localhost
+            -addext subjectAltName=DNS:localhost
+            RESULT_VARIABLE generated OUTPUT_QUIET ERROR_QUIET)
+        if(NOT generated EQUAL 0)
+            message(FATAL_ERROR "Failed to generate multiplex client test certificates")
+        endif()
+    endforeach()
+    foreach(protocol http2 http3)
+        if(TARGET mira_client_${protocol})
+            add_executable(mira_client_${protocol}_tests test_multiplex.cpp)
+            target_link_libraries(mira_client_${protocol}_tests PRIVATE Mira::client_${protocol} Mira::warnings)
+            if(protocol STREQUAL "http2")
+                target_compile_definitions(mira_client_${protocol}_tests PRIVATE MIRA_TEST_H2=1)
+            endif()
+            add_test(NAME client_${protocol}_pool COMMAND mira_client_${protocol}_tests
+                "${MIRA_MULTIPLEX_CERT}" "${MIRA_MULTIPLEX_KEY}" "${MIRA_MULTIPLEX_OTHER}")
+            set_tests_properties(client_${protocol}_pool PROPERTIES TIMEOUT 45)
+            add_test(NAME client_${protocol}_abandon COMMAND mira_client_${protocol}_tests
+                "${MIRA_MULTIPLEX_CERT}" "${MIRA_MULTIPLEX_KEY}" "${MIRA_MULTIPLEX_OTHER}" --death)
+            set_tests_properties(client_${protocol}_abandon PROPERTIES WILL_FAIL TRUE TIMEOUT 10
+                FAIL_REGULAR_EXPRESSION "AddressSanitizer;runtime error:")
+        endif()
+    endforeach()
+endif()
+
 add_executable(mira_http_upload_tests ../../http/tests/test_client_upload.cpp)
 target_link_libraries(mira_http_upload_tests PRIVATE Mira::http Mira::warnings)
 target_include_directories(mira_http_upload_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)

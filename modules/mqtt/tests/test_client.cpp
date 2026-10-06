@@ -501,7 +501,69 @@ Task<void> duplex_failure_state() {
     }
 }
 
+Task<void> persistence_events() {
+    test::section("client checkpoints retain delivery events and packet identifiers");
+    ClientOptions options;
+    options.client_id = "persistent";
+    options.clean_start = false;
+    auto session = Session::create(options);
+    CHECK(session.has_value());
+    if (!session) co_return;
+    CHECK(session->connect(0).has_value());
+    static_cast<void>(session->take_output(0));
+    CHECK(session->receive(*encode(Connack{}, Version::v5), 0).has_value());
+    static_cast<void>(session->take_events());
+    Publish expiring;
+    expiring.topic = "expired";
+    expiring.qos = QoS::at_least_once;
+    expiring.properties.message_expiry_interval = 1;
+    CHECK(session->publish(expiring) == 1);
+    auto image = session->checkpoint("broker/tenant");
+    CHECK(image.has_value());
+    if (!image) co_return;
+    ScriptedBroker resumed;
+    resumed.input.push_back(*encode(Connack{true, 0, {}}, Version::v5));
+    auto client = co_await Client<ScriptedBroker>::restore(resumed, options, *image, "broker/tenant", {}, 1);
+    CHECK(client.has_value());
+    if (!client) co_return;
+    auto id = co_await client->publish("new", {}, QoS::at_least_once);
+    CHECK(id && *id != 1);
+    auto waiting = co_await client->wait_for(*id);
+    CHECK(!waiting && waiting.error() == Errc::timed_out);
+    CHECK(!client->checkpoint("broker/tenant"));
+    auto notices = co_await client->receive();
+    CHECK(notices && notices->size() == 1 && notices->front().discarded && notices->front().packet_id == 1);
+    CHECK(client->checkpoint("broker/tenant").has_value());
+    options.max_events = 1;
+    ScriptedBroker tiny;
+    tiny.input.push_back(*encode(Connack{true, 0, {}}, Version::v5));
+    auto bounded = co_await Client<ScriptedBroker>::restore(tiny, options, *image, "broker/tenant", {}, 1);
+    CHECK(bounded.has_value());
+    if (bounded) {
+        auto events = co_await bounded->receive();
+        CHECK(events && events->size() == 1 && events->front().discarded);
+    }
+    options.max_events = 4;
+    ScriptedBroker incoming;
+    auto batch = *encode(Connack{}, Version::v5);
+    Publish inbound;
+    inbound.topic = "unconsumed"; inbound.qos = QoS::exactly_once; inbound.packet_id = 9;
+    auto wire = *encode(inbound, Version::v5);
+    batch.insert(batch.end(), wire.begin(), wire.end());
+    incoming.input.push_back(batch);
+    auto owner = co_await Client<ScriptedBroker>::connect(incoming, options);
+    CHECK(owner.has_value());
+    if (owner) {
+        CHECK(owner->checkpoint("broker/tenant").error() == Errc::would_block);
+        CHECK(owner->session().checkpoint("broker/tenant").error() == Errc::not_supported);
+        auto received = co_await owner->receive();
+        CHECK(received && received->size() == 1 && received->front().kind == Event::Kind::message);
+        CHECK(owner->checkpoint("broker/tenant").has_value());
+    }
+}
+
 Task<void> run(EventLoop& loop) {
+    co_await persistence_events();
     co_await bounded_events_and_auth();
     co_await transport_failure_state();
     co_await duplex_failure_state();

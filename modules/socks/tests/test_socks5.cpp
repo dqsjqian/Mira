@@ -95,6 +95,43 @@ void addresses() {
     CHECK(make_error_code(SocksError::auth_failed).message().find("authentication") != std::string::npos);
 }
 
+void udp_codec() {
+    test::section("UDP ASSOCIATE encapsulation validates addressing and rejects fragments");
+    const auto payload = std::as_bytes(std::span("binary\0payload", 14));
+    for (const auto name : {"127.0.0.1", "::1", "remote.test"}) {
+        const auto target = Address::parse(name, 53);
+        CHECK_VALUE(target);
+        if (!target) continue;
+        auto encoded = encode_udp(*target, payload);
+        CHECK_VALUE(encoded);
+        if (!encoded) continue;
+        auto decoded = decode_udp(*encoded);
+        CHECK(decoded && decoded->target == *target && std::ranges::equal(decoded->payload, payload));
+        for (std::size_t i = 0; i < encoded->size() - payload.size(); ++i)
+            CHECK(!decode_udp(std::span<const std::byte>{*encoded}.first(i)));
+        (*encoded)[2] = std::byte{1};
+        CHECK(decode_udp(*encoded).error() == Errc::not_supported);
+        CHECK(!encode_udp(*target, payload, 10));
+    }
+}
+
+Task<void> command_paths() {
+    test::section("BIND two replies and UDP ASSOCIATE command framing");
+    const auto target = *Address::parse("remote.test", 53);
+    const auto reply = bytes({5, 0, 0, 1, 127, 0, 0, 1, 1, 2});
+    Script bind_peer;
+    bind_peer.input = bytes({5, 0}) + reply + reply + "tunnel";
+    auto listening = co_await socks::bind(bind_peer, target, ClientOptions{});
+    CHECK(listening && listening->bound.port() == 258);
+    CHECK(static_cast<unsigned char>(bind_peer.output[4]) == 2);
+    auto accepted = co_await read_reply(bind_peer);
+    CHECK(accepted && bind_peer.rest() == "tunnel");
+    Script udp_peer;
+    udp_peer.input = bytes({5, 0}) + reply;
+    auto relay = co_await udp_associate(udp_peer, target, ClientOptions{});
+    CHECK(relay && static_cast<unsigned char>(udp_peer.output[4]) == 3 && udp_peer.rest().empty());
+}
+
 Task<void> client_paths() {
     test::section("client handshake");
     const auto target = *Address::domain("example.com", 443);
@@ -361,11 +398,69 @@ Task<void> loopback(EventLoop& loop) {
     co_await second.join();
 }
 
+Task<void> udp_association_loopback(EventLoop& loop) {
+    test::section("owning UDP association keeps control lifetime and filters relay source");
+    auto listener = transport::tcp::Listener::bind(loop, transport::Endpoint::loopback(0));
+    auto relay = transport::udp::Socket::bind(loop, transport::Endpoint::loopback(0));
+    auto stranger = transport::udp::Socket::bind(loop, transport::Endpoint::loopback(0));
+    CHECK(listener && relay && stranger);
+    if (!listener || !relay || !stranger) co_return;
+    const OperationOptions io{.deadline = Clock::now() + 3s};
+    TaskScope workers;
+    auto proxy = [&]() -> Task<void> {
+        auto control = co_await listener->accept(io);
+        CHECK_VALUE(control);
+        if (!control) co_return;
+        ServerOptions options;
+        options.allow_no_auth = true;
+        auto request = co_await socks::accept(*control, options, io);
+        CHECK(request && request->command == Command::udp_associate);
+        if (!request) co_return;
+        auto local = relay->local_endpoint();
+        auto bound = Address::parse(local->address(), local->port());
+        CHECK_VALUE(co_await socks::reply(*control, ReplyCode::succeeded, *bound, io));
+        std::array<std::byte, 512> input{};
+        auto packet = co_await relay->receive_from(input, io);
+        CHECK_VALUE(packet);
+        if (!packet) co_return;
+        auto decoded = decode_udp(std::span<const std::byte>{input}.first(packet->size));
+        CHECK(decoded && decoded->target.host() == "remote.test" && decoded->target.port() == 53);
+        auto forged = encode_udp(Address::ipv4({127, 0, 0, 1}, 9), std::as_bytes(std::span("bad", 3)));
+        CHECK_VALUE(co_await stranger->send_to(*forged, packet->peer, io));
+        CHECK_VALUE(co_await relay->send_to(std::span<const std::byte>{input}.first(packet->size), packet->peer, io));
+        std::array<std::byte, 1> end{};
+        auto eof = co_await control->read_some(end, io);
+        CHECK(!eof && eof.error() == Errc::eof);
+    };
+    workers.spawn(proxy());
+    auto control = co_await transport::tcp::connect(loop, listener->local_endpoint(), {}, io);
+    CHECK_VALUE(control);
+    auto association = co_await client::Socks5UdpSession::create(loop, std::move(*control), listener->local_endpoint(), {}, io);
+    CHECK_VALUE(association);
+    if (!association) { co_await workers.join(); co_return; }
+    TaskScope monitor;
+    auto watch = [&]() -> Task<void> { CHECK_VALUE(co_await (*association)->monitor(io)); };
+    monitor.spawn(watch());
+    const auto payload = std::as_bytes(std::span("relay-data", 10));
+    auto sent = co_await (*association)->send_to(payload, *Address::domain("remote.test", 53), io);
+    CHECK(sent && *sent == payload.size());
+    std::array<std::byte, 32> received{};
+    auto response = co_await (*association)->receive_from(received, io);
+    CHECK(response && response->size == payload.size() && response->peer.host() == "remote.test" &&
+          std::ranges::equal(std::span<const std::byte>{received}.first(response->size), payload));
+    (*association)->close();
+    co_await monitor.join();
+    co_await workers.join();
+}
+
 Task<void> run(EventLoop& loop) {
     addresses();
+    udp_codec();
+    co_await command_paths();
     co_await client_paths();
     co_await server_paths();
     co_await loopback(loop);
+    co_await udp_association_loopback(loop);
 }
 
 }  // namespace

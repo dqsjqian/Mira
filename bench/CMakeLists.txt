@@ -58,3 +58,31 @@ add_executable(bench_h1_overload h1_overload.cpp)
 target_link_libraries(bench_h1_overload
     PRIVATE Mira::transport Mira::http Mira::warnings)
 target_compile_features(bench_h1_overload PRIVATE cxx_std_23)
+
+# Opt-in process-level libuv reference; use installed dependencies, not downloads.
+# This dependency belongs only to the reference executable, never to Mira.
+option(MIRA_BENCH_LIBUV "Build the optional single-loop libuv TCP echo reference" OFF)
+if(MIRA_BENCH_LIBUV)
+    find_package(libuv CONFIG QUIET)
+    if(TARGET libuv::uv)
+        set(mira_bench_libuv_target libuv::uv)
+    elseif(TARGET libuv::uv_a)
+        set(mira_bench_libuv_target libuv::uv_a)
+    else()
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(MIRA_LIBUV REQUIRED IMPORTED_TARGET libuv)
+        set(mira_bench_libuv_target PkgConfig::MIRA_LIBUV)
+    endif()
+    add_executable(bench_libuv_echo_server libuv_echo_server.cpp)
+    target_link_libraries(bench_libuv_echo_server PRIVATE ${mira_bench_libuv_target} Mira::warnings)
+    target_compile_features(bench_libuv_echo_server PRIVATE cxx_std_23)
+    if(MIRA_BUILD_TESTS)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME bench.libuv_echo
+                COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/bench/check_echo_reference.py
+                    --server $<TARGET_FILE:bench_libuv_echo_server>)
+            set_tests_properties(bench.libuv_echo PROPERTIES TIMEOUT 20)
+        endif()
+    endif()
+endif()

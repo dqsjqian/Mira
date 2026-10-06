@@ -11,6 +11,7 @@
 #include <exception>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_ossl.h>
 #include <openssl/err.h>
@@ -363,8 +364,37 @@ Result<std::shared_ptr<SessionCache>> SessionCache::create(SessionCacheLimits li
 void SessionCache::clear() noexcept { impl_->tickets.clear(); impl_->used = 0; }
 std::size_t SessionCache::size() const noexcept { return impl_->tickets.size(); }
 std::size_t SessionCache::bytes() const noexcept { return impl_->used; }
+struct MemoryReplayStore::Impl {
+    explicit Impl(std::size_t capacity) : maximum(capacity) {}
+    const std::size_t maximum;
+    mutable std::mutex mutex;
+    std::map<std::array<std::byte, 32>, std::uint64_t> entries;
+    std::uint64_t clock = 0;
+};
+MemoryReplayStore::MemoryReplayStore(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+MemoryReplayStore::~MemoryReplayStore() = default;
+Result<std::shared_ptr<MemoryReplayStore>> MemoryReplayStore::create(std::size_t max_entries) {
+    if (!max_entries || max_entries > 1'000'000) return fail(Errc::invalid_argument);
+    return std::shared_ptr<MemoryReplayStore>(new MemoryReplayStore(std::make_unique<Impl>(max_entries)));
+}
+bool MemoryReplayStore::claim(const std::array<std::byte, 32>& key, std::uint64_t now,
+                              std::uint64_t expires) noexcept {
+    try {
+        const std::lock_guard lock{impl_->mutex};
+        if (now < impl_->clock || expires <= now) return false;
+        impl_->clock = now;
+        std::erase_if(impl_->entries, [now](const auto& entry) { return entry.second <= now; });
+        if (impl_->entries.size() >= impl_->maximum) return false;
+        return impl_->entries.emplace(key, expires).second;
+    } catch (...) { return false; } // Storage failure must reject early data.
+}
+std::size_t MemoryReplayStore::size() const noexcept {
+    const std::lock_guard lock{impl_->mutex};
+    return impl_->entries.size();
+}
 struct ServerContext::Impl {
     Options options;
+    std::uint64_t ticket_lifetime_ns = 0;
     SSL_CTX* ctx = nullptr;
     ~Impl() { if (ctx) SSL_CTX_free(ctx); }
 };
@@ -396,6 +426,42 @@ struct Engine::Impl {
     std::size_t received = 0;
     std::uint64_t remote_bidi_limit = 0;
     std::vector<Event> events;
+    std::vector<Datagram> datagrams;
+    std::size_t datagram_bytes = 0;
+    std::uint64_t datagrams_sent = 0, datagrams_received = 0, datagrams_dropped = 0;
+    // Allocate output scratch once, before ngtcp2 can commit packet state.
+    std::vector<std::uint8_t> output_buffer;
+    static void increment(std::uint64_t& counter) noexcept {
+        if (counter != (std::numeric_limits<std::uint64_t>::max)()) ++counter;
+    }
+    static void write_qlog(void* p, std::uint32_t flags, const void* data, std::size_t size) noexcept {
+        auto& s = self(p);
+        if (s.options.qlog) s.options.qlog->write(
+            {static_cast<const std::byte*>(data), size}, (flags & NGTCP2_QLOG_WRITE_FLAG_FIN) != 0);
+    }
+    static int receive_datagram(ngtcp2_conn*, std::uint32_t flags, const std::uint8_t* data,
+                                std::size_t size, void* p) noexcept {
+        return guarded([&] {
+            auto& s = self(p);
+            // Datagram sends are 1-RTT-only. Do not surface replayable data
+            // through a policy intended for reliable, explicitly early streams.
+            if (flags & NGTCP2_DATAGRAM_FLAG_0RTT) {
+                increment(s.datagrams_dropped);
+                return 0;
+            }
+            if (s.datagrams.size() >= s.options.max_queued_datagrams ||
+                size > s.options.max_datagram_bytes - s.datagram_bytes) {
+                increment(s.datagrams_dropped);
+                return 0;
+            }
+            Bytes payload(size);
+            if (size) std::memcpy(payload.data(), data, size);
+            s.datagrams.push_back({std::move(payload), false});
+            s.datagram_bytes += size;
+            increment(s.datagrams_received);
+            return 0;
+        });
+    }
     struct Chunk {
         Bytes bytes;
         std::uint64_t start;
@@ -429,6 +495,31 @@ struct Engine::Impl {
         return true;
     }
     static Impl& self(void* p) { return *static_cast<Impl*>(p); }
+    static int allow_early_data(SSL* ssl, void*) noexcept {
+        auto* ref = static_cast<ngtcp2_crypto_conn_ref*>(SSL_get_app_data(ssl));
+        if (!ref) return 0;
+        auto& s = self(ref->user_data);
+        if (!s.options.server_context) return 0;
+        const auto& domain = *s.options.server_context->impl_;
+        if (!domain.options.replay_store) return 1;
+        // OpenSSL calls this after authenticating the resumed PSK binder. An
+        // attacker cannot change ClientHello.random without invalidating it.
+        // Hash it with the ticket domain; no TLS secret leaves this callback.
+        std::array<unsigned char, 32> random{};
+        if (SSL_get_client_random(ssl, random.data(), random.size()) != random.size()) return 0;
+        std::array<std::byte, 32> key{};
+        unsigned int size = 0;
+        std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> digest(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+        if (!digest || EVP_DigestInit_ex(digest.get(), EVP_sha256(), nullptr) != 1 ||
+            EVP_DigestUpdate(digest.get(), domain.options.service_scope.data(), domain.options.service_scope.size()) != 1 ||
+            EVP_DigestUpdate(digest.get(), random.data(), random.size()) != 1 ||
+            EVP_DigestFinal_ex(digest.get(), reinterpret_cast<unsigned char*>(key.data()), &size) != 1 ||
+            size != key.size()) return 0;
+        const auto lifetime = domain.ticket_lifetime_ns;
+        const auto expires = lifetime > (std::numeric_limits<std::uint64_t>::max)() - s.clock
+            ? (std::numeric_limits<std::uint64_t>::max)() : s.clock + lifetime;
+        return domain.options.replay_store->claim(key, s.clock, expires) ? 1 : 0;
+    }
     template<class F>
     static int guarded(F&& f) noexcept {
         try {
@@ -704,10 +795,12 @@ Result<std::shared_ptr<ServerContext>> ServerContext::create(Options options, st
         !lifetime || lifetime > 86400 || options.server_context || options.session_cache ||
         !options.max_streams || options.max_streams > 4096 || options.max_buffered_bytes < 4096 ||
         options.max_buffered_bytes > 64 * 1024 * 1024 || options.early_data_context.size() > 1024 ||
+        options.max_datagram_frame_size > 65527 ||
         (options.early_data != EarlyDataPolicy::disabled && options.early_data != EarlyDataPolicy::replay_safe))
         return std::unexpected(quic_error(invalid));
     auto impl = std::make_unique<Impl>();
     impl->options = std::move(options);
+    impl->ticket_lifetime_ns = lifetime * 1'000'000'000;
     impl->ctx = SSL_CTX_new(TLS_method());
     if (!impl->ctx || SSL_CTX_set_min_proto_version(impl->ctx, TLS1_3_VERSION) != 1 ||
         SSL_CTX_set_max_proto_version(impl->ctx, TLS1_3_VERSION) != 1 ||
@@ -728,6 +821,7 @@ Result<std::shared_ptr<ServerContext>> ServerContext::create(Options options, st
     if (impl->options.early_data == EarlyDataPolicy::replay_safe) {
         SSL_CTX_set_max_early_data(impl->ctx, std::numeric_limits<std::uint32_t>::max());
         SSL_CTX_set_options(impl->ctx, SSL_OP_NO_ANTI_REPLAY);
+        SSL_CTX_set_allow_early_data_cb(impl->ctx, Engine::Impl::allow_early_data, nullptr);
     }
     return std::shared_ptr<ServerContext>(new ServerContext(std::move(impl)));
 }
@@ -750,6 +844,13 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
         options.alpn.find('\0') != std::string::npos || options.max_streams == 0 ||
         options.max_streams > 4096 || options.max_buffered_bytes < 4096 ||
         options.max_buffered_bytes > 64 * 1024 * 1024 ||
+        options.max_udp_payload < 1200 || options.max_udp_payload > 65527 ||
+        options.max_datagram_frame_size > 65527 ||
+        options.max_queued_datagrams == 0 || options.max_queued_datagrams > 4096 ||
+        options.max_datagram_bytes == 0 || options.max_datagram_bytes > 64 * 1024 * 1024 ||
+        (options.congestion_control != CongestionControl::cubic &&
+         options.congestion_control != CongestionControl::reno &&
+         options.congestion_control != CongestionControl::bbr) ||
         options.max_connection_ids < 2 || options.max_connection_ids > 64 ||
         (options.migration != MigrationPolicy::fixed_peer && options.migration != MigrationPolicy::validated) ||
         (options.early_data != EarlyDataPolicy::disabled && options.early_data != EarlyDataPolicy::replay_safe) ||
@@ -757,7 +858,8 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
         options.service_scope.size() > 128 || options.service_scope.find('\0') != std::string::npos ||
         options.early_data_context.size() > 1024 ||
         ((options.session_cache || options.server_context) && options.service_scope.empty()) ||
-        (options.server && options.session_cache) || (!options.server && options.server_context) ||
+        (options.server && options.session_cache) || (!options.server && (options.server_context || options.replay_store)) ||
+        (options.replay_store && !options.server_context) ||
         (options.early_data != EarlyDataPolicy::disabled &&
          !(options.server ? bool(options.server_context) : bool(options.session_cache))) ||
         (!options.server &&
@@ -814,6 +916,7 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
     cb.rand = Impl::random;
     cb.get_new_connection_id2 = Impl::cid;
     cb.recv_stream_data = Impl::receive_data;
+    cb.recv_datagram = Impl::receive_datagram;
     cb.acked_stream_data_offset = Impl::acknowledged;
     cb.stream_close = Impl::stream_close;
     cb.stream_reset = Impl::reset;
@@ -824,11 +927,19 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
     ngtcp2_settings settings;
     ngtcp2_settings_default(&settings);
     settings.initial_ts = now;
-    settings.no_pmtud = 1;
-    settings.max_tx_udp_payload_size = 1200;
+    settings.no_pmtud = s->options.path_mtu_discovery ? 0 : 1;
+    settings.max_tx_udp_payload_size = s->options.max_udp_payload;
+    settings.qlog_write = s->options.qlog ? Impl::write_qlog : nullptr;
+    switch (s->options.congestion_control) {
+    case CongestionControl::cubic: settings.cc_algo = NGTCP2_CC_ALGO_CUBIC; break;
+    case CongestionControl::reno: settings.cc_algo = NGTCP2_CC_ALGO_RENO; break;
+    case CongestionControl::bbr: settings.cc_algo = NGTCP2_CC_ALGO_BBR; break;
+    }
+    s->output_buffer.resize(s->options.max_udp_payload);
     settings.handshake_timeout = 10 * NGTCP2_SECONDS;
     ngtcp2_transport_params params;
     ngtcp2_transport_params_default(&params);
+    params.max_datagram_frame_size = s->options.max_datagram_frame_size;
     params.initial_max_data = s->options.max_buffered_bytes;
     params.initial_max_stream_data_bidi_local = s->options.max_buffered_bytes;
     params.initial_max_stream_data_bidi_remote = s->options.max_buffered_bytes;
@@ -895,6 +1006,8 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
             bound.service_scope != s->options.service_scope ||
             bound.max_streams != s->options.max_streams ||
             bound.max_buffered_bytes != s->options.max_buffered_bytes ||
+            bound.max_datagram_frame_size != s->options.max_datagram_frame_size ||
+            bound.replay_store != s->options.replay_store ||
             bound.early_data_context != s->options.early_data_context ||
             (s->options.early_data == EarlyDataPolicy::replay_safe &&
              bound.early_data != EarlyDataPolicy::replay_safe) || SSL_CTX_up_ref(context.ctx) != 1)
@@ -1050,7 +1163,7 @@ Result<Packet> Engine::poll_datagram(std::uint64_t now) {
     auto& s = *impl_;
     if (s.failed || s.ended || !s.time(now))
         return std::unexpected(quic_error(invalid));
-    std::array<std::uint8_t, 1200> out{};
+    auto& out = s.output_buffer;
     ngtcp2_pkt_info info{};
     ngtcp2_path_storage path;
     ngtcp2_path_storage_zero(&path);
@@ -1117,6 +1230,63 @@ Result<Packet> Engine::poll_datagram(std::uint64_t now) {
     }
     if (n) ngtcp2_conn_update_pkt_tx_time(s.conn, now);
     return s.output(path.path, out.data(), static_cast<std::size_t>(n));
+}
+std::size_t Engine::max_datagram_payload() const noexcept {
+    if (!impl_ || !handshake_complete() || impl_->ended) return 0;
+    const auto* remote = ngtcp2_conn_get_remote_transport_params(impl_->conn);
+    if (!remote || remote->max_datagram_frame_size <= 9) return 0;
+    const auto path = ngtcp2_conn_get_path_max_tx_udp_payload_size(impl_->conn);
+    // Reserve the maximum short-header/CID/AEAD and DATAGRAM varint overhead.
+    // This deliberately conservative bound avoids accepting messages that can
+    // never fit the current path, even if the peer advertises a larger frame.
+    if (path <= 128) return 0;
+    return (std::min)(path - 128, static_cast<std::size_t>(
+        (std::min)(remote->max_datagram_frame_size - 9, std::uint64_t{65527})));
+}
+Result<DatagramWrite> Engine::send_datagram(std::span<const std::byte> bytes, std::uint64_t now) {
+    auto& s = *impl_;
+    if (s.failed || s.ended || !s.handshake_ready() || !s.time(now))
+        return fail(Errc::invalid_argument);
+    const auto* remote = ngtcp2_conn_get_remote_transport_params(s.conn);
+    if (!remote || remote->max_datagram_frame_size == 0) return fail(Errc::not_supported);
+    if (bytes.size() > max_datagram_payload()) return fail(std::make_error_code(std::errc::message_size));
+    ngtcp2_path_storage path;
+    ngtcp2_path_storage_zero(&path);
+    ngtcp2_pkt_info info{};
+    ngtcp2_vec data{const_cast<std::uint8_t*>(reinterpret_cast<const std::uint8_t*>(bytes.data())),
+                    bytes.size()};
+    int accepted = 0;
+    ERR_clear_error();
+    const auto size = ngtcp2_conn_writev_datagram(s.conn, &path.path, &info,
+        s.output_buffer.data(), s.output_buffer.size(), &accepted,
+        NGTCP2_WRITE_DATAGRAM_FLAG_NONE, 0, &data, 1, now);
+    if (size < 0) {
+        if (size == NGTCP2_ERR_INVALID_STATE) return fail(Errc::not_supported);
+        if (size == NGTCP2_ERR_INVALID_ARGUMENT) return fail(std::make_error_code(std::errc::message_size));
+        s.failed = true;
+        s.failure_code = static_cast<int>(size);
+        return std::unexpected(quic_error(s.failure_code));
+    }
+    if (size) ngtcp2_conn_update_pkt_tx_time(s.conn, now);
+    if (accepted) Impl::increment(s.datagrams_sent);
+    return DatagramWrite{s.output(path.path, s.output_buffer.data(), static_cast<std::size_t>(size)),
+                          accepted != 0};
+}
+std::vector<Datagram> Engine::take_datagrams() {
+    std::vector<Datagram> result;
+    result.swap(impl_->datagrams);
+    impl_->datagram_bytes = 0;
+    return result;
+}
+Statistics Engine::statistics() const noexcept {
+    if (!impl_) return {};
+    ngtcp2_conn_info info{};
+    ngtcp2_conn_get_conn_info(impl_->conn, &info);
+    return {info.smoothed_rtt, info.cwnd, info.bytes_in_flight,
+            info.pkt_sent, info.pkt_recv, info.pkt_lost, info.bytes_sent, info.bytes_recv,
+            impl_->datagrams_sent, impl_->datagrams_received, impl_->datagrams_dropped,
+            ngtcp2_conn_get_path_max_tx_udp_payload_size(impl_->conn), impl_->buffered,
+            impl_->datagrams.size(), impl_->datagram_bytes};
 }
 Path Engine::active_path() const { return owned_path(*ngtcp2_conn_get_path(impl_->conn)); }
 Path Engine::validated_path() const { return impl_->validated; }

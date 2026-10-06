@@ -150,6 +150,10 @@ public:
         std::size_t size{0};
         alignas(std::max_align_t) std::array<std::byte, 128> address{};
         std::size_t address_size{0};
+        // Native POSIX ancillary data; core does not interpret it. Empty on IOCP.
+        alignas(std::max_align_t) std::array<std::byte, 512> control{};
+        std::size_t control_size{0};
+        bool control_truncated{false};
     };
 
     /// Receive one whole datagram. A zero-length packet succeeds; a
@@ -168,6 +172,14 @@ public:
     [[nodiscard]] Task<Result<std::size_t>> send_to(
         NativeHandle handle, std::span<const std::byte> source,
         std::span<const std::byte> address, OperationOptions options = {});
+
+    /// Send one datagram with native ancillary data; shares send_to's direction slot.
+    /// control contains platform-valid, aligned cmsghdr data, borrowed until completion.
+    /// IOCP rejects nonempty control with not_supported rather than ignoring it.
+    [[nodiscard]] Task<Result<std::size_t>> send_message(
+        NativeHandle handle, std::span<const std::byte> source,
+        std::span<const std::byte> address, std::span<const std::byte> control,
+        OperationOptions options = {});
 
     // ── timers and scheduling (portable) ────────────────────────────────────
 

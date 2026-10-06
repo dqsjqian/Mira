@@ -1,3 +1,8 @@
+add_executable(mira_mqtt_websocket_tests ${PROJECT_SOURCE_DIR}/modules/mqtt/tests/test_websocket.cpp)
+target_link_libraries(mira_mqtt_websocket_tests PRIVATE Mira::mqtt Mira::ws Mira::transport Mira::warnings)
+add_test(NAME mqtt.websocket COMMAND mira_mqtt_websocket_tests)
+set_tests_properties(mqtt.websocket PROPERTIES TIMEOUT 30)
+
 add_executable(mira_ws_extended_negotiation_tests test_extended_connect_negotiation.cpp)
 target_link_libraries(mira_ws_extended_negotiation_tests PRIVATE Mira::ws Mira::warnings)
 target_include_directories(mira_ws_extended_negotiation_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)

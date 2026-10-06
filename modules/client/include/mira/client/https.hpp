@@ -29,7 +29,7 @@ public:
     using Connection = HttpsConnection;
     [[nodiscard]] static Result<HttpsFactory> create(tls::Context::ClientConfig config = {},
                                                                std::optional<ResourceBudget> buffer_budget = {}) {
-        if (!config.protocol.empty() && config.protocol != "http/1.1")
+        if ((!config.protocol.empty() && config.protocol != "http/1.1") || !config.protocols.empty())
             return fail(Errc::not_supported);
         config.protocol = "http/1.1";
         auto context = tls::Context::client(config);

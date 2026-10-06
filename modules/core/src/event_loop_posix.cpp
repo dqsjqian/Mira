@@ -1072,6 +1072,8 @@ Task<Result<EventLoop::DatagramResult>> EventLoop::receive_from(
         message.msg_namelen = static_cast<socklen_t>(result.address.size());
         message.msg_iov = &buffer;
         message.msg_iovlen = 1;
+        message.msg_control = result.control.data();
+        message.msg_controllen = static_cast<decltype(message.msg_controllen)>(result.control.size());
         const ssize_t count = ::recvmsg(handle, &message, 0);
         if (count >= 0) {
             if ((message.msg_flags & MSG_TRUNC) != 0 ||
@@ -1079,6 +1081,8 @@ Task<Result<EventLoop::DatagramResult>> EventLoop::receive_from(
                 co_return fail(std::make_error_code(std::errc::message_size));
             result.size = static_cast<std::size_t>(count);
             result.address_size = message.msg_namelen;
+            result.control_size = message.msg_controllen;
+            result.control_truncated = (message.msg_flags & MSG_CTRUNC) != 0;
             co_return result;
         }
         if (errno == EINTR) continue;
@@ -1091,11 +1095,19 @@ Task<Result<EventLoop::DatagramResult>> EventLoop::receive_from(
 Task<Result<std::size_t>> EventLoop::send_to(
     NativeHandle handle, std::span<const std::byte> source,
     std::span<const std::byte> address, OperationOptions options) {
+    return send_message(handle, source, address, {}, options);
+}
+
+Task<Result<std::size_t>> EventLoop::send_message(
+    NativeHandle handle, std::span<const std::byte> source,
+    std::span<const std::byte> address, std::span<const std::byte> control,
+    OperationOptions options) {
     Impl* impl = impl_.get();
     if (!impl || impl->shutting_down()) co_return fail(Errc::cancelled);
     if (const auto rejected = detail::rejected_before_submit(options)) co_return fail(*rejected);
     if (handle < 0 || address.size() < sizeof(sockaddr) ||
-        address.size() > sizeof(sockaddr_storage))
+        address.size() > sizeof(sockaddr_storage) ||
+        control.size() > (std::numeric_limits<decltype(msghdr{}.msg_controllen)>::max)())
         co_return fail(Errc::invalid_argument);
     auto token = impl->acquire_datagram(handle, true);
     if (!token) co_return fail(Errc::invalid_argument);
@@ -1107,9 +1119,15 @@ Task<Result<std::size_t>> EventLoop::send_to(
     } guard{impl, handle, token};
     for (;;) {
         if (*token) co_return fail(Errc::cancelled);
-        const ssize_t count = ::sendto(handle, source.data(), source.size(), 0,
-            reinterpret_cast<const sockaddr*>(address.data()),
-            static_cast<socklen_t>(address.size()));
+        iovec buffer{const_cast<std::byte*>(source.data()), source.size()};
+        msghdr message{};
+        message.msg_name = const_cast<std::byte*>(address.data());
+        message.msg_namelen = static_cast<socklen_t>(address.size());
+        message.msg_iov = &buffer;
+        message.msg_iovlen = 1;
+        message.msg_control = const_cast<std::byte*>(control.data());
+        message.msg_controllen = static_cast<decltype(message.msg_controllen)>(control.size());
+        const ssize_t count = ::sendmsg(handle, &message, 0);
         if (count >= 0) {
             if (static_cast<std::size_t>(count) != source.size())
                 co_return fail(std::make_error_code(std::errc::message_size));

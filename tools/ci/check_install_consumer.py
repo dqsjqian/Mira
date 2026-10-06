@@ -11,6 +11,7 @@ import tempfile
 BASE_SOURCE = r'''
 #include <mira/core/version.hpp>
 #include <mira/core/error.hpp>
+#include <mira/core/observe.hpp>
 #include <mira/http/parser.hpp>
 #include <mira/transport/endpoint.hpp>
 #include <iostream>
@@ -29,6 +30,7 @@ int main() {
 H3_SOURCE = r'''
 #include <mira/core/version.hpp>
 #include <mira/http3/connection.hpp>
+#include <mira/http3/client_session.hpp>
 #include <mira/transport/udp.hpp>
 #include <iostream>
 int main() {
@@ -88,6 +90,10 @@ static_assert(std::string_view{{MIRA_VERSION_STRING}} == "{version}");
         installed.append('quic')
     if 'tls' in installed:
         installed.append('client_tls')
+        if 'http2' in installed:
+            installed.append('client_http2')
+    if 'http3' in installed:
+        installed.append('client_http3')
     if args.expect_http3_only and ('http3' not in installed or 'http2' in installed):
         raise RuntimeError('This mode requires HTTP3=ON and HTTP2=OFF')
 
@@ -272,6 +278,31 @@ int main() {
     return client && client->active_and_idle() == 0 ? 0 : 2;
 }
 ''')
+        if 'client_http2' in installed:
+            case('client-h2-api', 'COMPONENTS client_http2', links='client_http2', source='''
+#include <mira/client/http2.hpp>
+int main() {
+    auto loop = Mira::EventLoop::create();
+    auto factory = Mira::client::Http2Factory::create();
+    if (!loop || !factory) return 1;
+    auto client = Mira::client::Http2Client::create(*loop, std::move(*factory));
+    return client && client->origins() == 0 ? 0 : 2;
+}
+''')
+        if 'client_http3' in installed:
+            case('client-h3-api', 'COMPONENTS client_http3', links='client_http3', source='''
+#include <mira/client/http3.hpp>
+int main() {
+    auto loop = Mira::EventLoop::create();
+    if (!loop) return 1;
+    auto client = Mira::client::Http3Client::create(*loop, Mira::client::Http3Factory{});
+    return client && client->origins() == 0 ? 0 : 2;
+}
+''')
+        for component in ['client_http2', 'client_http3']:
+            case(component + '-required-hidden', 'COMPONENTS ' + component,
+                 hidden=True, success=False,
+                 diagnostic=f"Mira component '{component}' is unavailable")
         case('client-tls-required-hidden', 'COMPONENTS client_tls', hidden=True, success=False,
              diagnostic="Mira component 'client_tls' is unavailable")
         case('client-tls-optional-hidden', 'COMPONENTS client OPTIONAL_COMPONENTS client_tls',

@@ -111,11 +111,15 @@ struct Session::Impl {
         releasing.clear();
     }
 
-    std::uint16_t allocate() {
+    std::uint16_t allocate(std::span<const std::uint16_t> retained_ids) {
         for (std::uint32_t tries = 0; tries < 65535; ++tries) {
             const auto id = next_id;
             next_id = static_cast<std::uint16_t>(next_id == 65535 ? 1 : next_id + 1);
-            if (!outgoing.contains(id) && !requests.contains(id)) return id;
+            if (!outgoing.contains(id) && !requests.contains(id) &&
+                std::find(retained_ids.begin(), retained_ids.end(), id) == retained_ids.end() &&
+                std::none_of(events.begin(), events.end(), [id](const Event& event) {
+                    return event.packet_id == id && event.kind != Event::Kind::message;
+                })) return id;
         }
         return 0;
     }
@@ -371,6 +375,120 @@ Result<Session> Session::create(ClientOptions options) {
     return session;
 }
 
+Result<Bytes> Session::checkpoint(std::string_view scope, std::size_t max_bytes) const {
+    if (client_owned_) return fail(Errc::not_supported);
+    return checkpoint_impl(scope, max_bytes);
+}
+Result<Bytes> Session::checkpoint_impl(std::string_view scope, std::size_t max_bytes) const {
+    const auto& s = *impl_;
+    if (scope.empty() || scope.size() > 4096 || s.options.client_id.empty() ||
+        s.options.clean_start || max_bytes > 64 * 1024 * 1024 || max_bytes < 32)
+        return fail(Errc::invalid_argument);
+    if (!s.events.empty() || s.external_events || !s.requests.empty()) return fail(Errc::would_block);
+    Bytes result;
+    const auto put = [&](std::uint32_t value) {
+        if (result.size() > max_bytes - 4) return false;
+        for (int shift : {24, 16, 8, 0}) result.push_back(std::byte((value >> shift) & 255U));
+        return true;
+    };
+    const auto blob = [&](std::span<const std::byte> data) {
+        if (data.size() > max_bytes || result.size() > max_bytes - data.size() ||
+            max_bytes - result.size() - data.size() < 4) return false;
+        if (!put(static_cast<std::uint32_t>(data.size()))) return false;
+        result.insert(result.end(), data.begin(), data.end());
+        return true;
+    };
+    if (!put(0x4d515331) || !put(static_cast<std::uint32_t>(s.options.version)) ||
+        !blob(std::as_bytes(std::span(scope.data(), scope.size()))) ||
+        !blob(std::as_bytes(std::span(s.options.client_id.data(), s.options.client_id.size()))) ||
+        !put(static_cast<std::uint32_t>(s.outgoing.size()))) return fail(Errc::limit_exceeded);
+    std::vector<std::pair<std::uint64_t, std::uint16_t>> order;
+    for (const auto& [id, value] : s.outgoing) order.emplace_back(value.order, id);
+    std::sort(order.begin(), order.end());
+    for (const auto& [unused, id] : order) {
+        static_cast<void>(unused);
+        const auto& entry = s.outgoing.at(id);
+        auto encoded = encode(entry.publish, s.options.version);
+        if (!encoded) return fail(encoded.error());
+        if (!put(static_cast<std::uint32_t>(entry.stage)) || !blob(*encoded))
+            return fail(Errc::limit_exceeded);
+    }
+    if (!put(static_cast<std::uint32_t>(s.releasing.size()))) return fail(Errc::limit_exceeded);
+    for (auto id : s.releasing) if (!put(id)) return fail(Errc::limit_exceeded);
+    return result;
+}
+Result<Session> Session::restore(ClientOptions options, std::span<const std::byte> data,
+                                std::string_view scope, std::size_t max_bytes,
+                                std::uint32_t elapsed_seconds) {
+    if (scope.empty() || scope.size() > 4096 || options.clean_start || options.client_id.empty() ||
+        max_bytes > 64 * 1024 * 1024 || data.size() > max_bytes) return fail(Errc::invalid_argument);
+    const auto get = [&]() -> std::optional<std::uint32_t> {
+        if (data.size() < 4) return {};
+        std::uint32_t value = 0;
+        for (std::byte byte : data.first(4)) value = (value << 8) | std::to_integer<std::uint32_t>(byte);
+        data = data.subspan(4);
+        return value;
+    };
+    const auto blob = [&]() -> std::optional<std::span<const std::byte>> {
+        const auto size = get();
+        if (!size || *size > data.size()) return {};
+        const auto value = data.first(*size);
+        data = data.subspan(*size);
+        return value;
+    };
+    const auto magic = get(), version = get();
+    const auto domain = blob(), identity = blob();
+    const auto equal = [](std::span<const std::byte> bytes, std::string_view value) {
+        return std::ranges::equal(bytes, std::as_bytes(std::span(value.data(), value.size())));
+    };
+    if (magic != 0x4d515331 || version != static_cast<std::uint32_t>(options.version) ||
+        !domain || !identity || !equal(*domain, scope) || !equal(*identity, options.client_id))
+        return fail(Errc::invalid_argument);
+    auto result = create(std::move(options));
+    if (!result) return fail(result.error());
+    auto& s = *result->impl_;
+    const auto count = get();
+    if (!count || *count > 65535) return fail(Errc::invalid_argument);
+    std::set<std::uint16_t> identifiers;
+    for (std::uint32_t n = 0; n < *count; ++n) {
+        const auto stage = get();
+        const auto encoded = blob();
+        if (!stage || *stage > static_cast<std::uint32_t>(Impl::Stage::pubcomp) || !encoded)
+            return fail(Errc::invalid_argument);
+        auto decoded = decode(*encoded, s.options.version, Role::server, max_bytes);
+        if (!decoded || !decoded->packet || decoded->consumed != encoded->size())
+            return fail(Errc::invalid_argument);
+        auto* message = std::get_if<Publish>(&*decoded->packet);
+        if (!message || message->qos == QoS::at_most_once || message->properties.topic_alias ||
+            !message->properties.subscription_identifiers.empty() ||
+            !identifiers.insert(message->packet_id).second ||
+            ((*stage == static_cast<std::uint32_t>(Impl::Stage::puback)) !=
+             (message->qos == QoS::at_least_once))) return fail(Errc::invalid_argument);
+        const auto id = message->packet_id;
+        if (*stage != static_cast<std::uint32_t>(Impl::Stage::pubcomp) &&
+            message->properties.message_expiry_interval) {
+            auto& remaining = *message->properties.message_expiry_interval;
+            if (elapsed_seconds >= remaining) {
+                if (!s.room_for_events(1)) return fail(Errc::limit_exceeded);
+                s.discard(Event::Kind::published, id);
+                continue;
+            }
+            remaining -= elapsed_seconds;
+        }
+        s.outgoing.emplace(id, Impl::Outgoing{std::move(*message), static_cast<Impl::Stage>(*stage),
+                                              s.order++, false});
+    }
+    const auto incoming = get();
+    if (!incoming || *incoming > s.options.receive_maximum) return fail(Errc::invalid_argument);
+    for (std::uint32_t n = 0; n < *incoming; ++n) {
+        const auto id = get();
+        if (!id || *id == 0 || *id > 65535 || !s.releasing.insert(static_cast<std::uint16_t>(*id)).second)
+            return fail(Errc::invalid_argument);
+    }
+    if (!data.empty()) return fail(Errc::invalid_argument);
+    return result;
+}
+
 Result<void> Session::connect(std::uint64_t now, std::size_t externally_buffered_events) {
     auto& s = *impl_;
     // Drain prior events before reconnecting if all abandonment notices would
@@ -453,7 +571,7 @@ Result<void> Session::receive(std::span<const std::byte> bytes, std::uint64_t no
     return outcome;
 }
 
-Result<std::uint16_t> Session::publish(Publish message) {
+Result<std::uint16_t> Session::publish(Publish message, std::span<const std::uint16_t> retained_ids) {
     auto& s = *impl_;
     if (auto r = s.ready_to_send(); !r) return fail(r.error());
     if (static_cast<std::uint8_t>(message.qos) > s.server_max_qos || (message.retain && !s.retain_available) ||
@@ -464,7 +582,7 @@ Result<std::uint16_t> Session::publish(Publish message) {
     message.packet_id = 0;
     if (message.qos != QoS::at_most_once) {
         if (!s.pending_resends.empty() || s.sent_count() >= s.server_receive_max) return fail(Errc::would_block);
-        message.packet_id = s.allocate();
+        message.packet_id = s.allocate(retained_ids);
         if (!message.packet_id) return fail(Errc::would_block);
     }
     if (auto r = s.submit(message); !r) return fail(r.error());
@@ -477,7 +595,8 @@ Result<std::uint16_t> Session::publish(Publish message) {
     return id;
 }
 
-Result<std::uint16_t> Session::subscribe(std::vector<Subscription> subscriptions, Properties properties) {
+Result<std::uint16_t> Session::subscribe(std::vector<Subscription> subscriptions, Properties properties,
+                                        std::span<const std::uint16_t> retained_ids) {
     auto& s = *impl_;
     if (auto r = s.ready_to_send(); !r) return fail(r.error());
     for (const auto& sub : subscriptions)
@@ -485,7 +604,7 @@ Result<std::uint16_t> Session::subscribe(std::vector<Subscription> subscriptions
             (!s.shared_available && s.v5() && sub.filter.starts_with("$share/")))
             return fail(Errc::not_supported);
     if (!s.identifiers_available && !properties.subscription_identifiers.empty()) return fail(Errc::not_supported);
-    const auto id = s.allocate();
+    const auto id = s.allocate(retained_ids);
     if (!id) return fail(Errc::would_block);
     const auto count = subscriptions.size();
     if (auto r = s.submit(Subscribe{id, std::move(subscriptions), std::move(properties)}); !r) return fail(r.error());
@@ -493,10 +612,11 @@ Result<std::uint16_t> Session::subscribe(std::vector<Subscription> subscriptions
     return id;
 }
 
-Result<std::uint16_t> Session::unsubscribe(std::vector<std::string> filters, Properties properties) {
+Result<std::uint16_t> Session::unsubscribe(std::vector<std::string> filters, Properties properties,
+                                          std::span<const std::uint16_t> retained_ids) {
     auto& s = *impl_;
     if (auto r = s.ready_to_send(); !r) return fail(r.error());
-    const auto id = s.allocate();
+    const auto id = s.allocate(retained_ids);
     if (!id) return fail(Errc::would_block);
     const auto count = filters.size();
     if (auto r = s.submit(Unsubscribe{id, std::move(filters), std::move(properties)}); !r) return fail(r.error());

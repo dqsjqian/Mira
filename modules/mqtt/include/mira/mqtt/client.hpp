@@ -69,6 +69,27 @@ public:
         co_return std::move(client);
     }
 
+    /// Restore a caller-persisted session, then perform CONNECT on a fresh
+    /// transport. Persist scope and elapsed time according to Session::restore.
+    [[nodiscard]] static Task<Result<Client>> restore(Stream& stream, ClientOptions options,
+        Bytes checkpoint, std::string scope, OperationOptions io = {},
+        std::uint32_t elapsed_seconds = 0, AuthHandler auth_handler = {}) {
+        const auto event_limit = options.max_events;
+        auto session = Session::restore(std::move(options), checkpoint, scope,
+                                          16 * 1024 * 1024, elapsed_seconds);
+        if (!session) co_return fail(session.error());
+        auto notices = session->take_events();
+        Client client{stream, std::move(*session)};
+        client.max_events_ = event_limit;
+        client.auth_handler_ = std::move(auth_handler);
+        auto connected = co_await client.handshake(stream, io);
+        if (!connected) co_return fail(connected.error());
+        if (notices.size() > event_limit - client.events_.size()) co_return fail(Errc::limit_exceeded);
+        for (auto it = notices.rbegin(); it != notices.rend(); ++it)
+            client.events_.push_front(std::move(*it));
+        co_return std::move(client);
+    }
+
     /// Resume on a fresh stream after the previous one failed. With
     /// clean_start = false and a present session, unacknowledged publishes are
     /// resent; otherwise they are reported as discarded events.
@@ -91,7 +112,7 @@ public:
         message.qos = qos;
         message.retain = retain;
         message.properties = std::move(properties);
-        auto id = session_.publish(std::move(message));
+        auto id = session_.publish(std::move(message), retained_ids());
         if (!id) co_return fail(id.error());
         auto flushed = co_await flush(io);
         if (!flushed) co_return fail(flushed.error());
@@ -102,7 +123,7 @@ public:
                                                         Properties properties = {}, OperationOptions io = {}) {
         if (error_) co_return fail(error_);
         const FailureGuard failure_guard{*this};
-        auto id = session_.subscribe(std::move(subscriptions), std::move(properties));
+        auto id = session_.subscribe(std::move(subscriptions), std::move(properties), retained_ids());
         if (!id) co_return fail(id.error());
         auto flushed = co_await flush(io);
         if (!flushed) co_return fail(flushed.error());
@@ -113,7 +134,7 @@ public:
                                                           Properties properties = {}, OperationOptions io = {}) {
         if (error_) co_return fail(error_);
         const FailureGuard failure_guard{*this};
-        auto id = session_.unsubscribe(std::move(filters), std::move(properties));
+        auto id = session_.unsubscribe(std::move(filters), std::move(properties), retained_ids());
         if (!id) co_return fail(id.error());
         auto flushed = co_await flush(io);
         if (!flushed) co_return fail(flushed.error());
@@ -204,8 +225,18 @@ public:
         }
     }
 
+    /// Advanced session access: do not mutate it while client I/O is pending.
+    /// A client-owned session rejects direct checkpoint calls; use the client's
+    /// queue-aware checkpoint() even when accessing through this reference.
     [[nodiscard]] Session& session() noexcept { return session_; }
     [[nodiscard]] const Session& session() const noexcept { return session_; }
+    /// A snapshot cannot discard events buffered by wait_for or a partially
+    /// completed read/write. Drain receive() and join operations first.
+    [[nodiscard]] Result<Bytes> checkpoint(std::string_view scope,
+                                          std::size_t max_bytes = 16 * 1024 * 1024) const {
+        if (reading_ || writing_ || !events_.empty()) return fail(Errc::would_block);
+        return session_.checkpoint_impl(scope, max_bytes);
+    }
     [[nodiscard]] bool closed() const noexcept { return error_ || session_.state() == SessionState::closed; }
     /// The CONNACK of the latest (re)connect attempt.
     [[nodiscard]] const Event& last_connack() const noexcept { return connack_; }
@@ -228,7 +259,9 @@ private:
         ~Guard() { flag = false; }
     };
 
-    Client(Stream& stream, Session session) : stream_(&stream), session_(std::move(session)) {}
+    Client(Stream& stream, Session session) : stream_(&stream), session_(std::move(session)) {
+        session_.client_owned_ = true;
+    }
 
     Task<Result<void>> handshake(Stream& stream, OperationOptions io) {
         const FailureGuard failure_guard{*this};
@@ -337,6 +370,13 @@ private:
         co_return Result<void>{};
     }
 
+    std::vector<std::uint16_t> retained_ids() const {
+        std::vector<std::uint16_t> ids;
+        ids.reserve(events_.size());
+        for (const auto& event : events_)
+            if (event.packet_id && event.kind != Event::Kind::message) ids.push_back(event.packet_id);
+        return ids;
+    }
     Stream* stream_;
     Session session_;
     std::deque<Event> events_;
