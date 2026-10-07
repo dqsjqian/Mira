@@ -4,7 +4,7 @@ Version source, compatibility policy and consumption instructions are maintained
 in the [release guide](docs/RELEASES.md). Version headings below are historical
 records; they are not additional definitions of the current build version.
 
-## [Unreleased]
+## [1.1.0] - 2026-10-07
 
 ### Added
 
@@ -34,6 +34,9 @@ records; they are not additional definitions of the current build version.
 - Opt-in operation observation, stream decorators, cross-loop counters and fixed
   latency histograms; focused ThreadSanitizer jobs and independent aioquic H3,
   early-data acceptance/rejection and WebSocket Extended CONNECT validation.
+- Protocol-neutral DoH multiplexed mapping.
+- Optional libuv TCP reference benchmark and revision-scoped longer fault-soak
+  evidence. These do not establish a universal cross-library performance ranking.
 
 ### Fixed
 
@@ -47,24 +50,6 @@ records; they are not additional definitions of the current build version.
 Verification remains revision/configuration-specific. No new Release is implied
 by this development entry; mobile/WAN and unsupported platform extensions remain
 explicit acceptance boundaries.
-
-## [Unreleased]
-
-- Structured H2/H3 duplex session drivers, bounded concurrent client sessions,
-  owning per-origin H2TLS/H3 client pools, and opt-in full-duplex Extended CONNECT
-  adapters with per-stream cancellation.
-- TLS immutable SNI identity snapshots, atomic certificate reload, combined mTLS
-  and ALPN, local CRL policy and OCSP stapling/client verification.
-- Bounded resolver policy cache and request coalescing; explicit asynchronous DNS
-  UDP/TCP queries, UDP multicast and POSIX packet metadata/source selection.
-- QUIC PMTUD/payload/congestion configuration, RFC 9221 unreliable DATAGRAMs,
-  qlog/statistics, and optional atomic early-data replay admission storage.
-- WebSocket binary byte-stream adapter, MQTT checkpoint/restore and delivery-ID
-  protection, SOCKS5 BIND/UDP ASSOCIATE and owning UDP relay lifecycle.
-- Protocol-neutral DoH multiplexed mapping, operation tracing and fixed metrics,
-  focused ThreadSanitizer CI and independent aioquic advanced interoperability.
-- Optional libuv TCP reference benchmark and revision-scoped longer fault-soak
-  evidence. These do not establish a universal cross-library performance ranking.
 
 ## [1.0.0] — 2026-09-30
 
