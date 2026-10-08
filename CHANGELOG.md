@@ -4,6 +4,16 @@ Version source, compatibility policy and consumption instructions are maintained
 in the [release guide](docs/RELEASES.md). Version headings below are historical
 records; they are not additional definitions of the current build version.
 
+## Unreleased
+
+### Fixed
+
+- Reject framing, routing and connection-control fields in HTTP/1 request
+  trailers, matching response parsing. Buffered and streaming connections stop
+  dispatching pipelined requests after invalid trailers.
+- Apply the per-line header limit to generated `Expect: 100-continue` fields
+  before modifying the serialized output.
+
 ## [1.1.0] - 2026-10-07
 
 ### Added

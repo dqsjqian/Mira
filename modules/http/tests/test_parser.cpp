@@ -306,6 +306,28 @@ void test_chunked_trailers() {
     CHECK(parser.trailers().get("x-checksum").value_or("") == "abc123");
 }
 
+void test_forbidden_trailers() {
+    test::section("request trailers reject framing, routing and connection control fields");
+    for (const auto field : {"Content-Length: 0", "Transfer-Encoding: chunked", "Host: other.test",
+                              "Connection: close", "Trailer: X-End", "cOnTeNt-LeNgTh: 0",
+                              "tRaNsFeR-EnCoDiNg: chunked", "hOsT: other.test",
+                              "cOnNeCtIoN: close", "tRaIlEr: X-End"}) {
+        const auto wire = std::string{"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                      "4\r\ndata\r\n0\r\n"} + field + "\r\n\r\n";
+        for (const auto& outcome : {parse_all(wire), parse_byte_by_byte(wire)}) {
+            CHECK(!outcome.ok);
+            CHECK(!outcome.complete);
+            CHECK(outcome.error == ParseError::framing_conflict);
+            CHECK(outcome.body == "data");
+        }
+        RequestParser parser;
+        Buffer buffer;
+        feed(buffer, wire);
+        static_cast<void>(drive(parser, buffer));
+        CHECK(parser.trailers().empty());
+    }
+}
+
 void test_pipelining_and_reset() {
     test::section("pipelining");
 
@@ -666,6 +688,7 @@ int main() {
     test_chunked_body();
     test_chunk_data_terminator();
     test_chunked_trailers();
+    test_forbidden_trailers();
     test_pipelining_and_reset();
     test_methods_and_versions();
 

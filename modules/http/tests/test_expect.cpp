@@ -134,6 +134,35 @@ Task<void> serializer_rules() {
     Buffer chunked;
     CHECK_VALUE(write_request_head(chunked, request, Framing::chunked, 0, {},
                                    Expectation::continue_100));
+    test::section("generated Expect fields respect the per-line header limit");
+    for (const auto framing : {Framing::content_length, Framing::chunked}) {
+        constexpr auto expect_size = std::string_view{"Expect: 100-continue"}.size();
+        const auto framing_size = framing == Framing::content_length
+                                    ? std::string_view{"Content-Length: 5"}.size()
+                                    : std::string_view{"Transfer-Encoding: chunked"}.size();
+        const auto longest = (std::max)(expect_size, framing_size);
+        for (const auto line_limit : {longest - 1, longest, longest + 1}) {
+            Limits limits;
+            limits.max_header_line = line_limit;
+            auto minimal = post();
+            minimal.headers.clear();
+            minimal.headers.append("Host", "x");
+            Buffer wire;
+            wire.append(bytes("prefix"));
+            const auto serialized = write_request_head(wire, minimal, framing,
+                framing == Framing::content_length ? 5 : 0, limits, Expectation::continue_100);
+            if (line_limit < longest) {
+                CHECK(!serialized && serialized.error() == Errc::limit_exceeded);
+                CHECK(std::ranges::equal(wire.readable(), bytes("prefix")));
+            } else {
+                CHECK_VALUE(serialized);
+                wire.consume(6);
+                RequestParser parser{limits};
+                CHECK(parser.parse(wire) == ParseStep::head);
+                CHECK(parser.request().headers.get("Expect") == "100-continue");
+            }
+        }
+    }
     auto old = post();
     old.version = Version::http_1_0;
     Buffer legacy;

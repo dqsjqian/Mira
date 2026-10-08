@@ -723,6 +723,28 @@ void test_double_send_refused() {
     CHECK(count_occurrences(stream.sent(), "HTTP/1.1 200 OK") == 1);
 }
 
+void test_forbidden_trailer_stops_pipeline() {
+    test::section("forbidden request trailers stop pipelined request dispatch");
+    const std::string wire = "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+                             "4\r\ndata\r\n0\r\nContent-Length: 0\r\n\r\n"
+                             "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    for (const auto fragment : {std::size_t{1}, wire.size()}) {
+        ScriptedStream stream{wire, fragment};
+        unsigned calls = 0;
+        auto handler = [&calls](const Request&, auto& writer,
+                                 std::span<const std::byte>) -> Task<Result<void>> {
+            ++calls;
+            co_return co_await writer.send(Response{});
+        };
+        const auto result = serve_connection(stream, handler).sync_get();
+        CHECK(!result);
+        if (!result) CHECK(result.error() == ParseError::framing_conflict);
+        CHECK(calls == 0);
+        CHECK(count_occurrences(stream.sent(), "HTTP/1.1 400 ") == 1);
+        CHECK(stream.sent().find("HTTP/1.1 200 ") == std::string::npos);
+    }
+}
+
 void test_truncated_head_and_zero_read_policy() {
     test::section("truncated heads are not clean idle closes");
     int calls = 0;
@@ -966,6 +988,7 @@ int main() {
     test_clean_close_between_requests();
     test_request_limit_closes_connection();
     test_double_send_refused();
+    test_forbidden_trailer_stops_pipeline();
     test_truncated_head_and_zero_read_policy();
     test_timeout_windows();
     test_request_budget_is_per_request();

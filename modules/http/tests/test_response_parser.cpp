@@ -275,6 +275,23 @@ void test_negative() {
               limits)
             .error == ParseError::limit_exceeded);
 }
+void test_forbidden_trailers() {
+    test::section("response trailers preserve the same rejection rules as requests");
+    for (const auto field : {"Content-Length: 0", "Transfer-Encoding: chunked", "Host: other.test",
+                              "Connection: close", "Trailer: X-End", "cOnTeNt-LeNgTh: 0",
+                              "tRaNsFeR-EnCoDiNg: chunked", "hOsT: other.test",
+                              "cOnNeCtIoN: close", "tRaIlEr: X-End"}) {
+        const auto wire = std::string{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                      "4\r\ndata\r\n0\r\n"} + field + "\r\n\r\n";
+        for (const auto fragment : {std::size_t{1}, wire.size()}) {
+            const auto result = parse(wire, fragment);
+            CHECK_VALUE(result.error == ParseError::framing_conflict);
+            CHECK_VALUE(!result.done);
+            CHECK_VALUE(result.body == "data");
+        }
+    }
+}
+
 void test_request_serialization() {
     test::section("request serialization and Host validation");
     Request request;
@@ -358,6 +375,7 @@ int main() {
     test_chunk_data_terminator();
     test_semantics();
     test_negative();
+    test_forbidden_trailers();
     test_request_serialization();
     return test::summary();
 }

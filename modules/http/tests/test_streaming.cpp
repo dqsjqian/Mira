@@ -180,6 +180,34 @@ static void test_streaming_chunked_body_with_trailers() {
     CHECK(trailer_value == "8");
 }
 
+static void test_forbidden_trailer_stops_streaming_pipeline() {
+    test::section("body reads and automatic drains reject forbidden trailers before pipelining");
+    for (const bool reads_body : {false, true}) {
+        ScriptStream stream{{bytes("POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                   "4\r\ndata\r\n0\r\nhOsT: other.test\r\n\r\n"
+                                   "GET /next HTTP/1.1\r\nHost: x\r\n\r\n")}};
+        unsigned calls = 0;
+        Error read_error;
+        auto handler = [&](const http::Request&, auto& writer, auto& reader) -> Task<Result<void>> {
+            ++calls;
+            if (reads_body) {
+                const auto body = co_await reader.read_all();
+                if (!body) read_error = body.error();
+                CHECK(reader.trailers().empty());
+            }
+            co_return co_await writer.send(http::Response{});
+        };
+        const auto result = http::serve_connection(stream, handler).sync_get();
+        CHECK(!result);
+        if (!result) CHECK(result.error() == http::ParseError::framing_conflict);
+        CHECK(calls == 1);
+        if (reads_body) CHECK(read_error == http::ParseError::framing_conflict);
+        const auto sent = stream.written();
+        CHECK(sent.find("HTTP/1.1 200 ") == 0);
+        CHECK(sent.find("HTTP/1.1 200 ", 1) == std::string::npos);
+    }
+}
+
 static void test_streaming_read_all_matches_buffered_path() {
     test::section("read_all matches the buffered path");
     const std::string payload(4096, 'x');
@@ -260,6 +288,7 @@ int main() {
     test_streaming_body_slices_arrive_in_order();
     test_streaming_handler_that_never_reads_gets_its_body_drained();
     test_streaming_chunked_body_with_trailers();
+    test_forbidden_trailer_stops_streaming_pipeline();
     test_streaming_read_all_matches_buffered_path();
     test_streaming_body_over_budget_fails_and_closes();
     test_buffered_handler_still_gets_whole_body();

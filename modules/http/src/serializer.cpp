@@ -261,6 +261,7 @@ Result<void> write_request_head(Buffer& out, const Request& request,
     constexpr std::string_view expect_line = "Expect: 100-continue";
     const bool expect = expectation == Expectation::continue_100;
     if (expect && (request.headers.size() + 1 >= limits.max_header_count ||
+                   expect_line.size() > limits.max_header_line ||
                    expect_line.size() > limits.max_headers_total - total)) {
         return fail(Errc::limit_exceeded);
     }

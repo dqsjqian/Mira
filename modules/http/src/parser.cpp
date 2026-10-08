@@ -691,6 +691,15 @@ Result<RequestParser::Progress> RequestParser::read_chunk_trailer(Buffer& input)
             }
         }
 
+        // Match response trailer validation: framing, routing and connection
+        // control fields cannot be supplied after the message body.
+        if (HeaderMap::names_equal(name, "content-length") ||
+            HeaderMap::names_equal(name, "transfer-encoding") ||
+            HeaderMap::names_equal(name, "host") ||
+            HeaderMap::names_equal(name, "connection") ||
+            HeaderMap::names_equal(name, "trailer")) {
+            return fail(ParseError::framing_conflict);
+        }
         if (trailers_.size() >= limits_.max_header_count - request_.headers.size() ||
             line.text.size() > limits_.max_headers_total - headers_total_) {
             return fail(ParseError::limit_exceeded);
