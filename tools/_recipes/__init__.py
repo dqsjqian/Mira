@@ -7,32 +7,29 @@ everything Mira-specific: the recipe table and OpenSSL version gate.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+import sys
 
 from aria_deps import Dependency, ProjectConfig
+from .protocol_support import install_compile_pdbs, install_dependency_licenses
 
 
-def _ngtcp2_openssl_check(prefix: Path, source: Path, dep: Dependency) -> None:
-    # ngtcp2's OpenSSL backend requires SSL_set_quic_tls_cbs (OpenSSL 3.5+).
-    # The original build_protocol_deps.py gated on this CMake cache entry.
-    # (Hook runs after build; the cache file lives next to the build dir,
-    # so we check the installed library instead.)
-    pass
+def protocol_post_build(prefix: Path, source: Path, dep: Dependency) -> None:
+    build = source.parent / 'build'
+    if dep.name == 'ngtcp2':
+        cache = (build / 'CMakeCache.txt').read_text(encoding='utf-8')
+        if 'HAVE_SSL_SET_QUIC_TLS_CBS:INTERNAL=1' not in cache:
+            raise ValueError('ngtcp2 requires OpenSSL 3.5+ with SSL_set_quic_tls_cbs')
+    if sys.platform == 'win32':
+        install_compile_pdbs(build, prefix)
 
 
-def ngtcp2_post_build(prefix: Path, source: Path, dep: Dependency) -> None:
-    # Verify the OpenSSL backend was actually enabled: the original script
-    # required HAVE_SSL_SET_QUIC_TLS_CBS in CMakeCache. We check for the
-    # crypto backend library as a proxy.
-    lib = prefix / "lib" / "libngtcp2_crypto_ossl.a"
-    if not lib.is_file():
-        # Windows uses _static suffix
-        lib = prefix / "lib" / "ngtcp2_crypto_ossl_static.lib"
-    if not lib.is_file():
-        raise ValueError(
-            "ngtcp2 OpenSSL crypto backend not built; "
-            "requires OpenSSL 3.5+ with SSL_set_quic_tls_cbs"
-        )
+def protocol_licenses(prefix: Path, source: Path, dep: Dependency) -> list[str]:
+    install_dependency_licenses(source, prefix, dep.name)
+    license_dir = prefix / 'share/licenses' / dep.name
+    return sorted(path.relative_to(license_dir).as_posix() for path in license_dir.rglob('*')
+                  if path.is_file() and path.name not in dep.license_files)
 
 
 RECIPES: tuple[Dependency, ...] = (
@@ -75,14 +72,27 @@ RECIPES: tuple[Dependency, ...] = (
             "lib/libngtcp2_crypto_ossl.a",
             "include/ngtcp2/ngtcp2.h",
         ),
-        post_build=ngtcp2_post_build,
     ),
 )
 
 
 def make_config() -> ProjectConfig:
     """Build the ProjectConfig for Mira protocol dependencies."""
+    windows = sys.platform == 'win32'
+    recipes = []
+    for dep in RECIPES:
+        options = (*dep.options, '-DENABLE_LIB_ONLY=ON', '-DBUILD_TESTING=OFF')
+        if dep.name == 'ngtcp2':
+            options += ('-DENABLE_WOLFSSL=OFF',)
+        artifacts = dep.artifacts
+        if windows:
+            options += ('-DSTATIC_LIB_SUFFIX=_static',)
+            artifacts = tuple(path.replace('.a', '_static.a') if path.endswith('.a') else path
+                              for path in artifacts)
+        recipes.append(replace(dep, options=options, artifacts=artifacts,
+                               uses_libdir=True, post_build=protocol_post_build,
+                               post_install=protocol_licenses))
     return ProjectConfig(
         name="mira-protocol-deps",
-        recipes=RECIPES,
+        recipes=tuple(recipes),
     )

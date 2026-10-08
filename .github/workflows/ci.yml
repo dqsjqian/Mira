@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install aria-deps
-        run: python3 -m pip install --break-system-packages "git+https://github.com/dqsjqian/AriaDeps.git"
+        run: python3 -m pip install --break-system-packages -r requirements-build.txt
       - name: Layering, framework-independence, platform-fencing
         run: python3 tools/ci/check_layering.py
       - name: Verification runner invariants
@@ -62,7 +62,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install aria-deps
-        run: python -m pip install --break-system-packages "git+https://github.com/dqsjqian/AriaDeps.git"
+        run: python -m pip install --break-system-packages -r requirements-build.txt
       - name: Install clang
         if: matrix.cxx
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.cc }}
@@ -86,6 +86,10 @@ jobs:
         std: [23]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install aria-deps
+        run: python -m pip install --break-system-packages -r requirements-build.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
       - name: Install OpenSSL on Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
@@ -154,8 +158,6 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install aria-deps
-        run: python -m pip install --break-system-packages "git+https://github.com/dqsjqian/AriaDeps.git"
       - name: Install the UCRT64 toolchain
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         with:
@@ -169,6 +171,9 @@ jobs:
             mingw-w64-ucrt-x86_64-nghttp2
             mingw-w64-ucrt-x86_64-zlib
             mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-pip
+      - name: Install aria-deps into the selected MinGW Python
+        run: python -m pip install --break-system-packages -r requirements-build.txt
       - name: Build pinned MinGW QUIC and HTTP3 dependencies
         run: python tools/ci/build_protocol_deps.py --path build/mingw-protocol-deps --openssl-root "$MINGW_PREFIX" --generator Ninja --config Debug
       - name: Configure with TLS and HTTP3
@@ -198,7 +203,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install aria-deps
-        run: python3 -m pip install --break-system-packages "git+https://github.com/dqsjqian/AriaDeps.git"
+        run: python3 -m pip install --break-system-packages -r requirements-build.txt
       - name: Install OpenSSL on Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y g++-14 libssl-dev zlib1g-dev
@@ -282,7 +287,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install aria-deps
-        run: python3 -m pip install --break-system-packages "git+https://github.com/dqsjqian/AriaDeps.git"
+        run: python3 -m pip install --break-system-packages -r requirements-build.txt
       - name: Install clang 19
         # clang-19 minimum on Linux (see the epoll-clang entry in build). No
         # -stdlib=libc++: LLVM 19's libc++ still hides std::stop_token behind
@@ -388,7 +393,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install aria-deps
-        run: python3 -m pip install --break-system-packages "git+https://github.com/dqsjqian/AriaDeps.git"
+        run: python3 -m pip install --break-system-packages -r requirements-build.txt
       - name: Install protocol toolchain on Linux
         if: runner.os == 'Linux'
         run: |

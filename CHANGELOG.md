@@ -4,9 +4,14 @@ Version source, compatibility policy and consumption instructions are maintained
 in the [release guide](docs/RELEASES.md). Version headings below are historical
 records; they are not additional definitions of the current build version.
 
-## Unreleased
+## [1.1.1] - 2026-10-08
 
 ### Fixed
+
+- Restore protocol dependency migration contracts, including pinned source locks,
+  configuration, OpenSSL/toolchain selection, static-library options and notices.
+- Pin the shared AriaDeps package and cover offline builds, verified reuse and
+  Windows Python installation in CI.
 
 - Reject framing, routing and connection-control fields in HTTP/1 request
   trailers, matching response parsing. Buffered and streaming connections stop

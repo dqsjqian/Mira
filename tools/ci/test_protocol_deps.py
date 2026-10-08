@@ -11,8 +11,68 @@ import unittest
 from unittest import mock
 
 import build_protocol_deps as deps
+from aria_deps import deps_build as pipeline
 import build_interop_curl as interop
 from types import SimpleNamespace
+
+
+class ProtocolMigrationTests(unittest.TestCase):
+    def test_checked_in_lock_is_complete_and_offline(self):
+        lock = deps.REPO / 'tools/protocol-dependencies.json'
+        recipes = deps.make_config().recipes
+        with mock.patch.object(pipeline.urllib.request, 'urlopen', side_effect=AssertionError('network')):
+            resolution = pipeline.read_resolved(lock)
+            locked = pipeline.locked_recipes(resolution, recipes)
+        self.assertEqual({dep.name for dep in locked}, {'nghttp2', 'nghttp3', 'ngtcp2'})
+        for actual, expected in zip(locked, recipes):
+            self.assertEqual(actual.version, expected.version)
+            self.assertEqual(actual.sha256, expected.sha256)
+
+    def test_cli_preserves_openssl_toolchain_generator_architecture_and_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ssl = root / 'ssl'
+            (ssl / 'include/openssl').mkdir(parents=True)
+            (ssl / 'include/openssl/ssl.h').write_text('fixture')
+            toolchain = root / 'toolchain.cmake'
+            toolchain.write_text('# fixture')
+            argv = ['build_protocol_deps.py', '--path', str(root / 'work'),
+                    '--openssl-root', str(ssl), '--toolchain', str(toolchain),
+                    '--generator', 'Visual Studio 18 2026', '--architecture', 'x64',
+                    '--config', 'Debug', '--offline']
+            seen = {}
+            def install(*args, **kwargs):
+                seen.update(kwargs)
+                seen['generator'] = os.environ.get('CMAKE_GENERATOR')
+                seen['platform'] = os.environ.get('CMAKE_GENERATOR_PLATFORM')
+                self.assertEqual(args[0], deps.REPO / 'tools/protocol-dependencies.json')
+            with mock.patch.object(deps.sys, 'argv', argv), \
+                    mock.patch.dict(os.environ, {'CMAKE_GENERATOR': 'Ninja'}, clear=False), \
+                    mock.patch.object(pipeline, 'install', side_effect=install):
+                deps.main()
+                self.assertEqual(os.environ['CMAKE_GENERATOR'], 'Ninja')
+            self.assertEqual(seen['build_config'], 'Debug')
+            self.assertEqual(seen['toolchain'], str(toolchain.resolve()))
+            self.assertEqual(seen['generator'], 'Visual Studio 18 2026')
+            self.assertEqual(seen['platform'], 'x64')
+            self.assertIn('-DOPENSSL_ROOT_DIR=' + ssl.resolve().as_posix(), seen['cmake_options'])
+            self.assertTrue(seen['offline'])
+
+    def test_windows_recipes_require_real_static_libraries(self):
+        with mock.patch.object(deps.sys, 'platform', 'win32'):
+            recipes = deps.make_config().recipes
+        for recipe in recipes:
+            self.assertIn('-DSTATIC_LIB_SUFFIX=_static', recipe.options)
+            self.assertIn('-DENABLE_LIB_ONLY=ON', recipe.options)
+            self.assertIn('-DBUILD_TESTING=OFF', recipe.options)
+            self.assertTrue(recipe.uses_libdir)
+            self.assertTrue(all(path.endswith('_static.a') for path in recipe.artifacts if path.endswith('.a')))
+            self.assertIsNotNone(recipe.post_build)
+
+    def test_repository_and_system_output_paths_are_rejected(self):
+        for path in (deps.REPO, deps.REPO.parent, Path.home(), Path(Path.cwd().anchor)):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                deps.output_path(path)
 
 
 class InteropConfigurationTests(unittest.TestCase):
@@ -239,16 +299,19 @@ class ProtocolDownloadTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.cache = Path(self.temporary.name)
-        self.archive = self.cache / "dependency-1.0.tar.xz"
         self.payload = b"verified archive bytes"
         self.digest = hashlib.sha256(self.payload).hexdigest()
-        self.network = mock.patch.object(deps.urllib.request, "urlopen")
+        self.archive = self.cache / (self.digest + "-dependency-1.0.tar.xz")
+        pipeline.init_project(deps.make_config())
+        self.network = mock.patch.object(pipeline.urllib.request, "urlopen")
         self.urlopen = self.network.start()
         self.addCleanup(self.network.stop)
 
     def download(self, *, offline):
-        return deps.download(self.cache, "dependency", "1.0", "example/dependency",
-                             self.digest, offline)
+        dependency = pipeline.Dependency(
+            name="dependency", version="1.0", url="https://example.invalid/dependency-1.0.tar.xz",
+            sha256=self.digest, license="MIT", license_files=(), root="", kind="cmake")
+        return pipeline.download(self.cache, dependency, offline)
 
     def test_offline_missing_archive_never_downloads(self):
         with self.assertRaisesRegex(ValueError, "Offline cache missing"):
@@ -269,7 +332,7 @@ class ProtocolDownloadTests(unittest.TestCase):
         self.archive.write_bytes(original)
         for offline in (False, True):
             with self.subTest(offline=offline):
-                with self.assertRaisesRegex(ValueError, "file not overwritten"):
+                with self.assertRaisesRegex(ValueError, "preserved"):
                     self.download(offline=offline)
                 self.assertEqual(self.archive.read_bytes(), original)
                 self.assertEqual(list(self.cache.iterdir()), [self.archive])
@@ -277,18 +340,20 @@ class ProtocolDownloadTests(unittest.TestCase):
 
     def test_download_hash_mismatch_is_not_published(self):
         self.urlopen.return_value = io.BytesIO(b"corrupt downloaded archive")
-        with self.assertRaisesRegex(ValueError, "Download failed SHA256 verification"):
+        self.urlopen.return_value.url = "https://example.invalid/dependency-1.0.tar.xz"
+        with self.assertRaisesRegex(ValueError, "Download SHA256 verification failed"):
             self.download(offline=False)
         self.urlopen.assert_called_once()
         self.assertEqual(list(self.cache.iterdir()), [])
 
     def test_verified_download_is_published(self):
         self.urlopen.return_value = io.BytesIO(self.payload)
+        self.urlopen.return_value.url = "https://example.invalid/dependency-1.0.tar.xz"
         self.assertEqual(self.download(offline=False), self.archive)
         self.assertEqual(self.archive.read_bytes(), self.payload)
         self.assertEqual(list(self.cache.iterdir()), [self.archive])
         self.urlopen.assert_called_once()
-        self.assertEqual(self.urlopen.call_args.kwargs["timeout"], 60)
+        self.assertEqual(self.urlopen.call_args.kwargs["timeout"], 120)
 
     def test_interrupted_download_leaves_no_partial_archive(self):
         self.urlopen.side_effect = OSError("interrupted download")

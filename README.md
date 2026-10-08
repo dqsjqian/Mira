@@ -269,7 +269,7 @@ cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON
 cmake --build build/tls -j && ctest --test-dir build/tls --output-on-failure
 ```
 
-可选高版本协议：`MIRA_ENABLE_HTTP2=ON` / `MIRA_ENABLE_HTTP3=ON`（默认关闭，不自动联网下载；依赖版本由 `tools/ci/build_protocol_deps.py` SHA256 固定）。
+可选高版本协议：`MIRA_ENABLE_HTTP2=ON` / `MIRA_ENABLE_HTTP3=ON`（默认关闭，不自动联网下载；依赖版本与 SHA256 固定在 `tools/protocol-dependencies.json`）。显式依赖构建入口需要 Python 3.10+；先在同一个 Python 环境安装 `requirements-build.txt` 中固定版本的构建工具。
 
 ### 最小 client / server 示例
 
@@ -288,6 +288,7 @@ UDP 客户端传 `""` 可测零字节报文。HTTP1 在同一连接执行两次 
 构建 H2/H3（先准备 OpenSSL 3.5+，将 `OPENSSL_ROOT_DIR` 设为其安装路径）：
 
 ```bash
+python3 -m pip install -r requirements-build.txt
 python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
 cmake -S . -B build/protocols -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix" -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"
 cmake --build build/protocols -j

@@ -276,7 +276,7 @@ cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON
 cmake --build build/tls -j && ctest --test-dir build/tls --output-on-failure
 ```
 
-Optional higher protocols: `MIRA_ENABLE_HTTP2=ON` / `MIRA_ENABLE_HTTP3=ON` (off by default, never auto-downloads; dependency versions are SHA256-pinned via `tools/ci/build_protocol_deps.py`).
+Optional higher protocols: `MIRA_ENABLE_HTTP2=ON` / `MIRA_ENABLE_HTTP3=ON` (off by default, never auto-downloads; dependency versions and SHA256 are pinned in `tools/protocol-dependencies.json`). The explicit dependency builder requires Python 3.10+; install the released build tool from `requirements-build.txt` into that same Python environment first.
 
 ### Minimal client / server pairs
 
@@ -295,6 +295,7 @@ Pass `""` to the UDP client for a zero-byte datagram. H1 makes two keep-alive re
 Build H2/H3 after installing OpenSSL 3.5+ and setting `OPENSSL_ROOT_DIR`:
 
 ```bash
+python3 -m pip install -r requirements-build.txt
 python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
 cmake -S . -B build/protocols -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix" -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"
 cmake --build build/protocols -j

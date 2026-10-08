@@ -1,0 +1,59 @@
+{
+  "dependencies": {
+    "nghttp2": {
+      "artifact": "release-asset",
+      "asset": "nghttp2-{version}.tar.xz",
+      "provider": "github",
+      "repo": "nghttp2/nghttp2",
+      "resolved": {
+        "checksum_source": "verified official release archive",
+        "request_hash": "b9fe94b2b6b6626823ff8da077f44f8f3bcc51e44d7a68d46818c3fdcfd57af7",
+        "requested": "1.70.0",
+        "revision": "85e300c79fb6dbcfa9c1013215c8710c1c2cd3d2",
+        "sha256": "e05cb1388eaca3830aded4ccf20044b6e1ac1a61411dcca11b0437c4285c8bc2",
+        "tag": "v1.70.0",
+        "url": "https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.xz",
+        "version": "1.70.0"
+      },
+      "tag_prefix": "v",
+      "version": "1.70.0"
+    },
+    "nghttp3": {
+      "artifact": "release-asset",
+      "asset": "nghttp3-{version}.tar.xz",
+      "provider": "github",
+      "repo": "ngtcp2/nghttp3",
+      "resolved": {
+        "checksum_source": "verified official release archive",
+        "request_hash": "55cab2fc72a19c629ce24a5e2f3fcb1dcee8bcceb092709f9b088bd2b8956e70",
+        "requested": "1.15.0",
+        "revision": "d326f4c1eb3f6a780d77793b30e16756c498f913",
+        "sha256": "6da0cd06b428d32a54c58137838505d9dc0371a900bb8070a46b29e1ceaf2e0f",
+        "tag": "v1.15.0",
+        "url": "https://github.com/ngtcp2/nghttp3/releases/download/v1.15.0/nghttp3-1.15.0.tar.xz",
+        "version": "1.15.0"
+      },
+      "tag_prefix": "v",
+      "version": "1.15.0"
+    },
+    "ngtcp2": {
+      "artifact": "release-asset",
+      "asset": "ngtcp2-{version}.tar.xz",
+      "provider": "github",
+      "repo": "ngtcp2/ngtcp2",
+      "resolved": {
+        "checksum_source": "verified official release archive",
+        "request_hash": "83e1af8f7e4b42dba290635322a47d377bb182770c628e95b1143d1db0ae8890",
+        "requested": "1.22.1",
+        "revision": "716e64b05f4a3709dfc0b0522cf9fd4456d055e5",
+        "sha256": "dfd2c68bd64b89847c611425b9487105c46e8447b5c21e6aeb00642c8fbe2ca8",
+        "tag": "v1.22.1",
+        "url": "https://github.com/ngtcp2/ngtcp2/releases/download/v1.22.1/ngtcp2-1.22.1.tar.xz",
+        "version": "1.22.1"
+      },
+      "tag_prefix": "v",
+      "version": "1.22.1"
+    }
+  },
+  "schema": 2
+}
