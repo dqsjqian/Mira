@@ -370,7 +370,7 @@ library is built on became named, executable contracts.
   instead of growing through a dozen reallocations on the way.
 - In-process benchmarks land under `bench/` (opt-in via `MIRA_BUILD_BENCH`):
   HTTP/1.1 keep-alive small responses and HTTP/2 concurrent streams, with
-  the blessed invocation pinned in `tools/bench/run.sh`.
+  the blessed invocation pinned in `scripts/bench/run.sh`.
 - Request bodies can stream. A handler whose third parameter is
   `std::span<const std::byte>` gets the whole buffered body as before; any
   other callable gets a `RequestBodyReader` and pulls slices while it runs —
@@ -431,7 +431,7 @@ library is built on became named, executable contracts.
   `cmake -DMIRA_BUILD_BENCH=ON` used to die at generate time because
   `bench_h2_roundtrip` linked `Mira::http2` unconditionally. The bench set
   degrades to the HTTP/1.1 scenarios with a note pointing at
-  `tools/bench/run.sh`.
+  `scripts/bench/run.sh`.
 - QUIC/HTTP/3 pump loops no longer mistake the caller's expired deadline for
   the engine timer: the operation now fails with `timed_out` instead of
   spinning the loop thread on a silent peer.

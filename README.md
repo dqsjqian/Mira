@@ -129,7 +129,7 @@ flowchart TB
 | `Mira::dns` | DNS 报文编解码（RFC 1035/6891，含 EDNS(0)）与 DoH 映射（RFC 8484） |
 | `Mira::mqtt` | MQTT 3.1.1/5.0 全报文编解码、无套接字客户端 `Session`、双工 `Client<Stream>` |
 
-分层由 `tools/ci/check_layering.py` 强制检查：禁止反向依赖与宿主框架头文件，平台识别集中在 `platform.hpp`，协议模块不包含 OS 头文件。
+分层由 `scripts/ci/check_layering.py` 强制检查：禁止反向依赖与宿主框架头文件，平台识别集中在 `platform.hpp`，协议模块不包含 OS 头文件。
 
 ## 📖 API 速览
 
@@ -289,7 +289,7 @@ UDP 客户端传 `""` 可测零字节报文。HTTP1 在同一连接执行两次 
 
 ```bash
 python3 -m pip install -r requirements-build.txt
-python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
+python3 scripts/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
 cmake -S . -B build/protocols -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix" -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"
 cmake --build build/protocols -j
 ctest --test-dir build/protocols --output-on-failure
@@ -343,7 +343,7 @@ ctest --test-dir build/ws --output-on-failure
 # MQTT（本机 mosquitto -p 1883）：mira_mqtt_client 127.0.0.1 1883 echo mira/demo hello --qos 2
 ```
 
-真实网络基准：`python3 tools/bench/network_bench.py --server build/release/mira_managed_echo_server --clients 8 --requests 1000 --slow-clients 4`，输出吞吐、p50/p99、峰值 RSS 采样和环境 JSON。负载发生器使用独立进程 Python sockets；loopback 数字不是跨库性能排名，也不是公网性能。
+真实网络基准：`python3 scripts/bench/network_bench.py --server build/release/mira_managed_echo_server --clients 8 --requests 1000 --slow-clients 4`，输出吞吐、p50/p99、峰值 RSS 采样和环境 JSON。负载发生器使用独立进程 Python sockets；loopback 数字不是跨库性能排名，也不是公网性能。
 
 ### 生产组合补充（主线，尚未单独发布）
 
@@ -354,7 +354,7 @@ ctest --test-dir build/ws --output-on-failure
 - **协议组合**：`ws::ByteStream` 支持 MQTT 等二进制流协议；MQTT checkpoint/restore 带版本、client ID、调用者 scope 和过期处理，磁盘原子持久化与业务事务由应用负责。SOCKS5 新增 BIND 双响应、UDP ASSOCIATE 及严格 UDP 封装，分片明确不支持。`dns::doh::query_multiplexed` 可组合 H2/H3 客户端。
 - **可观测性**：`observe` / `ObservedStream` 输出关联 ID、完成状态、时延与字节数；`OperationMetrics` 提供跨 loop 原子计数和固定桶延迟分布，不记录负载或凭据，不强制引入日志/遥测供应商。
 
-独立 aioquic 客户端→Mira 服务端已实测 H3、0-RTT 接受/拒绝回退和 WebSocket Extended CONNECT；`tools/ci/check_h3_aioquic.py` 可复现。30 分钟、16 客户端的故障注入快照完成 116,480/116,480 请求，87,360 个短流在慢响应重叠时完成，最终资源计数归零。上述均为明确配置下的 loopback 证据，不是所有未来提交、WAN 或全球性能排名。
+独立 aioquic 客户端→Mira 服务端已实测 H3、0-RTT 接受/拒绝回退和 WebSocket Extended CONNECT；`scripts/ci/check_h3_aioquic.py` 可复现。30 分钟、16 客户端的故障注入快照完成 116,480/116,480 请求，87,360 个短流在慢响应重叠时完成，最终资源计数归零。上述均为明确配置下的 loopback 证据，不是所有未来提交、WAN 或全球性能排名。
 
 ### 主线 API 的使用边界
 
@@ -371,7 +371,7 @@ QUIC 会话恢复与 0-RTT 要求显式 `ca_file`：缓存键绑定 OpenSSL 实�
 
 `http2::ConnectStream<Driver>` / `http3::ConnectStream<Driver>` 借用已接受流；driver 的 `progress(OperationOptions)` / `flush(OperationOptions)` 必须串行驱动连接并遵守取消与 deadline。**自定义 legacy driver 同时只允许一个操作；内置 `SessionDriver` 允许一读一写并发且独占连接收发调度**，跨流调度和对象/缓冲区存活由调用方负责，不能混用直接 body 操作；`finish()` 半关闭本地输出，`close()`/取消仅 reset 该流，不保证底层 driver 的连接级故障只影响单流。
 
-WebSocket 用 `extended_connect_request` / `accept_extended_connect` / `validate_extended_connect` 校验字段并协商子协议与 PMD，再把 `Negotiated` 交给 `Connection::adopt_extended_connect`；不执行 HTTP/1 Upgrade 或 nonce 握手。`ws.connect_network` 最新实跑 TCP H2 / UDP H3 × 压缩关闭/开启共 4 场景通过。该用例是同库真实网络证据，已移除首个 Initial flight 丢包设置，不能作为 PTO 恢复证据。独立 `tools/ci/check_h3_aioquic.py` 使用不同 QUIC/TLS/QPACK 引擎，另行验证 H3、0-RTT 接受/拒绝回退和 WebSocket Extended CONNECT 的二进制/ping/close；当前方向为 aioquic 客户端到 Mira 服务端，不能推论反向或所有第三方实现。
+WebSocket 用 `extended_connect_request` / `accept_extended_connect` / `validate_extended_connect` 校验字段并协商子协议与 PMD，再把 `Negotiated` 交给 `Connection::adopt_extended_connect`；不执行 HTTP/1 Upgrade 或 nonce 握手。`ws.connect_network` 最新实跑 TCP H2 / UDP H3 × 压缩关闭/开启共 4 场景通过。该用例是同库真实网络证据，已移除首个 Initial flight 丢包设置，不能作为 PTO 恢复证据。独立 `scripts/ci/check_h3_aioquic.py` 使用不同 QUIC/TLS/QPACK 引擎，另行验证 H3、0-RTT 接受/拒绝回退和 WebSocket Extended CONNECT 的二进制/ping/close；当前方向为 aioquic 客户端到 Mira 服务端，不能推论反向或所有第三方实现。
 
 ### WebSocket 子协议与压缩
 
@@ -381,7 +381,7 @@ WebSocket 用 `extended_connect_request` / `accept_extended_connect` / `validate
 
 `compression_parameters()` 返回 wire 协商结果；客户端仍在本地遵守 offer 中更小的窗口及 no-context 承诺。压缩会引入大小侧信道，不应在同一压缩上下文混合秘密与攻击者可控内容；敏感数据默认保持压缩关闭。启用 ws 构建需要 zlib，但基础模块和只用 Crypto 的安装消费不强制查找 zlib。
 
-独立 Python socket/zlib 双向互操作：`python3 tools/ci/check_ws_interop.py --extensions-peer build/ws/mira_ws_extensions_peer`。官方 Autobahn 客户端/服务端完整压缩模式以 `run_autobahn.py --compression` 启动，CI 拒绝失败、NON-STRICT 和缺失用例。INFORMATIONAL 单独计数；具体提交的结果与完整报告见[审核记录](docs/AUDIT-2026-09-30.md)。
+独立 Python socket/zlib 双向互操作：`python3 scripts/ci/check_ws_interop.py --extensions-peer build/ws/mira_ws_extensions_peer`。官方 Autobahn 客户端/服务端完整压缩模式以 `run_autobahn.py --compression` 启动，CI 拒绝失败、NON-STRICT 和缺失用例。INFORMATIONAL 单独计数；具体提交的结果与完整报告见[审核记录](docs/AUDIT-2026-09-30.md)。
 
 ### HTTP/3 0-RTT
 
@@ -425,7 +425,7 @@ auto events = co_await client->receive();                 // 消息、发布完�
 启用 `MIRA_ENABLE_HTTP3=ON` 与 `MIRA_BUILD_BENCH=ON` 后，可复现有界丢包、重复、延迟、重排与连接 churn：
 
 ```bash
-python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak \
+python3 scripts/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak \
   --duration-seconds 600 --seed 20260929 --output build/h3-soak.json
 ```
 
@@ -444,7 +444,7 @@ python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak 
 
 ## 🤝 贡献
 
-欢迎从一个可复现问题、一条明确契约或一个针对性测试开始。修改请保持模块单向依赖，说明所有权与平台差异，并运行相关测试与 `tools/ci/check_layering.py`。性能改进请附可复现的环境与测量方法。
+欢迎从一个可复现问题、一条明确契约或一个针对性测试开始。修改请保持模块单向依赖，说明所有权与平台差异，并运行相关测试与 `scripts/ci/check_layering.py`。性能改进请附可复现的环境与测量方法。
 
 ## 🙏 致谢
 

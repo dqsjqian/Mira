@@ -12,7 +12,7 @@ concept accepts one without naming it. Implemented here:
 - `connect` — an outgoing connection with `ConnectOptions`.
 
 This layer may include `Mira/core/…` and nothing above it; the layering
-check in `tools/ci/check_layering.py` fails the build otherwise.
+check in `scripts/ci/check_layering.py` fails the build otherwise.
 
 Every operation takes `OperationOptions` and forwards it to the event loop
 unchanged, which is what makes `Socket` a `BoundedStream`. `connect` keeps it

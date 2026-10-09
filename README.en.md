@@ -129,7 +129,7 @@ Solid arrows are dependency directions; dashed arrows are application-level comp
 | `Mira::dns` | DNS message codec (RFC 1035/6891, EDNS(0)) and DoH mapping (RFC 8484) |
 | `Mira::mqtt` | MQTT 3.1.1/5.0 codec for every packet, socket-free client `Session`, duplex `Client<Stream>` |
 
-Layering is enforced by `tools/ci/check_layering.py`: no reverse dependencies, no host-framework headers, platform detection centralized in `platform.hpp`, and no OS headers inside protocol modules.
+Layering is enforced by `scripts/ci/check_layering.py`: no reverse dependencies, no host-framework headers, platform detection centralized in `platform.hpp`, and no OS headers inside protocol modules.
 
 ## 📖 API tour
 
@@ -296,7 +296,7 @@ Build H2/H3 after installing OpenSSL 3.5+ and setting `OPENSSL_ROOT_DIR`:
 
 ```bash
 python3 -m pip install -r requirements-build.txt
-python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
+python3 scripts/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
 cmake -S . -B build/protocols -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix" -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"
 cmake --build build/protocols -j
 ctest --test-dir build/protocols --output-on-failure
@@ -350,7 +350,7 @@ ctest --test-dir build/ws --output-on-failure
 # MQTT (local mosquitto -p 1883): mira_mqtt_client 127.0.0.1 1883 echo mira/demo hello --qos 2
 ```
 
-Real network benchmark: `python3 tools/bench/network_bench.py --server build/release/mira_managed_echo_server --clients 8 --requests 1000 --slow-clients 4` emits throughput, p50/p99, sampled peak RSS and environment JSON. The independent Python socket load generator uses loopback; these are neither cross-library rankings nor WAN measurements.
+Real network benchmark: `python3 scripts/bench/network_bench.py --server build/release/mira_managed_echo_server --clients 8 --requests 1000 --slow-clients 4` emits throughput, p50/p99, sampled peak RSS and environment JSON. The independent Python socket load generator uses loopback; these are neither cross-library rankings nor WAN measurements.
 
 ### Additional production composition (main, not separately released)
 
@@ -361,7 +361,7 @@ Real network benchmark: `python3 tools/bench/network_bench.py --server build/rel
 - **Protocol composition**: `ws::ByteStream` carries MQTT and other binary-stream protocols. MQTT checkpoint/restore binds version, client ID and caller scope, with expiry handling; atomic disk storage and business transactions remain application responsibilities. SOCKS5 adds two-reply BIND, UDP ASSOCIATE and strict UDP framing without fragmentation. `dns::doh::query_multiplexed` composes with H2/H3 clients.
 - **Observability**: `observe`, `ObservedStream` and fixed-size `OperationMetrics` expose correlation, outcomes, latency and bytes without payload/credential collection or a mandatory telemetry vendor.
 
-Independent aioquic-client to Mira-server loopback checks cover authenticated H3, accepted/rejected early data and WebSocket Extended CONNECT. Reproduce with `tools/ci/check_h3_aioquic.py`. A 30-minute, 16-client fault-soak snapshot completed 116,480/116,480 requests, 87,360 short streams during slow-response overlap, and zero final resource counters. This evidence is configuration-specific, not WAN certification or a universal performance ranking.
+Independent aioquic-client to Mira-server loopback checks cover authenticated H3, accepted/rejected early data and WebSocket Extended CONNECT. Reproduce with `scripts/ci/check_h3_aioquic.py`. A 30-minute, 16-client fault-soak snapshot completed 116,480/116,480 requests, 87,360 short streams during slow-response overlap, and zero final resource counters. This evidence is configuration-specific, not WAN certification or a universal performance ranking.
 
 ### Main-branch API boundaries
 
@@ -378,7 +378,7 @@ Explicitly set `enable_connect_protocol = true` in `http2::Limits` / `http3::Lim
 
 `http2::ConnectStream<Driver>` / `http3::ConnectStream<Driver>` borrow accepted streams. Driver `progress(OperationOptions)` / `flush(OperationOptions)` must serialize connection driving and honor cancellation/deadlines. **The built-in `http2::SessionDriver` / `http3::SessionDriver` permit one read and one write concurrently**, using independent reader/writer tasks and QUIC timers. Stream-local cancellation does not cancel shared TLS input. Legacy custom drivers retain the one-operation contract. Engines, transports and drivers must outlive application tasks and `join()`; never mix direct body operations. `finish()` half-closes local output; `close()`/cancellation resets only that stream, without promising driver-level connection failures stay stream-local.
 
-WebSocket uses `extended_connect_request` / `accept_extended_connect` / `validate_extended_connect` to validate fields and negotiate subprotocols/PMD, then passes `Negotiated` to `Connection::adopt_extended_connect`. No HTTP/1 Upgrade or nonce handshake runs. The latest `ws.connect_network` run passed four scenarios: TCP H2 / UDP H3 × compression off/on. This is same-library real-network evidence. The first-Initial-flight drop setting was removed, so it is not PTO recovery evidence. Separately, `tools/ci/check_h3_aioquic.py` uses a different QUIC/TLS/QPACK engine to validate H3, accepted/rejected early-data fallback and WebSocket Extended CONNECT binary/ping/close. Its scope is aioquic client to Mira server, not reverse-direction or all-implementation certification.
+WebSocket uses `extended_connect_request` / `accept_extended_connect` / `validate_extended_connect` to validate fields and negotiate subprotocols/PMD, then passes `Negotiated` to `Connection::adopt_extended_connect`. No HTTP/1 Upgrade or nonce handshake runs. The latest `ws.connect_network` run passed four scenarios: TCP H2 / UDP H3 × compression off/on. This is same-library real-network evidence. The first-Initial-flight drop setting was removed, so it is not PTO recovery evidence. Separately, `scripts/ci/check_h3_aioquic.py` uses a different QUIC/TLS/QPACK engine to validate H3, accepted/rejected early-data fallback and WebSocket Extended CONNECT binary/ping/close. Its scope is aioquic client to Mira server, not reverse-direction or all-implementation certification.
 
 ### WebSocket subprotocols and compression
 
@@ -388,7 +388,7 @@ Only `compression.enabled = true` offers/accepts RFC7692 permessage-deflate; it 
 
 `compression_parameters()` returns the wire agreement; clients still locally honor stricter window and no-context hints promised in their offer. Compression introduces size side channels: do not mix secrets and attacker-controlled content in one compression context; leave compression off for sensitive data. Building ws requires zlib, but base-module and Crypto-only installed consumers do not discover it.
 
-Independent Python socket/zlib interoperability: `python3 tools/ci/check_ws_interop.py --extensions-peer build/ws/mira_ws_extensions_peer`. Run official Autobahn client/server coverage including compression with `run_autobahn.py --compression`; CI rejects failures, NON-STRICT results and missing cases. INFORMATIONAL cases are counted separately. Revision-specific results and complete reports are linked from the [audit record](docs/AUDIT-2026-09-30.md).
+Independent Python socket/zlib interoperability: `python3 scripts/ci/check_ws_interop.py --extensions-peer build/ws/mira_ws_extensions_peer`. Run official Autobahn client/server coverage including compression with `run_autobahn.py --compression`; CI rejects failures, NON-STRICT results and missing cases. INFORMATIONAL cases are counted separately. Revision-specific results and complete reports are linked from the [audit record](docs/AUDIT-2026-09-30.md).
 
 ### HTTP/3 0-RTT
 
@@ -432,7 +432,7 @@ The caller owns the stream and destroys it after the client; the client never cl
 Enable `MIRA_ENABLE_HTTP3=ON` and `MIRA_BUILD_BENCH=ON` to reproduce bounded loss, duplication, delay, reordering and connection churn:
 
 ```bash
-python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak \
+python3 scripts/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak \
   --duration-seconds 600 --seed 20260929 --output build/h3-soak.json
 ```
 
@@ -451,7 +451,7 @@ See the [architecture document](docs/ARCHITECTURE.md) for design rationale and a
 
 ## 🤝 Contributing
 
-Start from a reproducible problem, a crisp contract, or a targeted test. Keep module dependencies one-way, state ownership and platform differences, and run the relevant tests plus `tools/ci/check_layering.py`. Performance contributions need a reproducible environment and measurement method.
+Start from a reproducible problem, a crisp contract, or a targeted test. Keep module dependencies one-way, state ownership and platform differences, and run the relevant tests plus `scripts/ci/check_layering.py`. Performance contributions need a reproducible environment and measurement method.
 
 ## 🙏 Acknowledgements
 

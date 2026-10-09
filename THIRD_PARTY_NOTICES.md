@@ -7,7 +7,7 @@ redistributing their source or binaries. Mira's MIT notice does not replace
 upstream notices.
 
 This inventory was reviewed on 2026-09-30 against the CMake module dependencies
-and the pinned source archives in [build_protocol_deps.py](https://github.com/dqsjqian/Mira/blob/main/tools/ci/build_protocol_deps.py).
+and the pinned source archives in [build_protocol_deps.py](https://github.com/dqsjqian/Mira/blob/main/scripts/ci/build_protocol_deps.py).
 It is a licensing inventory, not a substitute for the license texts shipped
 with the actual packages used in a downstream product.
 
