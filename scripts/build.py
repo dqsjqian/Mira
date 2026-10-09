@@ -34,12 +34,11 @@ from pathlib import Path
 
 try:
     from aria_deps.build_kit import Pipeline, is_gcc
+    _HAS_BUILD_KIT = True
 except ImportError:
-    print("Error: aria-deps is required. Install it with:", file=sys.stderr)
-    print("    pip install aria-deps", file=sys.stderr)
-    print("Or from source: pip install git+https://github.com/dqsjqian/AriaDeps.git",
-          file=sys.stderr)
-    sys.exit(1)
+    _HAS_BUILD_KIT = False
+    Pipeline = None
+    is_gcc = None
 
 ROOT = Path(__file__).resolve().parents[1]
 
