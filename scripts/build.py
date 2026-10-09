@@ -6,11 +6,46 @@ Usage:
     python scripts/build.py debug           # Debug build + tests
     python scripts/build.py --no-test       # Build only, skip tests
     python scripts/build.py clean           # Remove all build output
-    python scripts/build.py --help          # Full options
+
+Parameters:
+    mode            Build mode (positional, default: release):
+                    - release: Release build, output to build/release
+                    - debug:   Debug build, output to build/debug
+                    - clean:   Delete build/, build-gcc/, build-clang/
+    --jobs N        Parallel build jobs (default: JOBS env or CPU count)
+    --build-dir PATH
+                    Override the build directory (default: build/<mode>).
+                    Useful for side-by-side compiler builds, e.g.
+                    --build-dir build/gcc and --build-dir build/clang.
+    --no-test       Skip running ctest after building.
+    --no-examples   Skip building examples (default: examples are built).
+    --tls           Enable OpenSSL 3 TLS stream module
+                    (MIRA_ENABLE_TLS=ON; requires OpenSSL 3).
+    --websocket     Enable WebSocket module
+                    (MIRA_ENABLE_WEBSOCKET=ON; needs OpenSSL Crypto + zlib).
+    --http2         Enable nghttp2 HTTP/2 module (MIRA_ENABLE_HTTP2=ON).
+    --http3         Enable QUIC/HTTP-3 modules, experimental
+                    (MIRA_ENABLE_HTTP3=ON).
+    --bench         Build in-process benchmarks (MIRA_BUILD_BENCH=ON).
+    --warnings-as-errors / --no-warnings-as-errors
+                    Treat compiler warnings as errors (default: on).
+                    Auto-disabled when a GCC compiler is detected
+                    (GCC 16 array-bounds false positives).
+    --generator GEN CMake generator (default: Ninja if available).
+    --cmake-arg -DNAME=VALUE
+                    Extra CMake definition, repeatable. Example:
+                    --cmake-arg -DMIRA_ENABLE_TLS=ON
 
 Environment:
     JOBS            Parallel build jobs (default: CPU count)
-    CC / CXX        C/C++ compiler selection
+    CC / CXX        C/C++ compiler selection (passed through to CMake)
+
+Notes:
+    - UDP-based tests fail in sandboxed environments (Operation not
+      permitted); TCP functionality is unaffected. This is expected
+      and not a build failure.
+    - Feature modules (TLS/WebSocket/HTTP2/HTTP3) need their third-party
+      dependencies available; see README.md and tools/ci/dependencies.
 """
 from __future__ import annotations
 
