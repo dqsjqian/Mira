@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -99,7 +100,13 @@ def main(argv=None) -> int:
         return 0
 
     build_type = "Debug" if args.mode == "debug" else "Release"
-    build_dir = args.build_dir or (ROOT / "build" / args.mode)
+    # Unified directory scheme: build/unified/<platform>-<toolchain>-<config>-<arch>
+    # Mira is native-only; toolchain defaults by host.
+    host = platform.system()
+    toolchain = "msvc" if host == "Windows" else "native"
+    arch = platform.machine()
+    suffix = f"native-{toolchain}-{build_type.lower()}-{arch}"
+    build_dir = args.build_dir or (ROOT / "build" / "unified" / suffix)
 
     # Tool checks
     for tool in ("cmake", "git"):
