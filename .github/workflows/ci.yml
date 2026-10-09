@@ -23,13 +23,13 @@ jobs:
       - name: Install aria-deps
         run: python3 -m pip install --break-system-packages -r requirements-build.txt
       - name: Layering, framework-independence, platform-fencing
-        run: python3 tools/ci/check_layering.py
+        run: python3 scripts/ci/check_layering.py
       - name: Verification runner invariants
         run: |
-          python3 tools/ci/test_protocol_deps.py
-          python3 tools/ci/test_autobahn_runner.py
-          python3 tools/ci/test_h3_interop.py
-          python3 tools/ci/test_h3_soak_runner.py
+          python3 scripts/ci/test_protocol_deps.py
+          python3 scripts/ci/test_autobahn_runner.py
+          python3 scripts/ci/test_h3_interop.py
+          python3 scripts/ci/test_h3_soak_runner.py
 
   # Every backend gets a real build and a real test run, because a platform
   # that merely compiles is not a supported platform:
@@ -73,7 +73,7 @@ jobs:
       - name: Test
         run: ctest --no-tests=error --test-dir build --output-on-failure --build-config Debug
       - name: Installed package consumer
-        run: python tools/ci/check_install_consumer.py --build-dir build --config Debug
+        run: python scripts/ci/check_install_consumer.py --build-dir build --config Debug
 
   # TLS is an opt-in module. Keep the dependency-free matrix above as well.
   tls:
@@ -115,7 +115,7 @@ jobs:
           $openssl = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows"
           "OPENSSL_ROOT_DIR=$openssl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           @("$openssl/debug/bin", "$openssl/bin", "$openssl/tools/openssl") | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          python tools/ci/build_protocol_deps.py --openssl-root "$openssl" --config Debug --architecture x64 --toolchain "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          python scripts/ci/build_protocol_deps.py --openssl-root "$openssl" --config Debug --architecture x64 --toolchain "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "CMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/build/protocol-deps/prefix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "MIRA_PLATFORM_PROTOCOL_FLAGS=-DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -123,7 +123,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          python tools/ci/build_interop_curl.py --openssl-root "$env:OPENSSL_ROOT_DIR" --config Debug --architecture x64 --toolchain "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          python scripts/ci/build_interop_curl.py --openssl-root "$env:OPENSSL_ROOT_DIR" --config Debug --architecture x64 --toolchain "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "$env:GITHUB_WORKSPACE/build/interop-curl/prefix/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Configure TLS
@@ -137,12 +137,12 @@ jobs:
         shell: pwsh
         run: |
           $curl = "$env:GITHUB_WORKSPACE/build/interop-curl/prefix/bin/curl.exe"
-          python tools/ci/check_h3_interop.py build/tls/Debug/mira_h3_server.exe --strict --curl "$curl"
+          python scripts/ci/check_h3_interop.py build/tls/Debug/mira_h3_server.exe --strict --curl "$curl"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python tools/ci/check_h3_interop.py build/tls/Debug/mira_h3_multi_server.exe --multi-retry --strict --curl "$curl"
+          python scripts/ci/check_h3_interop.py build/tls/Debug/mira_h3_multi_server.exe --multi-retry --strict --curl "$curl"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Installed TLS package and dependency isolation
-        run: python tools/ci/check_install_consumer.py --build-dir build/tls --config Debug
+        run: python scripts/ci/check_install_consumer.py --build-dir build/tls --config Debug
 
   # Windows is not one toolchain. MSVC covers the IOCP backend above, and the
   # tls job builds it there too — but MinGW GCC is a supported local
@@ -176,7 +176,7 @@ jobs:
       - name: Install aria-deps into the selected MinGW Python
         run: python -m pip install --break-system-packages -r requirements-build.txt
       - name: Build pinned MinGW QUIC and HTTP3 dependencies
-        run: python tools/ci/build_protocol_deps.py --path build/mingw-protocol-deps --openssl-root "$MINGW_PREFIX" --generator Ninja --config Debug
+        run: python scripts/ci/build_protocol_deps.py --path build/mingw-protocol-deps --openssl-root "$MINGW_PREFIX" --generator Ninja --config Debug
       - name: Configure with TLS and HTTP3
         run: cmake -S . -B build/mingw -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON -DOPENSSL_ROOT_DIR="$MINGW_PREFIX" -DCMAKE_PREFIX_PATH="$PWD/build/mingw-protocol-deps/prefix"
       - name: Build
@@ -233,7 +233,7 @@ jobs:
           CXXFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
           LDFLAGS: -fsanitize=address,undefined
         run: >
-          python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
+          python3 scripts/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
           --path build/asan-protocol-deps --config Debug
       - name: Configure all protocols with ASan and UBSan
         run: >
@@ -314,7 +314,7 @@ jobs:
           CXXFLAGS: -fsanitize=address,undefined,fuzzer-no-link -fno-omit-frame-pointer
           LDFLAGS: -fsanitize=address,undefined,fuzzer-no-link
         run: >
-          python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
+          python3 scripts/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
           --path build/fuzz-protocol-deps --config Debug
       - name: Configure with libFuzzer
         run: >
@@ -368,7 +368,7 @@ jobs:
           cmake --build build/autobahn --parallel --target mira_ws_autobahn_server mira_ws_autobahn_client
       - name: Run official Autobahn client and server cases
         run: >
-          python3 tools/ci/run_autobahn.py
+          python3 scripts/ci/run_autobahn.py
           --server build/autobahn/mira_ws_autobahn_server
           --client build/autobahn/mira_ws_autobahn_client
           --runtime docker --compression --fail-non-strict --output build/autobahn-results --timeout 2400
@@ -430,10 +430,10 @@ jobs:
           brew list mosquitto >/dev/null 2>&1 || brew install mosquitto
           echo "MIRA_REQUIRE_MOSQUITTO=1" >> "$GITHUB_ENV"
       - name: Build pinned protocol dependencies
-        run: python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
+        run: python3 scripts/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
       - name: Build independent HTTP3 curl
         run: |
-          python3 tools/ci/build_interop_curl.py --openssl-root "$OPENSSL_ROOT_DIR"
+          python3 scripts/ci/build_interop_curl.py --openssl-root "$OPENSSL_ROOT_DIR"
           echo "$PWD/build/interop-curl/prefix/bin" >> "$GITHUB_PATH"
       - name: Configure with TLS, HTTP/2 and HTTP/3
         shell: bash
@@ -452,7 +452,7 @@ jobs:
         run: ctest --no-tests=error --test-dir build/protocols --output-on-failure
       - name: Require independent HTTP3 interoperability
         run: >
-          python3 tools/ci/check_h3_interop.py build/protocols/mira_h3_server
+          python3 scripts/ci/check_h3_interop.py build/protocols/mira_h3_server
           --strict --curl "$PWD/build/interop-curl/prefix/bin/curl"
           --openssl "$OPENSSL_ROOT_DIR/bin/openssl"
       - name: Build independent aioquic validation environment
@@ -461,7 +461,7 @@ jobs:
           build/aioquic-venv/bin/python -m pip install aioquic==1.3.0
       - name: Verify independent H3 early data and Extended CONNECT
         run: >
-          build/aioquic-venv/bin/python tools/ci/check_h3_aioquic.py
+          build/aioquic-venv/bin/python scripts/ci/check_h3_aioquic.py
           --server build/protocols/mira_h3_advanced_peer
           --certificate build/protocols/modules/quic/tests/cert.pem
           --key build/protocols/modules/quic/tests/key.pem
@@ -474,7 +474,7 @@ jobs:
           if-no-files-found: error
       - name: Require independent Retry interoperability
         run: >
-          python3 tools/ci/check_h3_interop.py build/protocols/mira_h3_multi_server
+          python3 scripts/ci/check_h3_interop.py build/protocols/mira_h3_multi_server
           --strict --multi-retry --curl "$PWD/build/interop-curl/prefix/bin/curl"
           --openssl "$OPENSSL_ROOT_DIR/bin/openssl"
       - name: Real UDP Retry and network-fault smoke
@@ -492,7 +492,7 @@ jobs:
           path: build/h3-fault-smoke.json
           if-no-files-found: warn
       - name: Installed protocol package and component isolation
-        run: python3 tools/ci/check_install_consumer.py --build-dir build/protocols
+        run: python3 scripts/ci/check_install_consumer.py --build-dir build/protocols
       - name: Configure HTTP3 without HTTP2 or NGHTTP2 (Linux)
         if: runner.os == 'Linux'
         shell: bash
@@ -509,7 +509,7 @@ jobs:
         run: |
           cmake --build build/http3-only --parallel
           ctest --no-tests=error --test-dir build/http3-only --output-on-failure
-          python3 tools/ci/check_install_consumer.py --build-dir build/http3-only --expect-http3-only
+          python3 scripts/ci/check_install_consumer.py --build-dir build/http3-only --expect-http3-only
 
   # Mobile targets cross-compile only; no runner executes them. Keeping them in
   # CI catches the usual breakage — a POSIX assumption that does not hold on a

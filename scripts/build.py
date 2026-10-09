@@ -45,7 +45,7 @@ Notes:
       permitted); TCP functionality is unaffected. This is expected
       and not a build failure.
     - Feature modules (TLS/WebSocket/HTTP2/HTTP3) need their third-party
-      dependencies available; see README.md and tools/ci/dependencies.
+      dependencies available; see README.md and scripts/ci/dependencies.
 """
 from __future__ import annotations
 
