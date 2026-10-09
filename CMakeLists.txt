@@ -118,7 +118,7 @@ endfunction()
 
 # ── Modules ─────────────────────────────────────────────────────────────────
 #
-# Dependency direction is one-way and enforced by tools/ci/check_layering.py:
+# Dependency direction is one-way and enforced by scripts/ci/check_layering.py:
 #
 #   http and tls consume core's AsyncStream seam; transport implements it.
 #   Applications compose the modules, rather than http depending on sockets.
@@ -165,7 +165,7 @@ if(MIRA_BUILD_TESTS AND MIRA_ENABLE_WEBSOCKET AND MIRA_ENABLE_HTTP2 AND MIRA_ENA
 endif()
 
 if(MIRA_BUILD_TESTS AND MIRA_ENABLE_HTTP3 AND MIRA_ENABLE_WEBSOCKET)
-    add_executable(mira_h3_advanced_peer tools/ci/h3_advanced_peer.cpp)
+    add_executable(mira_h3_advanced_peer scripts/ci/h3_advanced_peer.cpp)
     target_link_libraries(mira_h3_advanced_peer PRIVATE Mira::http3 Mira::ws Mira::warnings)
 endif()
 
@@ -251,16 +251,16 @@ if(MIRA_BUILD_EXAMPLES)
         find_package(Python3 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
             add_test(NAME mira_managed_server
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_managed_server.py
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_managed_server.py
                     $<TARGET_FILE:mira_managed_echo_server>)
             set_tests_properties(mira_managed_server PROPERTIES TIMEOUT 30)
             add_test(NAME mira_sse_example
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_sse_example.py
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_sse_example.py
                     $<TARGET_FILE:mira_sse_server>)
             set_tests_properties(mira_sse_example PROPERTIES TIMEOUT 30)
             add_test(NAME mira_client_server_examples
                 COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_client_server_examples.py
+                    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_client_server_examples.py
                     --tcp-server $<TARGET_FILE:mira_echo_server>
                     --tcp-client $<TARGET_FILE:mira_tcp_client>
                     --udp-server $<TARGET_FILE:mira_udp_server>
@@ -270,24 +270,24 @@ if(MIRA_BUILD_EXAMPLES)
             set_tests_properties(mira_client_server_examples PROPERTIES TIMEOUT 90)
             add_test(NAME mira_echo_example
                 COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_echo_example.py
+                    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_echo_example.py
                     $<TARGET_FILE:mira_echo_server>
             )
             set_tests_properties(mira_echo_example PROPERTIES TIMEOUT 90)
             add_test(NAME mira_hello_world_example
                 COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_hello_world_example.py
+                    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_hello_world_example.py
                     $<TARGET_FILE:mira_hello_world_server>
             )
             set_tests_properties(mira_hello_world_example PROPERTIES TIMEOUT 90)
             add_test(NAME mira_tiny_file_server_example
                 COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_tiny_file_server.py
+                    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_tiny_file_server.py
                     $<TARGET_FILE:mira_tiny_file_server>
             )
             set_tests_properties(mira_tiny_file_server_example PROPERTIES TIMEOUT 120)
             add_test(NAME socks.interop
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_socks5.py
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_socks5.py
                     --proxy $<TARGET_FILE:mira_socks5_server>
                     --client $<TARGET_FILE:mira_socks5_client>
                     --http-server $<TARGET_FILE:mira_hello_world_server>)
@@ -301,41 +301,41 @@ if(MIRA_BUILD_EXAMPLES)
                 endif()
             endif()
             add_test(NAME dns.interop
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_doh.py
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_doh.py
                     --server $<TARGET_FILE:mira_doh_server>
                     --client $<TARGET_FILE:mira_doh_client>
                     --http-server $<TARGET_FILE:mira_hello_world_server> ${mira_doh_tls_flag})
             set_tests_properties(dns.interop PROPERTIES TIMEOUT 120)
             add_test(NAME mqtt.interop
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_mqtt.py
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_mqtt.py
                     --client $<TARGET_FILE:mira_mqtt_client>)
             set_tests_properties(mqtt.interop PROPERTIES TIMEOUT 180)
             if(TARGET mira_https_managed_server)
                 add_test(NAME mira_managed_https
-                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_managed_https.py
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_managed_https.py
                         $<TARGET_FILE:mira_https_managed_server>)
                 set_tests_properties(mira_managed_https PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
             endif()
             if(TARGET mira_ws_server)
                 add_test(NAME mira_ws_interop
-                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_ws_interop.py
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_ws_interop.py
                         --server $<TARGET_FILE:mira_ws_server> --client $<TARGET_FILE:mira_ws_client>)
                 set_tests_properties(mira_ws_interop PROPERTIES TIMEOUT 60)
                 add_test(NAME mira_ws_extensions_interop
-                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_ws_interop.py
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_ws_interop.py
                         --extensions-peer $<TARGET_FILE:mira_ws_extensions_peer>)
                 set_tests_properties(mira_ws_extensions_interop PROPERTIES TIMEOUT 120)
             endif()
             if(TARGET mira_h2_prior_knowledge_server)
                 add_test(NAME mira_h2_pair
                     COMMAND ${Python3_EXECUTABLE}
-                        ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_h2_pair.py
+                        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_h2_pair.py
                         --server $<TARGET_FILE:mira_h2_prior_knowledge_server>
                         --client $<TARGET_FILE:mira_h2_client>)
                 set_tests_properties(mira_h2_pair PROPERTIES TIMEOUT 60)
                 add_test(NAME mira_h2_interop
                     COMMAND ${Python3_EXECUTABLE}
-                        ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_h2_interop.py
+                        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_h2_interop.py
                         $<TARGET_FILE:mira_h2_prior_knowledge_server>
                 )
                 set_tests_properties(mira_h2_interop PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
@@ -343,20 +343,20 @@ if(MIRA_BUILD_EXAMPLES)
             if(TARGET mira_h3_server)
                 add_test(NAME mira_h3_pair
                     COMMAND ${Python3_EXECUTABLE}
-                        ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_h3_pair.py
+                        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_h3_pair.py
                         $<TARGET_FILE:mira_h3_server> $<TARGET_FILE:mira_h3_client>
                         ${MIRA_QUIC_TEST_CERT} ${MIRA_QUIC_TEST_KEY})
                 set_tests_properties(mira_h3_pair PROPERTIES TIMEOUT 120)
                 add_test(NAME mira_h3_interop
                     COMMAND ${Python3_EXECUTABLE}
-                        ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_h3_interop.py
+                        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_h3_interop.py
                         $<TARGET_FILE:mira_h3_server>
                         --openssl ${MIRA_QUIC_OPENSSL_TOOL}
                 )
                 set_tests_properties(mira_h3_interop PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
                 add_test(NAME mira_h3_retry_interop
                     COMMAND ${Python3_EXECUTABLE}
-                        ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_h3_interop.py
+                        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_h3_interop.py
                         $<TARGET_FILE:mira_h3_multi_server> --multi-retry
                         --openssl ${MIRA_QUIC_OPENSSL_TOOL})
                 set_tests_properties(mira_h3_retry_interop PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)

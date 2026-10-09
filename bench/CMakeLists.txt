@@ -7,7 +7,7 @@
 # a remote load generator, and they need no external tooling.
 #
 # In-process also means the numbers are *relative*: compare two commits, not
-# Mira against wrk. Use `tools/bench/run.sh` for the blessed invocation.
+# Mira against wrk. Use `scripts/bench/run.sh` for the blessed invocation.
 #
 # Scenarios, chosen because they are what the optimization work targeted:
 #   * bench_h1_keepalive — HTTP/1.1 keep-alive small-response request/response
@@ -25,7 +25,7 @@ endif()
 if(NOT TARGET Mira::http2)
     message(STATUS
         "Mira bench: MIRA_ENABLE_HTTP2 is off — skipping bench_h2_roundtrip "
-        "(tools/bench/run.sh configures it for you)")
+        "(scripts/bench/run.sh configures it for you)")
 else()
     add_executable(bench_h2_roundtrip h2_roundtrip.cpp)
     target_link_libraries(bench_h2_roundtrip
@@ -80,7 +80,7 @@ if(MIRA_BENCH_LIBUV)
         find_package(Python3 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
             add_test(NAME bench.libuv_echo
-                COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/bench/check_echo_reference.py
+                COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/bench/check_echo_reference.py
                     --server $<TARGET_FILE:bench_libuv_echo_server>)
             set_tests_properties(bench.libuv_echo PROPERTIES TIMEOUT 20)
         endif()

@@ -1,4 +1,4 @@
-# Source pins and hashes live in tools/ci/build_protocol_deps.py and CI.
+# Source pins and hashes live in scripts/ci/build_protocol_deps.py and CI.
 # THIRD_PARTY_NOTICES.md covers the selected libraries and embedded licenses.
 # The ossl QUIC TLS adapter is still marked experimental upstream; dependencies are not downloaded automatically.
 find_package(OpenSSL 3.5 REQUIRED COMPONENTS SSL Crypto)

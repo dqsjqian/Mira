@@ -60,14 +60,14 @@ endif()
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
     add_test(NAME client_stream_upload_interop
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/ci/check_http_stream_upload.py
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/ci/check_http_stream_upload.py
             $<TARGET_FILE:mira_client_upload_peer>)
     set_tests_properties(client_stream_upload_interop PROPERTIES TIMEOUT 90)
     if(MIRA_ENABLE_TLS)
         find_program(MIRA_CLIENT_OPENSSL_EXECUTABLE openssl HINTS "${OPENSSL_ROOT_DIR}/bin")
         if(MIRA_CLIENT_OPENSSL_EXECUTABLE)
             add_test(NAME client_https_upload_interop
-                COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/ci/check_http_stream_upload.py
+                COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/ci/check_http_stream_upload.py
                     $<TARGET_FILE:mira_client_upload_peer> --tls
                     --openssl ${MIRA_CLIENT_OPENSSL_EXECUTABLE})
             set_tests_properties(client_https_upload_interop PROPERTIES TIMEOUT 90)

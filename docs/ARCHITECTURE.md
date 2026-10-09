@@ -130,7 +130,7 @@ are `client` / `client_tls`; a base client consumer does not discover OpenSSL.
 Stream protocols must not assume datagrams are byte streams: a protocol only
 composes with a transport whose semantics it needs.
 
-Four dependency invariants are checked by `tools/ci/check_layering.py`.
+Four dependency invariants are checked by `scripts/ci/check_layering.py`.
 These static checks do not prove lifetime safety or runtime substitutability:
 
 1. **Dependencies point downwards only.** `core` must not include transport or

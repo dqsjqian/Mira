@@ -42,7 +42,7 @@ if(MIRA_ENABLE_TLS)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     find_program(MIRA_WS_OPENSSL openssl REQUIRED)
     add_test(NAME ws.tls COMMAND ${Python3_EXECUTABLE}
-        ${PROJECT_SOURCE_DIR}/tools/ci/check_ws_interop.py
+        ${PROJECT_SOURCE_DIR}/scripts/ci/check_ws_interop.py
         --wss $<TARGET_FILE:mira_wss_tests> --openssl ${MIRA_WS_OPENSSL})
     set_tests_properties(ws.tls PROPERTIES TIMEOUT 30)
 endif()
