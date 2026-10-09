@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 class ProtocolMigrationTests(unittest.TestCase):
     def test_checked_in_lock_is_complete_and_offline(self):
-        lock = deps.REPO / 'tools/protocol-dependencies.json'
+        lock = deps.REPO / 'scripts/protocol-dependencies.json'
         recipes = deps.make_config().recipes
         with mock.patch.object(pipeline.urllib.request, 'urlopen', side_effect=AssertionError('network')):
             resolution = pipeline.read_resolved(lock)
@@ -45,7 +45,7 @@ class ProtocolMigrationTests(unittest.TestCase):
                 seen.update(kwargs)
                 seen['generator'] = os.environ.get('CMAKE_GENERATOR')
                 seen['platform'] = os.environ.get('CMAKE_GENERATOR_PLATFORM')
-                self.assertEqual(args[0], deps.REPO / 'tools/protocol-dependencies.json')
+                self.assertEqual(args[0], deps.REPO / 'scripts/protocol-dependencies.json')
             with mock.patch.object(deps.sys, 'argv', argv), \
                     mock.patch.dict(os.environ, {'CMAKE_GENERATOR': 'Ninja'}, clear=False), \
                     mock.patch.object(pipeline, 'install', side_effect=install):

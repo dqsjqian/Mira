@@ -86,7 +86,7 @@ def main() -> None:
 
     work = output_path(args.path)
     prefix = output_path(args.prefix or work / "prefix")
-    lock = REPO / 'tools/protocol-dependencies.json'
+    lock = REPO / 'scripts/protocol-dependencies.json'
     source_dir = work / "sources"
 
     config = make_config()

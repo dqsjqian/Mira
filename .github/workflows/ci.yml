@@ -479,7 +479,7 @@ jobs:
           --openssl "$OPENSSL_ROOT_DIR/bin/openssl"
       - name: Real UDP Retry and network-fault smoke
         run: >
-          python3 tools/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak
+          python3 scripts/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soak
           --certificate build/protocols/modules/quic/tests/cert.pem
           --key build/protocols/modules/quic/tests/key.pem
           --duration-seconds 20 --seed 20260928 --clients 3 --requests 4
