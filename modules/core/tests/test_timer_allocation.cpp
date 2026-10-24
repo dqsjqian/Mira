@@ -489,10 +489,14 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 #if defined(_MSC_VER)
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#ifdef _DEBUG
+    // Release UCRT stubs (_CrtSetReportMode/_CrtSetReportFile expand to
+    // argument-discarding macros) would leave `kind` unreferenced under /W4 /WX.
     for (const int kind : {_CRT_WARN, _CRT_ERROR, _CRT_ASSERT}) {
         _CrtSetReportMode(kind, _CRTDBG_MODE_FILE);
         _CrtSetReportFile(kind, _CRTDBG_FILE_STDERR);
     }
+#endif
     ::SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     std::set_terminate([] {
         std::fputs("timer_allocation: std::terminate\n", stderr);
