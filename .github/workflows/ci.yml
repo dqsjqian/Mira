@@ -75,6 +75,26 @@ jobs:
       - name: Installed package consumer
         run: python scripts/ci/check_install_consumer.py --build-dir build --config Debug
 
+  # The matrix above builds Windows Debug only, so MSVC Release-only
+  # issues slip through: UCRT headers define _CrtSetReportMode and
+  # _CrtSetReportFile as argument-discarding macros outside _DEBUG,
+  # which tripped C4189 under /WX in Release (fixed by guarding the
+  # loop with _DEBUG). Keep one Windows Release job so that class of
+  # bug is caught by CI instead of by a downstream Windows build.
+  windows-release:
+    needs: discipline
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install aria-deps
+        run: python -m pip install --break-system-packages -r requirements-build.txt
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_CONFIGURATION_TYPES=Release -DCMAKE_CXX_STANDARD=23
+      - name: Build
+        run: cmake --build build --parallel --config Release
+      - name: Test
+        run: ctest --no-tests=error --test-dir build --output-on-failure --build-config Release
+
   # TLS is an opt-in module. Keep the dependency-free matrix above as well.
   tls:
     needs: discipline
