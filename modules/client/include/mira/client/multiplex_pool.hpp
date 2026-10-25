@@ -122,7 +122,11 @@ private:
     static Result<std::string> normalize(std::string host) {
         if (host.empty() || host.size() > 253) return fail(Errc::invalid_argument);
         if (host.find(':') != std::string::npos) {
-            if (host.find('%') != std::string::npos) return fail(Errc::not_supported);
+            // A zone id is accepted, not rejected: Endpoint::parse
+            // canonicalizes "fe80::1%eth0" and "fe80::1%3" to the same
+            // numeric-scope form, so both spellings share one origin, while
+            // different zones stay separate. Unknown interfaces and
+            // malformed scopes fail here as invalid_argument.
             auto endpoint = transport::Endpoint::parse(host, 1);
             if (!endpoint) return fail(Errc::invalid_argument);
             return endpoint->address();
@@ -139,7 +143,11 @@ private:
         return host;
     }
     static Result<void> bind_authority(http::Headers& headers, const Key& key) {
-        const auto host = key.first.find(':') == std::string::npos ? key.first : "[" + key.first + "]";
+        // The zone id is stripped from :authority, mirroring the pooled
+        // client's Host header: a zone routes the connection; it is not part
+        // of the origin identity. Pooling still keys on the full zoned form.
+        const auto bare = key.first.substr(0, key.first.find('%'));
+        const auto host = bare.find(':') == std::string::npos ? bare : "[" + bare + "]";
         const auto authority = host + ":" + std::to_string(key.second);
         bool present = false;
         for (auto& field : headers) {

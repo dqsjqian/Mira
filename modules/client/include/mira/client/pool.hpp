@@ -75,8 +75,12 @@ public:
     BasicClient& operator=(const BasicClient&) = delete;
     ~BasicClient() { close(); }
 
-    /// host is a bare name or IP without brackets, URL, userinfo, scope or proxy syntax.
-    /// One deadline covers DNS, TCP, TLS, upload and response without phase resets.
+    /// host is a bare name or IP without brackets, URL, userinfo or proxy syntax.
+    /// An IPv6 literal may carry a zone id ("fe80::1%eth0"): it is
+    /// canonicalized to a numeric scope for pooling and dialing, and stripped
+    /// from the Host header (a zone routes the connection; it is not part of
+    /// the origin identity a Host header carries). One deadline covers DNS,
+    /// TCP, TLS, upload and response without phase resets.
     [[nodiscard]] Task<Result<SessionType>> acquire(std::string host, std::uint16_t port,
                                                     OperationOptions io = {}) {
         return acquire_impl(state_, std::move(host), port, std::move(io));
@@ -112,7 +116,12 @@ private:
     static Result<std::string> normalize_host(std::string host) {
         if (host.empty() || host.size() > 253) return fail(Errc::invalid_argument);
         if (host.find(':') != std::string::npos) {
-            if (host.find('%') != std::string::npos) return fail(Errc::not_supported);
+            // A zone id is accepted, not rejected: Endpoint::parse
+            // canonicalizes "fe80::1%eth0" and "fe80::1%3" to the same
+            // numeric-scope form, so both spellings share one pool, while
+            // different zones stay separate origins. Unknown interfaces and
+            // malformed scopes fail here as invalid_argument (interface
+            // names are POSIX-only; Windows accepts numeric scopes).
             const auto endpoint = transport::Endpoint::parse(host, 1);
             if (!endpoint) return fail(Errc::invalid_argument);
             return endpoint->address();
@@ -123,6 +132,15 @@ private:
                 return fail(Errc::invalid_argument);
         }
         return host;
+    }
+    /// Host header form of a canonical host. The zone id is stripped: Host
+    /// validation (and most servers) reject '%' inside a bracketed literal,
+    /// and the zone is routing, not identity. Pooling still keys on the full
+    /// zoned form, so two zones never share a connection.
+    static std::string authority_for(const std::string& canonical, std::uint16_t port) {
+        const auto bare = canonical.substr(0, canonical.find('%'));
+        if (bare.find(':') == std::string::npos) return bare + ":" + std::to_string(port);
+        return "[" + bare + "]:" + std::to_string(port);
     }
     static Task<Result<SessionType>> acquire_impl(std::shared_ptr<State> state, std::string host,
                                                     std::uint16_t port, OperationOptions io) {
@@ -155,9 +173,7 @@ private:
             found = state->pools.emplace(key, std::make_unique<Pool>(
                 state->options.max_connections_per_origin, state->options.idle_timeout)).first;
         }
-        const auto authority = canonical->find(':') == std::string::npos
-                                   ? *canonical + ":" + std::to_string(port)
-                                   : "[" + *canonical + "]:" + std::to_string(port);
+        const auto authority = authority_for(*canonical, port);
         auto factory = [state, host_name = *canonical, port](OperationOptions operation)
             -> Task<Result<std::unique_ptr<Connection>>> {
             ResourceBudget::Reservation admission;

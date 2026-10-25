@@ -82,7 +82,20 @@ Result<Engine> Engine::create(const Context& context, std::string_view peer_name
     ERR_clear_error();
     SSL_set_bio(impl->ssl, internal, internal);
     if (context.impl_->client) {
-        const std::string name(peer_name);
+        // A zone id routes the connection; it is never TLS identity. A
+        // scoped literal ("fe80::1%eth0") would otherwise fail
+        // a2i_IPADDRESS below and be misclassified as a DNS name, sending
+        // a bogus SNI and verifying against the wrong name. Strip the zone
+        // only when the part before '%' is itself an IP literal, so every
+        // other peer name passes through unchanged.
+        std::string name(peer_name);
+        if (const auto percent = name.find('%'); percent != std::string::npos) {
+            const std::string bare = name.substr(0, percent);
+            if (ASN1_OCTET_STRING* probe = a2i_IPADDRESS(bare.c_str()); probe != nullptr) {
+                ASN1_OCTET_STRING_free(probe);
+                name = bare;
+            }
+        }
         ERR_clear_error();
         SSL_set_connect_state(impl->ssl);
         ERR_clear_error();

@@ -1063,7 +1063,12 @@ Engine::create(Options options, std::span<const std::byte> initial, std::uint64_
         SSL_set_connect_state(s->ssl);
         auto name = s->options.peer_name.c_str();
         if (transport::Endpoint::parse(s->options.peer_name, 0)) {
-            if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(s->ssl), name) != 1) rv = -1;
+            // A zone id routes the connection; it is never TLS identity.
+            // set1_ip_asc rejects scoped literals, so verify against the
+            // bare address. (No SNI is sent for IP literals: the SNI call
+            // below lives in the DNS-name branch only.)
+            const std::string bare = s->options.peer_name.substr(0, s->options.peer_name.find('%'));
+            if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(s->ssl), bare.c_str()) != 1) rv = -1;
         } else if (
 #if OPENSSL_VERSION_NUMBER >= 0x40000000L
                    // OpenSSL 4.0 deprecated SSL_set1_host in favour of the
