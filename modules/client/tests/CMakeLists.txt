@@ -51,6 +51,24 @@ target_include_directories(mira_client_pool_tests PRIVATE ${PROJECT_SOURCE_DIR}/
 add_test(NAME client_pool COMMAND mira_client_pool_tests)
 set_tests_properties(client_pool PROPERTIES TIMEOUT 60)
 
+add_executable(mira_client_zone_tests test_zone.cpp)
+target_link_libraries(mira_client_zone_tests PRIVATE Mira::client Mira::warnings)
+target_include_directories(mira_client_zone_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+add_test(NAME client_zone COMMAND mira_client_zone_tests)
+set_tests_properties(client_zone PROPERTIES TIMEOUT 60)
+
+add_executable(mira_client_redirect_tests test_redirect.cpp)
+target_link_libraries(mira_client_redirect_tests PRIVATE Mira::client Mira::warnings)
+target_include_directories(mira_client_redirect_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+add_test(NAME client_redirect COMMAND mira_client_redirect_tests)
+set_tests_properties(client_redirect PROPERTIES TIMEOUT 60)
+
+add_executable(mira_client_decompress_tests test_decompress.cpp)
+target_link_libraries(mira_client_decompress_tests PRIVATE Mira::client Mira::warnings)
+target_include_directories(mira_client_decompress_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+add_test(NAME client_decompress COMMAND mira_client_decompress_tests)
+set_tests_properties(client_decompress PROPERTIES TIMEOUT 60)
+
 add_executable(mira_client_upload_peer upload_peer.cpp)
 target_link_libraries(mira_client_upload_peer PRIVATE Mira::client Mira::warnings)
 if(MIRA_ENABLE_TLS)
