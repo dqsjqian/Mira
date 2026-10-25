@@ -17,3 +17,9 @@ target_link_libraries(mira_dns_query_tests PRIVATE Mira::dns Mira::transport Mir
 target_include_directories(mira_dns_query_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
 add_test(NAME dns.query COMMAND mira_dns_query_tests)
 set_tests_properties(dns.query PROPERTIES TIMEOUT 60)
+
+add_executable(mira_dns_fallback_tests test_fallback.cpp)
+target_link_libraries(mira_dns_fallback_tests PRIVATE Mira::dns Mira::warnings)
+target_include_directories(mira_dns_fallback_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+add_test(NAME dns.fallback COMMAND mira_dns_fallback_tests)
+set_tests_properties(dns.fallback PROPERTIES TIMEOUT 60)
