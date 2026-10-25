@@ -104,6 +104,102 @@ private:
     std::array<std::atomic<std::uint64_t>, 8> latency_{};
 };
 
+/// Severity order: debug < info < warning < error. Sinks that filter use
+/// log_at_least rather than re-declaring the order.
+enum class LogLevel { debug, info, warning, error };
+
+[[nodiscard]] constexpr bool log_at_least(LogLevel level, LogLevel floor) noexcept {
+    return static_cast<int>(level) >= static_cast<int>(floor);
+}
+
+/// One log record. This is the metrics' event rendered as text's worth of
+/// structure: a level, a timestamp, a component/operation name, a short
+/// message, and an error code when the record is about a failure. Elapsed
+/// time and byte counts are populated for operation events (see
+/// LoggingObserver) and zero for direct log() calls. Names and messages are
+/// borrowed for the call, exactly like OperationEvent's: the sink must copy
+/// anything it keeps. No payload, hostname or credentials are ever carried
+/// here — the same boundary the observer contract draws.
+struct LogRecord {
+    LogLevel level = LogLevel::info;
+    Clock::time_point at{};
+    std::string_view name;
+    std::string_view message;
+    Error error;
+    Clock::duration elapsed{};
+    std::size_t bytes = 0;
+};
+
+/// Synchronous, noexcept log receiver, in the OperationObserver mould: the
+/// caller renders, the sink only receives. Implementations shared across
+/// loops must be thread-safe and non-blocking. No formatting, no file I/O,
+/// no network here — a sink that needs those owns a queue and a worker.
+/// Do not destroy or reenter the logging operation's owner.
+class LogSink {
+public:
+    virtual ~LogSink() = default;
+    virtual void write(const LogRecord& record) noexcept = 0;
+};
+
+/// Emit one record. Null-safe: a null sink means logging is off, not an
+/// error. Takes a raw pointer because nothing is retained past the call;
+/// callers holding a shared_ptr pass .get().
+inline void log(LogSink* sink, LogLevel level, std::string_view name, std::string_view message,
+                Error error = {}) noexcept {
+    if (!sink) return;
+    sink->write(LogRecord{level, Clock::now(), name, message, error, {}, 0});
+}
+
+/// An OperationObserver that renders operation events as log records, so an
+/// existing sink receives operation lifecycles without a second observer
+/// registration. Started events log at debug; completed events at info (or
+/// the configured level); failed or throwing operations at error, with the
+/// error code preserved. Duration and byte counts ride along in the record.
+class LoggingObserver final : public OperationObserver {
+public:
+    explicit LoggingObserver(std::shared_ptr<LogSink> sink, LogLevel completed_level = LogLevel::info)
+        : sink_(std::move(sink)), completed_level_(completed_level) {}
+    void notify(const OperationEvent& event) noexcept override {
+        if (!sink_) return;
+        if (event.phase == OperationPhase::started) {
+            sink_->write(LogRecord{LogLevel::debug, event.started, event.name, "started", {}, {}, 0});
+            return;
+        }
+        LogRecord record;
+        record.at = event.started + event.elapsed;
+        record.name = event.name;
+        record.error = event.error;
+        record.elapsed = event.elapsed;
+        record.bytes = event.bytes;
+        if (event.exception || event.error) {
+            record.level = LogLevel::error;
+            record.message = event.exception ? "failed with exception" : "failed";
+        } else {
+            record.level = completed_level_;
+            record.message = "completed";
+        }
+        sink_->write(record);
+    }
+private:
+    std::shared_ptr<LogSink> sink_;
+    LogLevel completed_level_;
+};
+
+/// A sink that forwards only records at or above a floor, so a verbose
+/// component can stay wired to a quiet sink. The floor is fixed at
+/// construction; a sink whose floor moves needs its own implementation.
+class FilteringSink final : public LogSink {
+public:
+    FilteringSink(std::shared_ptr<LogSink> next, LogLevel floor)
+        : next_(std::move(next)), floor_(floor) {}
+    void write(const LogRecord& record) noexcept override {
+        if (next_ && log_at_least(record.level, floor_)) next_->write(record);
+    }
+private:
+    std::shared_ptr<LogSink> next_;
+    LogLevel floor_;
+};
+
 /// Decorate any bounded stream at a chosen layer (wire bytes below TLS, plain
 /// bytes above it). Ownership, duplex and cancellation remain the stream's.
 /// Move neither wrapper nor transport while operations are pending.

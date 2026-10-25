@@ -5,6 +5,11 @@ target_link_libraries(mira_observe_tests PRIVATE Mira::core Mira::warnings)
 add_test(NAME observe COMMAND mira_observe_tests)
 set_tests_properties(observe PROPERTIES TIMEOUT 30)
 
+add_executable(mira_log_tests test_log.cpp)
+target_link_libraries(mira_log_tests PRIVATE Mira::core Mira::warnings)
+add_test(NAME log COMMAND mira_log_tests)
+set_tests_properties(log PROPERTIES TIMEOUT 30)
+
 add_executable(mira_core_tests test_core.cpp)
 add_executable(mira_event_loop_tests test_event_loop.cpp)
 
