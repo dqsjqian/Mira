@@ -55,14 +55,22 @@ if(NOT ZLIB_FOUND)
         # the host /usr/include by default — so the include dir must also
         # travel as a raw compile option, which CMake does not filter.
         # -isystem (not -I) keeps the headers' system-header warning
-        # exemption under this repo's -Werror build.
-        target_compile_options(mira_client INTERFACE "-isystem${ZLIB_INCLUDE_DIR}")
+        # exemption under this repo's -Werror build. Build-tree only, like
+        # the link and the define below.
+        target_compile_options(mira_client INTERFACE "$<BUILD_INTERFACE:-isystem${ZLIB_INCLUDE_DIR}>")
         set(ZLIB_FOUND TRUE)
     endif()
 endif()
 if(ZLIB_FOUND)
-    target_link_libraries(mira_client INTERFACE ZLIB::ZLIB)
-    target_compile_definitions(mira_client INTERFACE MIRA_CLIENT_HAS_ZLIB=1)
+    # Build-tree only. The installed client must stay consumable without
+    # zlib — the install-consumer script disables ZLIB lookup for the
+    # client case — so neither the link nor the define may leak into the
+    # exported target. Installed consumers that want gzip/deflate define
+    # MIRA_CLIENT_HAS_ZLIB themselves and link ZLIB::ZLIB (see
+    # decompress.hpp); without that, the header compiles in no-zlib mode
+    # and real codings fail with not_supported, exactly as here.
+    target_link_libraries(mira_client INTERFACE $<BUILD_INTERFACE:ZLIB::ZLIB>)
+    target_compile_definitions(mira_client INTERFACE $<BUILD_INTERFACE:MIRA_CLIENT_HAS_ZLIB=1>)
 endif()
 set_target_properties(mira_client PROPERTIES EXPORT_NAME client)
 mira_install_module(mira_client)

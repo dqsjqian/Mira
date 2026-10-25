@@ -26,6 +26,12 @@
 // zlib, and the client target links it. Without zlib, identity still
 // works and every real coding fails with not_supported, so a no-zlib
 // build keeps compiling and running — it just cannot decode.
+//
+// Installed consumers: the installed client target deliberately does
+// NOT carry the zlib link or the define (it must stay consumable
+// without zlib). To enable gzip/deflate against an installed package,
+// define MIRA_CLIENT_HAS_ZLIB=1 on your own target and link ZLIB::ZLIB
+// yourself; without that, this header compiles in no-zlib mode.
 
 #include "mira/core/error.hpp"
 

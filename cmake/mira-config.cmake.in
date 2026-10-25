@@ -7,10 +7,6 @@ set(MIRA_WITH_HTTP3 @MIRA_ENABLE_HTTP3@)
 set(MIRA_WITH_WS @MIRA_ENABLE_WEBSOCKET@)
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
-# The client target links zlib when the build found it (see
-# modules/client/CMakeLists.txt); resolve it before the targets file so
-# the imported ZLIB::ZLIB reference exists for consumers.
-find_package(ZLIB QUIET)
 include("${CMAKE_CURRENT_LIST_DIR}/miraTargets.cmake")
 set(Mira_core_FOUND TRUE)
 set(Mira_http_common_FOUND TRUE)
