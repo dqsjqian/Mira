@@ -437,7 +437,7 @@ python3 scripts/bench/run_h3_soak.py --binary build/protocols/bench/bench_h3_soa
 
 1. iOS 已通过宿主 smoke 和无签名交叉编译，真机缺签名 profile；Android 真机尚无证据。MinGW 已有 H2/H3 与独立 curl 互操作运行证据，但该任务不单独构建固定来源的 curl；Windows MSVC 的严格互操作任务会构建它。
 2. 更长时故障注入、真实多机/WAN 与进程内存硬上限仍待验。单机 loopback 和有限时长的 fuzz/soak 不代表这些边界已覆盖。
-3. aioquic→Mira 的 H3 0-RTT 接受/拒绝及 WebSocket Extended CONNECT 已有独立协议栈实测；反向角色、更多实现及真实 WAN 矩阵仍待扩展。内置防重放存储限同进程共享，分布式持久化后端未交付。Retry 不保证 token 一次性使用，listener 不是互联网抗洪泛系统。
+3. aioquic→Mira 的 H3 0-RTT 接受/拒绝及 WebSocket Extended CONNECT 已有独立协议栈实测；反向角色、更多实现及真实 WAN 矩阵仍待扩展。内置防重放存储限同进程共享，分布式持久化后端未交付。Retry 不保证 token 一次性使用，listener 不是互联网抗洪泛系统。HTTP/3 不再标注 experimental：其宣称范围已有独立互操作（aioquic/curl）与 600 秒 loopback soak 证据；本节所列 WAN/反向角色属于待扩展矩阵，不是模块不稳定。
 4. 客户端记忆服务端 SETTINGS、原生系统信任、Windows UDP ancillary、SSM 组播及自动 DNS fallback 等仍开放。io_uring/内核零拷贝/定制分配器按真实瓶颈选择，不以功能名代替性能证据。gRPC/Redis/WebRTC 保持生态层边界。
 
 设计依据与验收要求见[架构文档](docs/ARCHITECTURE.md)。

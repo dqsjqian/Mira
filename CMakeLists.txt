@@ -34,7 +34,7 @@ option(MIRA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(MIRA_ENABLE_TLS "Build the optional OpenSSL 3 TLS stream module" OFF)
 option(MIRA_ENABLE_WEBSOCKET "Build WebSocket (OpenSSL Crypto and zlib for optional compression)" OFF)
 option(MIRA_ENABLE_HTTP2 "Build the optional nghttp2 HTTP/2 module" OFF)
-option(MIRA_ENABLE_HTTP3 "Build the optional QUIC and HTTP/3 modules (experimental)" OFF)
+option(MIRA_ENABLE_HTTP3 "Build the optional QUIC and HTTP/3 modules" OFF)
 
 # Off by default when embedded: a project that pulls Mira in via
 # add_subdirectory() has not asked to install our headers alongside its own.

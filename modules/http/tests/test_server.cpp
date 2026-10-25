@@ -17,6 +17,7 @@
 
 #include "check.hpp"
 #include "mira/core/buffer.hpp"
+#include "mira/http/client.hpp"
 #include "mira/http/connection.hpp"
 #include "mira/http/serializer.hpp"
 
@@ -379,6 +380,17 @@ void test_audit_server_policy() {
     CHECK(bodyless.sent().starts_with("HTTP/1.0 204 "));
     CHECK(bodyless.sent().find("Connection: keep-alive\r\n") != std::string::npos);
     CHECK(bodyless.sent().find("Transfer-Encoding:") == std::string::npos);
+}
+
+void test_timeout_defaults() {
+    // Production defaults: one bounded exchange and one idle keep-alive
+    // window are both 60 seconds. Zero still disables either bound, and
+    // the explicit-timeout tests below keep covering the opt-out.
+    const ServerOptions server;
+    CHECK(server.idle_timeout == std::chrono::seconds{60});
+    CHECK(server.request_timeout == std::chrono::seconds{60});
+    const ClientOptions client;
+    CHECK(client.request_timeout == std::chrono::seconds{60});
 }
 
 void test_single_exchange() {
@@ -851,7 +863,10 @@ void test_timeout_windows() {
 
     // The same stall, with the windows disabled, is indistinguishable from any
     // other stream error — the timeout is the stream's, not the server's.
+    // Disabled means explicit zero: the defaults now bound both windows.
     ServerOptions unbounded;
+    unbounded.idle_timeout = Clock::duration::zero();
+    unbounded.request_timeout = Clock::duration::zero();
     TimingOutStream no_windows{"GET / HTTP/1.1\r\nHost: x\r\n"};
     const Result<void> unbounded_result =
         serve_connection(no_windows, handler, unbounded).sync_get();
@@ -974,6 +989,7 @@ int main() {
     test_keep_alive_rules();
 
     test_shared_buffer_budget();
+    test_timeout_defaults();
     test_single_exchange();
     test_audit_server_policy();
     test_keep_alive_pipeline();

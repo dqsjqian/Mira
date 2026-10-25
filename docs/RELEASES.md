@@ -17,6 +17,31 @@ changes increment the major version. Installed CMake packages use
 consumers when changing SDKs: this policy does not promise a stable binary ABI.
 Historical pre-stable releases used minor-version compatibility instead.
 
+### ABI policy (decision, 2026-10-25)
+
+Mira promises source compatibility within a major version, and explicitly
+does **not** promise binary compatibility across any release — including
+patch releases. This is a deliberate policy choice, not an omission, and it
+follows the same line as Abseil and fmt, the closest peers among modern
+C++ libraries:
+
+- Most of Mira's public surface is templates, header-only modules, and
+  inline functions, compiled into the consumer. There is no stable binary
+  boundary to promise across such a surface: coroutine frame layouts,
+  template instantiations, and inline bodies change with the headers.
+- The compiled modules are shipped as static libraries, so consumers
+  relink on every SDK change anyway; a binary-compatibility promise
+  would buy distributors nothing and constrain the headers severely.
+- What consumers must do: pin a release tag plus its SHA256 (see below)
+  and rebuild from source on every SDK change. `SameMajorVersion` guards
+  the source-level contract, not the binary one.
+
+What would be required to ever promise an ABI: a versioned inline
+namespace, a stable C-ABI surface for the compiled modules, and an
+ABI-compliance check in CI. That is explicitly out of scope until a
+major-version boundary forces the question; do not read this section as
+a roadmap item.
+
 Protocol versions, dependency pins and compiler requirements are separate from
 the library version. They must not be changed during a library version bump.
 

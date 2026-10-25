@@ -90,10 +90,10 @@ struct ServerOptions {
     /// being closed is how it normally ends, so this returns success — the same
     /// as the peer having closed it politely.
     ///
-    /// Zero disables it. A server exposed to the internet should not leave it
-    /// that way: an idle connection costs a descriptor and a buffer, and a
-    /// client can open many.
-    Clock::duration idle_timeout = Clock::duration::zero();
+    /// Zero disables it. The default is 60 seconds: an idle connection
+    /// costs a descriptor and a buffer, and a client can open many, so a
+    /// server exposed to the internet should not leave it disabled.
+    Clock::duration idle_timeout = std::chrono::seconds{60};
 
     /// How long one request may take, from its first byte to its last
     /// response byte.
@@ -112,7 +112,10 @@ struct ServerOptions {
     ///
     /// Zero disables it, which leaves a slow peer bounded only by `limits` —
     /// a bound on one message's size, not on the time it may take to arrive.
-    Clock::duration request_timeout = Clock::duration::zero();
+    /// The default is 60 seconds, matching the de facto server timeout
+    /// (nginx/Apache `Timeout 60`); bodies are already size-bounded by
+    /// `limits`, so 60 seconds is generous for one bounded exchange.
+    Clock::duration request_timeout = std::chrono::seconds{60};
 
     /// Hard input-buffer ceiling, including an incomplete framing line.
     std::size_t max_buffer_size = 64 * 1024;

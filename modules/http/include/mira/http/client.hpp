@@ -68,7 +68,10 @@ struct ClientOptions {
     /// Overall deadline for one exchange (send, 1xx, final response and body),
     /// not refreshed per read. Sources accepting OperationOptions receive this
     /// deadline; legacy no-argument sources must bound their own asynchronous work.
-    Clock::duration request_timeout = Clock::duration::zero();
+    /// Zero disables it. The default is 60 seconds: bodies are size-bounded
+    /// by `limits` by default, so one bounded exchange fits comfortably; a
+    /// client raising `limits` for large downloads must raise this together.
+    Clock::duration request_timeout = std::chrono::seconds{60};
     /// Charge the fixed response input capacity for this connection's lifetime.
     /// Does not cover parser metadata, caller buffers or allocator overhead.
     std::optional<ResourceBudget> input_budget{};
