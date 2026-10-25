@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import os
 import queue
 import re
 import shutil
@@ -183,8 +184,24 @@ class PythonProxy:
         self.listener.close()
 
 
-def run(arguments: list[str], ok: bool, expect: str | None = None, error: str | None = None):
-    result = subprocess.run(arguments, capture_output=True, text=True, timeout=TIMEOUT)
+def curl_env() -> dict[str, str]:
+    """Environment for the curl sub-cases, with proxy-bypass variables removed.
+
+    curl honours `no_proxy`/`NO_PROXY` from the environment: a value that
+    covers `localhost` makes curl skip the SOCKS proxy for the loopback
+    target entirely, so the interop case passes or fails depending on the
+    caller's shell instead of on the proxy under test. Stripping both
+    spellings keeps the proxy in the path no matter where the script runs.
+    """
+    env = dict(os.environ)
+    env.pop("no_proxy", None)
+    env.pop("NO_PROXY", None)
+    return env
+
+
+def run(arguments: list[str], ok: bool, expect: str | None = None, error: str | None = None,
+        env: dict[str, str] | None = None):
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=TIMEOUT, env=env)
     if (result.returncode == 0) != ok:
         raise AssertionError(f"{arguments} exited {result.returncode}: {result.stdout!r} {result.stderr!r}")
     if expect and expect not in result.stdout:
@@ -219,7 +236,7 @@ def main() -> int:
             passed += 1
             if curl:
                 run([curl, "-sS", "--max-time", "5", "--socks5-hostname", f"127.0.0.1:{open_proxy}",
-                     f"http://localhost:{http_port}/"], True, BODY)
+                     f"http://localhost:{http_port}/"], True, BODY, env=curl_env())
                 passed += 1
         with spawn([args.proxy, "0", "30000", "alice", "s3cret"], r"PORT=(\d+)") as locked:
             rep, response = python_client(locked, "localhost", http_port, ("alice", "s3cret"))
@@ -229,9 +246,9 @@ def main() -> int:
             passed += 2
             if curl:
                 run([curl, "-sS", "--max-time", "5", "--proxy", f"socks5h://alice:s3cret@127.0.0.1:{locked}",
-                     f"http://localhost:{http_port}/"], True, BODY)
+                     f"http://localhost:{http_port}/"], True, BODY, env=curl_env())
                 run([curl, "-sS", "--max-time", "5", "--proxy", f"socks5h://alice:nope@127.0.0.1:{locked}",
-                     f"http://localhost:{http_port}/"], False)
+                     f"http://localhost:{http_port}/"], False, env=curl_env())
                 passed += 2
         # Mira client -> independent proxy.
         proxy = PythonProxy()
