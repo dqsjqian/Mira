@@ -8,6 +8,12 @@ endforeach()
 add_test(NAME mqtt.packet COMMAND mira_mqtt_packet_tests)
 add_test(NAME mqtt.session COMMAND mira_mqtt_session_tests)
 set_tests_properties(mqtt.packet mqtt.session PROPERTIES TIMEOUT 60)
+
+add_executable(mira_mqtt_reconnect_tests test_reconnect.cpp)
+target_link_libraries(mira_mqtt_reconnect_tests PRIVATE Mira::mqtt Mira::transport Mira::warnings)
+target_include_directories(mira_mqtt_reconnect_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+add_test(NAME mqtt.reconnect COMMAND mira_mqtt_reconnect_tests)
+set_tests_properties(mqtt.reconnect PROPERTIES TIMEOUT 60)
 # Real sockets: the stream client against an in-test broker built on the codec.
 if(NOT (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14))
     add_executable(mira_mqtt_client_tests test_client.cpp)
