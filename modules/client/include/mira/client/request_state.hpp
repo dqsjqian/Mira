@@ -90,7 +90,8 @@ inline std::optional<std::chrono::sys_seconds> date(std::string_view text) {
     const std::chrono::year_month_day value{std::chrono::year{static_cast<int>(*year)},
         std::chrono::month{static_cast<unsigned>(month / 3 + 1)}, std::chrono::day{static_cast<unsigned>(*day)}};
     if (!value.ok()) return {};
-    return std::chrono::sys_days{value} + std::chrono::hours{*hour} +
+    // MSVC uses 32-bit reps for days/hours/minutes; widen before their arithmetic.
+    return std::chrono::sys_seconds{std::chrono::sys_days{value}} + std::chrono::hours{*hour} +
         std::chrono::minutes{*minute} + std::chrono::seconds{*second};
 }
 inline Clock::time_point expires_after(Clock::time_point now, std::chrono::seconds seconds) {

@@ -78,6 +78,12 @@ void cookies() {
     CHECK(cookie(*state, "/", {"https", "child.a.test", 443}).empty());
 
     test::section("Cookie Max-Age 优先、删除、Expires 与惰性过期");
+    CHECK(state_detail::date("Mon, 01 Jan 1601 00:00:00 GMT") ==
+          std::chrono::sys_seconds{std::chrono::seconds{-11644473600LL}});
+    CHECK(state_detail::date("Wed, 01 Jan 9999 00:00:02 GMT") ==
+          std::chrono::sys_seconds{std::chrono::seconds{253370764802LL}});
+    CHECK(state_detail::date("Fri, 31 Dec 9999 23:59:59 GMT") ==
+          std::chrono::sys_seconds{std::chrono::seconds{253402300799LL}});
     state->clear();
     store_cookie(*state, "a=x; Max-Age=2; Expires=Wed, 01 Jan 2020 00:00:00 GMT");
     CHECK(cookie(*state, "/", origin, now + 1s) == "a=x");
