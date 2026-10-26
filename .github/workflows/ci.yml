@@ -248,8 +248,8 @@ jobs:
         run: echo "MIRA_PYTHON=$(cygpath -u "$pythonLocation")/python.exe" >> "$GITHUB_ENV"
       - name: Install forgedeps into the selected Python
         run: |
-          $MIRA_PYTHON -m pip install --break-system-packages -r requirements-build.txt
-          python -m forgedeps init "$RUNNER_TEMP/forgedeps"
+          "$MIRA_PYTHON" -m pip install --break-system-packages -r requirements-build.txt
+          "$MIRA_PYTHON" -m forgedeps init "$RUNNER_TEMP/forgedeps"
           echo "FORGEDEPS_HOME=$RUNNER_TEMP/forgedeps" >> "$GITHUB_ENV"
       - name: Configure with TLS and HTTP3
         run: $MIRA_PYTHON scripts/ci/dependency_session.py -- cmake -S . -B build/mingw -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_DNSSEC=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON
