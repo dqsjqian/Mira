@@ -135,7 +135,16 @@ def main() -> int:
                      "--cacert", cert, "--max-time", "20", "-w", "\n%{http_version} %{http_code}\n",
                      f"https://localhost:{target_port}/first", f"https://localhost:{target_port}/second"],
                     capture_output=True, text=True, timeout=TIMEOUT)
-                assert completed.returncode == 0, completed.stderr
+                if completed.returncode != 0:
+                    # A bare "timed out" says nothing about which side stalled:
+                    # report what the server printed and which curl build ran.
+                    server_output = ""
+                    if process.poll() is not None:
+                        _, server_output = process.communicate(timeout=TIMEOUT)
+                    raise AssertionError(
+                        f"curl failed ({completed.returncode}): {completed.stderr.strip()}\n"
+                        f"curl: {version.stdout.splitlines()[0]}\n"
+                        f"server log:\n{server_output or '(server still running)'}")
                 assert completed.stdout.count("\n3 200\n") == 2, completed.stdout
             if relay:
                 assert relay.error is None, relay.error

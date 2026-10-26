@@ -295,6 +295,12 @@ def main():
                                       fail_non_strict=args.fail_non_strict)
         for field in ("executed_count", "failed_count", "non_strict_count", "informational_count"):
             summary[field] = summary["server"][field] + summary["client"][field]
+        for role, exit_key in (("server", "fuzzingclient_exit"), ("client", "mira_client_exit")):
+            role_summary = summary[role]
+            if role_summary["expected_count"] and not role_summary["executed_count"]:
+                summary["errors"].append(
+                    f"{role}: no case executed ({role_summary['missing_count']} missing); "
+                    f"{exit_key}={summary.get(exit_key)}")
         success = (summary["server"]["passed"] and summary["client"]["passed"] and
                    not summary["errors"] and summary.get("fuzzingclient_exit") == 0 and
                    summary.get("mira_server_exit") == 0 and summary.get("mira_client_exit") == 0)
@@ -323,6 +329,12 @@ def main():
     print(json.dumps({"status": summary["status"], "scope": summary["scope"],
                       "compression": summary["compression"],
                       "executed_count": summary["executed_count"],
+                      # An early failure (bad selection, unusable runtime) never
+                      # reaches the per-role summaries, so read them defensively.
+                      "server_executed": (summary.get("server") or {}).get("executed_count"),
+                      "client_executed": (summary.get("client") or {}).get("executed_count"),
+                      "exits": {key: summary.get(key) for key in
+                                ("fuzzingclient_exit", "mira_server_exit", "mira_client_exit")},
                       "non_strict_count": summary["non_strict_count"],
                       "informational_count": summary["informational_count"],
                       "strict_passed": summary["strict_passed"],
