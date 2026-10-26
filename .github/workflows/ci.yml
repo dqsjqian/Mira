@@ -21,9 +21,6 @@ concurrency:
 #   Android     NDK r30
 #   MinGW-w64   MSYS2 UCRT64, packages updated at job start (GCC 16)
 env:
-  # Not under github.workspace: a container job resolves that expression to
-  # the host path in one step and to the container mount in another.
-  FORGEDEPS_HOME: ${{ runner.temp }}/forgedeps
   GCC_VERSION: "16"
   LLVM_VERSION: "23"
   PYTHON_VERSION: "3.14"
@@ -43,7 +40,8 @@ jobs:
       - name: Install forgedeps
         run: |
           python3 -m pip install --break-system-packages -r requirements-build.txt
-          python3 -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
+          python -m forgedeps init "$RUNNER_TEMP/forgedeps"
+          echo "FORGEDEPS_HOME=$RUNNER_TEMP/forgedeps" >> "$GITHUB_ENV"
       - name: Layering, framework-independence, platform-fencing
         run: python3 scripts/ci/check_layering.py
       - name: Verification runner invariants
@@ -93,7 +91,8 @@ jobs:
       - name: Install forgedeps
         run: |
           python -m pip install --break-system-packages -r requirements-build.txt
-          python -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
+          python -m forgedeps init "$RUNNER_TEMP/forgedeps"
+          echo "FORGEDEPS_HOME=$RUNNER_TEMP/forgedeps" >> "$GITHUB_ENV"
       - name: Set up LLVM 23
         if: matrix.llvm
         run: .github/scripts/install-llvm.sh
@@ -125,7 +124,8 @@ jobs:
       - name: Install forgedeps
         run: |
           python -m pip install --break-system-packages -r requirements-build.txt
-          python -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
+          python -m forgedeps init "$RUNNER_TEMP/forgedeps"
+          echo "FORGEDEPS_HOME=$RUNNER_TEMP/forgedeps" >> "$GITHUB_ENV"
       - name: Configure
         run: cmake -S . -B build -DCMAKE_CONFIGURATION_TYPES=Release -DCMAKE_CXX_STANDARD=23
       - name: Build
@@ -160,7 +160,8 @@ jobs:
       - name: Install forgedeps
         run: |
           python -m pip install --break-system-packages -r requirements-build.txt
-          python -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
+          python -m forgedeps init "$RUNNER_TEMP/forgedeps"
+          echo "FORGEDEPS_HOME=$RUNNER_TEMP/forgedeps" >> "$GITHUB_ENV"
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
       - name: Install OpenSSL on Linux
@@ -248,7 +249,8 @@ jobs:
       - name: Install forgedeps into the selected Python
         run: |
           $MIRA_PYTHON -m pip install --break-system-packages -r requirements-build.txt
-          $MIRA_PYTHON -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
+          python -m forgedeps init "$RUNNER_TEMP/forgedeps"
+          echo "FORGEDEPS_HOME=$RUNNER_TEMP/forgedeps" >> "$GITHUB_ENV"
       - name: Configure with TLS and HTTP3
         run: $MIRA_PYTHON scripts/ci/dependency_session.py -- cmake -S . -B build/mingw -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_DNSSEC=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON
       - name: Build
@@ -290,7 +292,8 @@ jobs:
       - name: Install forgedeps
         run: |
           python3 -m pip install --break-system-packages -r requirements-build.txt
-          python3 -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
+          python -m forgedeps init "$RUNNER_TEMP/forgedeps"
+          echo "FORGEDEPS_HOME=$RUNNER_TEMP/forgedeps" >> "$GITHUB_ENV"
       - name: Install OpenSSL on Linux
         if: runner.os == 'Linux' && !matrix.container
         run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
@@ -380,7 +383,8 @@ jobs:
       - name: Install forgedeps
         run: |
           python3 -m pip install --break-system-packages -r requirements-build.txt
-          python3 -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
+          python -m forgedeps init "$RUNNER_TEMP/forgedeps"
+          echo "FORGEDEPS_HOME=$RUNNER_TEMP/forgedeps" >> "$GITHUB_ENV"
       - name: Configure with libFuzzer
         # CFLAGS reach only the C dependencies (Mira has no C sources), which
         # are instrumented on purpose. OpenSSL deliberately calls AES_encrypt
@@ -448,7 +452,8 @@ jobs:
       - name: Install forgedeps
         run: |
           python -m pip install --break-system-packages -r requirements-build.txt
-          python -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
+          python -m forgedeps init "$RUNNER_TEMP/forgedeps"
+          echo "FORGEDEPS_HOME=$RUNNER_TEMP/forgedeps" >> "$GITHUB_ENV"
       - name: Configure and build both conformance harnesses
         run: |
           cmake -S . -B build/autobahn -DCMAKE_BUILD_TYPE=Release -DMIRA_ENABLE_WEBSOCKET=ON
@@ -499,7 +504,8 @@ jobs:
       - name: Install forgedeps
         run: |
           python3 -m pip install --break-system-packages -r requirements-build.txt
-          python3 -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
+          python -m forgedeps init "$RUNNER_TEMP/forgedeps"
+          echo "FORGEDEPS_HOME=$RUNNER_TEMP/forgedeps" >> "$GITHUB_ENV"
       - name: Locate OpenSSL on macOS
         if: runner.os == 'macOS'
         shell: bash
