@@ -13,6 +13,7 @@ from unittest import mock
 import build_protocol_deps as deps
 from forgedeps import deps_build as pipeline
 import build_interop_curl as interop
+import forgerecipes.protocol_support as protocol_support
 from types import SimpleNamespace
 
 
@@ -165,7 +166,9 @@ class ProtocolLicenseTests(unittest.TestCase):
                            "shared declarations", "ossl adapter", "ossl declarations"):
                 self.assertIn(author, text)
             self.assertNotIn("disabled adapter", text)
-            resources = Path(deps.__file__).resolve().parent / "licenses"
+            # The immutable upstream license texts live with the recipe
+            # implementation that installs them, not with this test.
+            resources = Path(protocol_support.__file__).resolve().with_name("licenses")
             for filename in ("quiche-LICENSE", "pcg-LICENSE-MIT.txt", "SOURCES.md"):
                 self.assertEqual((installed / filename).read_bytes(), (resources / filename).read_bytes())
 
