@@ -30,6 +30,7 @@ jobs:
           python3 scripts/ci/test_autobahn_runner.py
           python3 scripts/ci/test_h3_interop.py
           python3 scripts/ci/test_h3_soak_runner.py
+          python3 scripts/ci/test_tcp_tls_early.py
 
   # Every backend gets a real build and a real test run, because a platform
   # that merely compiles is not a supported platform:

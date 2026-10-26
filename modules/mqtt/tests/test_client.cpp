@@ -68,7 +68,7 @@ Task<void> broker(Socket peer, BrokerStats& stats, std::uint8_t refuse = 0, std:
                 stats.version = version;
                 Connack ack{false, refuse, {}};
                 if (version == Version::v5 && !refuse) {
-                    ack.properties.topic_alias_maximum = 2;
+                    ack.properties.topic_alias_maximum = std::uint16_t{2};
                     if (c->client_id.empty()) ack.properties.assigned_client_identifier = "assigned-1";
                     if (server_keep_alive) ack.properties.server_keep_alive = server_keep_alive;
                 }
@@ -588,7 +588,7 @@ Task<void> outbound_alias_reconnect() {
     options.clean_start = false;
     options.outbound_topic_alias_maximum = 2;
     Connack ack;
-    ack.properties.topic_alias_maximum = 2;
+    ack.properties.topic_alias_maximum = std::uint16_t{2};
     ScriptedBroker previous;
     previous.input.push_back(*encode(ack, Version::v5));
     auto client = co_await Client<ScriptedBroker>::connect(previous, options);
@@ -623,7 +623,7 @@ Task<void> outbound_alias_reconnect() {
     };
     ScriptedBroker fresh;
     ack.session_present = true;
-    ack.properties.topic_alias_maximum = 1;
+    ack.properties.topic_alias_maximum = std::uint16_t{1};
     fresh.input.push_back(*encode(ack, Version::v5));
     CHECK((co_await client->reconnect(fresh)).has_value());
     check(fresh, true);

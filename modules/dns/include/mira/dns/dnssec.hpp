@@ -80,6 +80,7 @@ public:
         std::span<const Record> evidence, std::uint64_t unix_seconds) const;
     /// 实际查询及证据收集：开启 DO/CD，从回答签名者逐级取 DNSKEY/DS 至配置锚。
     /// 共享截止时间、查询/字节/记录/深度/验签上限；任何缺证明或验证失败不返回原回答。
+    /// 每份回答和证据的 TTL 从各自接收时刻扣减，已耗尽的 TTL 返回零，不延长缓存寿命。
     /// 调用当下即复制配置；随后可销毁或轮转原 Validator，不改变已创建任务的信任锚。
     /// Exchange 按值保留，但其捕获的外部资源仍须存活到任务完成。
     [[nodiscard]] Task<Result<VerifiedAnswer>> query(Exchange exchange, Question question,

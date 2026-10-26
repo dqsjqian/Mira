@@ -63,6 +63,8 @@ struct ListenOptions {
 };
 
 /// A connected TCP stream. Models `Mira::AsyncStream`.
+/// All operations, moves and close/destruction belong to the event-loop thread;
+/// requesting cancellation through a stop_source may originate on another thread.
 class Socket {
 public:
     Socket() = default;

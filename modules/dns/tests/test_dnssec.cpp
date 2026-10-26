@@ -380,6 +380,100 @@ Task<void> query_integration() {
     CHECK(!result);
 }
 
+Task<void> query_ttl_age(EventLoop& loop) {
+    test::section("DNSSEC 查询扣除回答接收后的等待，TTL 耗尽饱和到零");
+    Fixture f;
+    f.response.answers.front().ttl = 1;
+    Exchange delayed_keys = [&](Message request, OperationOptions io) -> Task<Result<Message>> {
+        Message response;
+        if (request.questions.front().type == type::a) response = f.response;
+        else {
+            auto waited = co_await loop.sleep_for(std::chrono::milliseconds(1100), io);
+            if (!waited) co_return fail(waited.error());
+            response.header.qr = true; response.questions = request.questions; response.answers = f.evidence;
+        }
+        response.header.id = request.header.id;
+        co_return response;
+    };
+    auto result = co_await f.validator().query(delayed_keys, f.question, now);
+    CHECK(result && result->ttl == 0 && result->records.front().ttl == 0);
+
+    test::section("后续 DNSKEY 和 DS 证据也从各自接收时刻扣减 TTL");
+    f.response.answers.front().ttl = 300;
+    auto root_secret = generate(13);
+    auto root_key = public_key(root_secret.get(), 13);
+    const Name root;
+    const auto root_record = key_record(root, root_key);
+    const auto root_signature = sig_record(std::span{&root_record, 1}, root, root_key, root_secret.get());
+    const auto delegation = ds_record(f.zone, *make_ds(f.zone, f.key));
+    const auto delegation_signature = sig_record(std::span{&delegation, 1}, root, root_key, root_secret.get());
+    auto chained = *Validator::create({TrustAnchor{root, *make_ds(root, root_key), 0, now + 1000}});
+    for (const auto limiting_type : {dnskey_type, ds_type, rrsig_type}) {
+        Exchange delayed_parent = [&](Message request, OperationOptions io) -> Task<Result<Message>> {
+            const auto& q = request.questions.front();
+            Message response; response.header.qr = true; response.questions = request.questions;
+            if (q.type == type::a) response = f.response;
+            else if (q.type == dnskey_type && q.name == f.zone) {
+                response.answers = f.evidence;
+                if (limiting_type == dnskey_type) response.answers.front().ttl = 1;
+            } else if (q.type == ds_type) {
+                response.answers = {delegation, delegation_signature};
+                if (limiting_type == ds_type) response.answers.front().ttl = 1;
+                if (limiting_type == rrsig_type) response.answers.back().ttl = 1;
+            } else {
+                // A subsecond delay still consumes part of a whole-second TTL.
+                auto waited = co_await loop.sleep_for(std::chrono::milliseconds(2), io);
+                if (!waited) co_return fail(waited.error());
+                response.answers = {root_record, root_signature};
+            }
+            response.header.id = request.header.id;
+            co_return response;
+        };
+        result = co_await chained.query(delayed_parent, f.question, now);
+        CHECK(result && result->ttl == 0 && result->records.front().ttl == 0);
+    }
+
+    test::section("网络接收前的等待不扣新收到的 TTL，签名有效期仍按查询总耗时限制");
+    for (auto& record : f.response.answers) record.ttl = 5;
+    for (auto& record : f.evidence) record.ttl = 5;
+    Clock::time_point first_received{};
+    Exchange delayed_answer = [&](Message request, OperationOptions io) -> Task<Result<Message>> {
+        Message response;
+        if (request.questions.front().type == type::a) {
+            auto waited = co_await loop.sleep_for(std::chrono::milliseconds(1100), io);
+            if (!waited) co_return fail(waited.error());
+            response = f.response;
+            first_received = Clock::now();
+        } else {
+            response.header.qr = true; response.questions = request.questions; response.answers = f.evidence;
+        }
+        response.header.id = request.header.id;
+        co_return response;
+    };
+    result = co_await f.validator().query(delayed_answer, f.question, now);
+    const auto age = std::chrono::ceil<std::chrono::seconds>(Clock::now() - first_received).count();
+    const auto remaining_ttl = age >= 5 ? 0U : 5U - static_cast<std::uint32_t>(age);
+    CHECK(result && result->ttl >= remaining_ttl && result->ttl < 5);
+
+    // Near-expiry signatures have their own absolute validity bound; fresh
+    // RR TTLs cannot reset it while the DNSKEY exchange is outstanding.
+    f.response.answers.back() = sig_record(std::span{f.response.answers}.first(1), f.zone,
+        f.key, f.secret.get(), static_cast<std::uint32_t>(now - 100), static_cast<std::uint32_t>(now + 2));
+    Exchange short_delay = [&](Message request, OperationOptions io) -> Task<Result<Message>> {
+        Message response;
+        if (request.questions.front().type == type::a) response = f.response;
+        else {
+            auto waited = co_await loop.sleep_for(std::chrono::milliseconds(2), io);
+            if (!waited) co_return fail(waited.error());
+            response.header.qr = true; response.questions = request.questions; response.answers = f.evidence;
+        }
+        response.header.id = request.header.id;
+        co_return response;
+    };
+    result = co_await f.validator().query(short_delay, f.question, now);
+    CHECK(result && result->ttl == 1 && result->records.front().ttl == 1);
+}
+
 }  // namespace
 
 int main() {
@@ -389,6 +483,9 @@ int main() {
     canonical_and_malformed();
     auto loop = EventLoop::create();
     CHECK(loop.has_value());
-    if (loop) CHECK(loop->run_until_complete(query_integration()).has_value());
+    if (loop) {
+        CHECK(loop->run_until_complete(query_integration()).has_value());
+        CHECK(loop->run_until_complete(query_ttl_age(*loop)).has_value());
+    }
     return test::summary();
 }

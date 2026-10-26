@@ -203,7 +203,7 @@ auto client = Mira::tls::Context::client({
 | 请求之间空等超时 | **成功**返回 —— 安静连接被关掉是它正常的结束方式 |
 | 请求进行中超时 | `Errc::timed_out` 并关闭连接 |
 
-不发 408：宣告超时就得再要一份调用方从未授予的预算。两个窗口默认关闭，公网服务应当显式设置。
+不发 408：宣告超时就得再要一份调用方从未授予的预算。两个窗口默认均为 60 秒；显式设为 0 可关闭，大传输应按需求调整。
 </details>
 
 ## 📋 平台矩阵
@@ -213,8 +213,8 @@ auto client = Mira::tls::Context::client({
 | macOS | kqueue | 基础/TLS/H2/H3 运行测试、ASan/UBSan、独立 HTTP/3 curl 与 Retry 互操作 |
 | Linux | epoll | GCC/Clang 运行测试、GCC ASan/UBSan、独立 HTTP/3 curl 与 Retry 互操作 |
 | Windows | IOCP | MSVC/MinGW 原生基础/TLS/H2/H3 测试；MSVC 独立 HTTP/3 curl 与 Retry 互操作 |
-| iOS | kqueue | 宿主 smoke 与无签名交叉编译通过；缺少签名 profile，未完成真机运行 |
-| Android | epoll | 非 TLS 模块交叉编译，需 **NDK 29+**；无真机运行证据 |
+| iOS | kqueue | arm64 Simulator 基础/TLS/H2/H3/DNSSEC 运行通过；缺少匹配的签名 profile，未完成真机运行 |
+| Android | epoll | arm64 Emulator 基础/TLS/H2/H3/DNSSEC 运行通过，需 **NDK 29+**；无真机运行证据 |
 
 CI 同时覆盖安装包消费与依赖隔离、协议模糊测试、MQTT/mosquitto 互操作，以及包含压缩的官方 Autobahn 客户端/服务端测试。Linux、macOS 和 Windows MSVC 的协议任务均要求独立 HTTP/3 与 Retry 互操作成功；sanitizer 等缺少独立 HTTP3 curl 的配置将相应用例计为跳过。
 

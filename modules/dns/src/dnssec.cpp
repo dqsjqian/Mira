@@ -281,6 +281,16 @@ Result<void> append_records(std::vector<Record>& out, const Message& response, c
     return {};
 }
 
+void age_records(std::span<Record> records, Clock::time_point received, Clock::time_point now) {
+    // TTL is a remaining lifetime at receipt. Round elapsed time up so a
+    // returned whole-second TTL cannot extend it, and leave signed RDATA intact.
+    const auto elapsed = std::chrono::ceil<std::chrono::seconds>(now - received).count();
+    if (elapsed <= 0) return;
+    const auto age = static_cast<std::uint64_t>(elapsed);
+    for (auto& record : records)
+        record.ttl = age >= record.ttl ? 0 : record.ttl - static_cast<std::uint32_t>(age);
+}
+
 }  // namespace
 
 Result<Dnskey> parse_dnskey(const Record& record) {
@@ -428,6 +438,7 @@ Task<Result<VerifiedAnswer>> Validator::query_impl(Validator snapshot, Exchange 
     const auto deadline = started + snapshot.options_.timeout;
     if (!io.deadline || deadline < *io.deadline) io.deadline = deadline;
     std::size_t queries = 0, bytes = 0, records = 0;
+    auto last_received = started;
     const auto fetch = [&](const Question& q) -> Task<Result<Message>> {
         if (io.stop.stop_requested()) co_return fail(Errc::cancelled);
         if (Clock::now() >= *io.deadline) co_return fail(Errc::timed_out);
@@ -437,8 +448,9 @@ Task<Result<VerifiedAnswer>> Validator::query_impl(Validator snapshot, Exchange 
         request->header.cd = true;
         const auto response = co_await exchange(std::move(*request), io);
         if (!response) co_return fail(response.error());
+        last_received = Clock::now();
         if (io.stop.stop_requested()) co_return fail(Errc::cancelled);
-        if (Clock::now() >= *io.deadline) co_return fail(Errc::timed_out);
+        if (last_received >= *io.deadline) co_return fail(Errc::timed_out);
         if (!response->header.qr || response->header.tc || response->header.opcode || response->questions.size() != 1 ||
             response->questions.front() != q) co_return fail(DnsError::mismatched_response);
         if (auto bounded = message_budget(*response, snapshot.options_, records, bytes); !bounded) co_return fail(bounded.error());
@@ -446,8 +458,11 @@ Task<Result<VerifiedAnswer>> Validator::query_impl(Validator snapshot, Exchange 
     };
     auto response = co_await fetch(question);
     if (!response) co_return fail(response.error());
+    const auto response_received = last_received;
     if (response->header.rcode != rcode::noerror) co_return fail(Errc::not_supported);
     std::vector<Record> evidence;
+    struct EvidenceReceipt { std::size_t begin; Clock::time_point received; };
+    std::vector<EvidenceReceipt> evidence_receipts;
     std::vector<Name> zones;
     for (const auto& record : response->answers) {
         if (record.name != question.name || record.type != rrsig_type) continue;
@@ -462,10 +477,12 @@ Task<Result<VerifiedAnswer>> Validator::query_impl(Validator snapshot, Exchange 
         visited.push_back(zone);
         auto keys = co_await fetch(Question{zone, dnskey_type, class_in});
         if (!keys) co_return fail(keys.error());
+        evidence_receipts.push_back({evidence.size(), last_received});
         if (auto r = append_records(evidence, *keys, snapshot.options_); !r) co_return fail(r.error());
         if (std::any_of(snapshot.anchors_.begin(), snapshot.anchors_.end(), [&](const auto& anchor) { return anchor.zone == zone; })) continue;
         auto ds = co_await fetch(Question{zone, ds_type, class_in});
         if (!ds) co_return fail(ds.error());
+        evidence_receipts.push_back({evidence.size(), last_received});
         if (auto r = append_records(evidence, *ds, snapshot.options_); !r) co_return fail(r.error());
         for (const auto& record : ds->answers) {
             auto signature = parse_rrsig(record);
@@ -473,7 +490,16 @@ Task<Result<VerifiedAnswer>> Validator::query_impl(Validator snapshot, Exchange 
                 zones.push_back(signature->signer);
         }
     }
-    const auto elapsed = std::chrono::ceil<std::chrono::seconds>(Clock::now() - started).count();
+    const auto validating_at = Clock::now();
+    age_records(response->answers, response_received, validating_at);
+    age_records(response->authorities, response_received, validating_at);
+    age_records(response->additionals, response_received, validating_at);
+    for (std::size_t i = 0; i < evidence_receipts.size(); ++i) {
+        const auto end = i + 1 < evidence_receipts.size() ? evidence_receipts[i + 1].begin : evidence.size();
+        age_records(std::span{evidence}.subspan(evidence_receipts[i].begin, end - evidence_receipts[i].begin),
+                    evidence_receipts[i].received, validating_at);
+    }
+    const auto elapsed = std::chrono::ceil<std::chrono::seconds>(validating_at - started).count();
     if (elapsed < 0 || static_cast<std::uint64_t>(elapsed) > UINT64_MAX - unix_seconds) co_return fail(Errc::invalid_argument);
     co_return snapshot.validate(*response, question, evidence, unix_seconds + static_cast<std::uint64_t>(elapsed));
 }

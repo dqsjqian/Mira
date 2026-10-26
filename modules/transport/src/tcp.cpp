@@ -85,7 +85,8 @@ Task<Result<TransferResult>> Socket::send_file(
             if (*read == 0) co_return fail(Errc::eof);
             std::size_t written = 0;
             while (written < *read) {
-                if (state->closed) co_return fail(Errc::cancelled);
+                if (state->closed || options.stop.stop_requested()) co_return fail(Errc::cancelled);
+                if (options.deadline && *options.deadline <= Clock::now()) co_return fail(Errc::timed_out);
                 const auto sent = co_await loop->write(socket,
                     std::span<const std::byte>{buffer}.subspan(written, *read - written), options);
                 if (!sent) co_return fail(sent.error());

@@ -25,6 +25,21 @@ const char* status_name(EarlyDataStatus status) {
     return "invalid";
 }
 
+template <typename Stream>
+Task<Result<void>> expect_response(Stream& stream, std::string_view expected, OperationOptions options) {
+    std::array<std::byte, 64> data{};
+    std::size_t received = 0;
+    while (received < expected.size()) {
+        auto read = co_await stream.read_some(std::span{data}.subspan(received, expected.size() - received), options);
+        if (!read) co_return fail(read.error());
+        if (*read == 0) co_return fail(Errc::eof);
+        received += *read;
+    }
+    if (std::string_view(reinterpret_cast<const char*>(data.data()), received) != expected)
+        co_return fail(Errc::internal);
+    co_return Result<void>{};
+}
+
 Task<Result<void>> serve(EventLoop& loop, tcp::Listener& listener, const tls::Context& context) {
     for (unsigned index = 0; index < 3; ++index) {
         const OperationOptions options{.deadline = Clock::now() + 10s};
@@ -76,19 +91,34 @@ Task<Result<void>> connect_twice(EventLoop& loop, Endpoint endpoint, const tls::
             if (stream->early_data_status() != EarlyDataStatus::accepted)
                 co_return fail(Errc::internal);
         }
-        std::array<std::byte, 64> data{};
-        auto read = co_await stream->read_some(data, options);
-        if (!read) co_return fail(read.error());
+        // Ordered after every handshake write: seeing this marker at s_server
+        // proves it also read any accidentally repeated 1-RTT application data.
+        const std::string marker = std::string("\nMIRA-DRAIN-") + status_name(stream->early_data_status()) + "\n";
+        auto drained = co_await write_all(*stream, bytes_of(marker), options);
+        if (!drained) co_return fail(drained.error());
+        std::printf("READY=%s\n", status_name(stream->early_data_status()));
+        std::fflush(stdout);
+        const std::string_view expected = index == 0 ? "ticket-ready\n" : "early-ready\n";
+        auto response = co_await expect_response(*stream, expected, options);
+        if (!response) co_return fail(response.error());
         if (index == 0) {
             auto captured = stream->take_session();
             if (!captured) co_return fail(captured.error());
             if (!captured->has_value()) co_return fail(Errc::internal);
             ticket = std::move(**captured);
         }
-        auto shutdown = co_await stream->shutdown(options);
-        if (!shutdown) co_return fail(shutdown.error());
+        std::printf("RECEIVED=%s\n", status_name(stream->early_data_status()));
+        std::fflush(stdout);
+        auto drain_ready = co_await expect_response(*stream, "drain-ready\n", options);
+        if (!drain_ready) co_return fail(drain_ready.error());
+        // The harness closes s_server's interactive connection with its q command.
+        // Windows s_server otherwise blocks on redirected stdin before reading
+        // close_notify; graceful shutdown is covered by the dedicated TLS tests.
         std::printf("CLIENT=%s\n", status_name(stream->early_data_status()));
         std::fflush(stdout);
+        std::array<char, 16> next{};
+        if (!std::fgets(next.data(), static_cast<int>(next.size()), stdin) ||
+            std::string_view(next.data()) != "next\n") co_return fail(Errc::internal);
     }
     co_return Result<void>{};
 }

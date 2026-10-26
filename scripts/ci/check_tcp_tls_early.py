@@ -74,6 +74,30 @@ def run(command, **kwargs):
     return result
 
 
+def exchange_with_server(server, client):
+    # s_server does not flush its initial early-data diagnostic on every platform.
+    # Drive its stdin from our explicitly flushed peer events instead. Windows
+    # s_server also blocks on redirected stdin, so q must end each connection.
+    for status, response in (('not_attempted', 'ticket-ready\n'), ('accepted', 'early-ready\n')):
+        client.event(f'READY={status}')
+        server.send(response)
+        client.event(f'RECEIVED={status}')
+        server.send('drain-ready\n')
+        client.event(f'CLIENT={status}')
+        # This record follows all application writes on the same TLS stream.
+        # Wait until OpenSSL has read it so q cannot hide a repeated payload.
+        server.event(f'MIRA-DRAIN-{status}')
+        server.send('q\n')
+        server.event('DONE')  # s_server flushes this acknowledgement before closing.
+        client.send('next\n')
+    client.finish()
+    output = server.finish()
+    assert 'No early data received' in output, output
+    assert 'Early data received:' in output, output
+    count = output.count('safe-tcp')
+    assert count == 1, f'应用载荷应恰好出现一次，实际 {count} 次：\n{output}'
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--peer', required=True, type=pathlib.Path)
@@ -108,15 +132,7 @@ def main():
             match = re.search(r':(\d+)\s*$', address)
             assert match, address
             with Process([str(args.peer), 'client', str(cert), match.group(1)]) as client:
-                server.event('No early data received')
-                server.send('ticket-ready\n')
-                client.event('CLIENT=not_attempted')
-                server.event('safe-tcp')
-                server.send('early-ready\n')
-                client.event('CLIENT=accepted')
-                client.finish()
-            output = server.finish()
-            assert output.count('safe-tcp') == 1, output
+                exchange_with_server(server, client)
         print('通过：Mira → s_server 原生早期数据接受，应用载荷只发送一次')
 
 

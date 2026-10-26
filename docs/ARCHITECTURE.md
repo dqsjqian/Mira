@@ -459,10 +459,10 @@ that just elapsed, so announcing the timeout would need a second budget the
 caller never granted — and a response written outside the caller's budget is
 the thing these options exist to prevent.
 
-Both windows default to zero, which disables them. That default is a
-compatibility choice, not a recommendation: it leaves a slow peer bounded by
-`limits` alone, which bounds one message's size and not the time it may take
-to arrive.
+Both windows default to 60 seconds. An explicit zero disables a window;
+callers allowing larger or slower transfers should adjust the request timeout
+alongside `limits`. Message-size limits and time bounds constrain different
+resources and do not replace each other.
 
 ## Current main-branch composition contracts
 
@@ -676,6 +676,9 @@ DNSKEY self-signatures and signed parent DS delegation. It supports algorithm
 queries/signature checks, and never trusts AD. Unknown algorithms, missing
 proof, wildcard expansion and negative answers fail closed. Trust anchors are
 replaced explicitly through trusted out-of-band policy, not RFC5011 learning.
+Queries age each answer and DNSKEY/DS evidence batch from its own receipt time,
+rounding elapsed time up and saturating exhausted TTLs at zero. Collecting
+validation evidence must not extend a response's cache lifetime.
 The default DNS component does not gain an OpenSSL dependency.
 
 `Mira::mqtt` covers MQTT 3.1.1 and 5.0 in three layers. The codec encodes and
@@ -783,7 +786,19 @@ not replace verification of a release candidate.
   security policy denied bind. The skip remains explicit; security enforcement
   was not changed. These are simulator, not physical-device, results. TLS early
   data has separate real OpenSSL client/server interoperability on the desktop.
-  File-transfer close/cancellation also passed ASan/UBSan Release verification.
+  The full 104-case protocol configuration also passed ASan/UBSan Release
+  verification on macOS. A separate DNSSEC-only configuration (TLS, WebSocket,
+  H2 and H3 disabled) passed its tests and installed-component isolation checks.
+  Additional file-transfer tests cover sparse offsets above 4 GiB and truncated
+  sources. Android also exercises test-only sendfile EINVAL/ENOSYS injection
+  before and after partial native progress, copy/native byte accounting, and
+  real EPIPE with thread signal-mask restoration and preservation of a pending
+  SIGPIPE. Error injection proves fallback control flow, not the availability
+  of every filesystem/provider; Windows sparse-file tests require native CI.
+  The Android shared-library transfer configuration also passed its real
+  sparse-file, EOF and SIGPIPE cases. Linker fault injection is enabled only
+  with a static core, because executable-level wrapping cannot intercept a
+  shared library's already-linked sendfile calls.
   Per-test evidence is produced by `scripts/ci/run_mobile_tests.py` under the
   selected build's `mobile-results/` directory. These local results do not
   replace subsequent CI on the exact committed revision.

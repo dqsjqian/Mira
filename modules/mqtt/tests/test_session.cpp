@@ -84,7 +84,7 @@ Publish publish(std::string topic, QoS qos, std::uint16_t id = 0, std::string_vi
 void outbound_aliases() {
     test::section("出站别名默认关闭、协商上限、分配复用和 LRU 替换");
     Broker broker;
-    Connack ack; ack.properties.topic_alias_maximum = 2;
+    Connack ack; ack.properties.topic_alias_maximum = std::uint16_t{2};
     auto disabled = connected(broker, {}, ack);
     CHECK(disabled.publish(publish("long/topic", QoS::at_most_once)).has_value());
     auto sent = broker.take(disabled);
@@ -109,17 +109,17 @@ void outbound_aliases() {
     CHECK(no_aliases.publish(publish("full/topic", QoS::at_most_once)).has_value());
     sent = broker.take(no_aliases);
     CHECK(sent.size() == 1 && std::get<Publish>(sent[0]).topic == "full/topic" && !std::get<Publish>(sent[0]).properties.topic_alias);
-    auto invalid = publish("full/topic", QoS::at_most_once); invalid.properties.topic_alias = 1;
+    auto invalid = publish("full/topic", QoS::at_most_once); invalid.properties.topic_alias = std::uint16_t{1};
     CHECK(no_aliases.publish(invalid).error() == MqttError::topic_alias_invalid);
-    invalid.properties.topic_alias = 0;
+    invalid.properties.topic_alias = std::uint16_t{0};
     CHECK(session.publish(invalid).error() == MqttError::topic_alias_invalid);
-    invalid.properties.topic_alias = 3;
+    invalid.properties.topic_alias = std::uint16_t{3};
     CHECK(session.publish(invalid).error() == MqttError::topic_alias_invalid);
     CHECK(disabled.publish(invalid).error() == Errc::not_supported);
     auto maximum_options = options; maximum_options.outbound_topic_alias_maximum = 65535;
-    auto maximum_ack = ack; maximum_ack.properties.topic_alias_maximum = 65535;
+    auto maximum_ack = ack; maximum_ack.properties.topic_alias_maximum = std::uint16_t{65535};
     auto maximum = connected(broker, maximum_options, maximum_ack);
-    invalid.properties.topic_alias = 65535;
+    invalid.properties.topic_alias = std::uint16_t{65535};
     CHECK(maximum.publish(invalid).has_value());
     invalid.topic.clear();
     CHECK(maximum.publish(invalid).has_value());
@@ -134,7 +134,7 @@ void outbound_aliases() {
 
     test::section("显式主题别名建立、替换、空主题解析与连接隔离");
     auto explicit_session = connected(broker, options, ack);
-    auto message = publish("explicit/topic", QoS::at_least_once); message.properties.topic_alias = 2;
+    auto message = publish("explicit/topic", QoS::at_least_once); message.properties.topic_alias = std::uint16_t{2};
     CHECK(explicit_session.publish(message).has_value());
     message.topic.clear();
     CHECK(explicit_session.publish(message).has_value());
@@ -150,7 +150,7 @@ void outbound_aliases() {
     auto independent = connected(broker, options, ack);
     message.topic.clear();
     CHECK(independent.publish(message).error() == MqttError::topic_alias_invalid);
-    message.properties.topic_alias = 1;
+    message.properties.topic_alias = std::uint16_t{1};
     CHECK(explicit_session.publish(message).error() == MqttError::topic_alias_invalid);
     message.topic = "bad/+";
     CHECK(!explicit_session.publish(message));
@@ -162,7 +162,7 @@ void outbound_aliases() {
     auto bounded = connected(broker, options, ack);
     CHECK(bounded.publish(publish("aaaa", QoS::at_most_once)).has_value());
     CHECK(bounded.publish(publish("bbbbb", QoS::at_most_once)).has_value());
-    message = publish("", QoS::at_most_once); message.properties.topic_alias = 1;
+    message = publish("", QoS::at_most_once); message.properties.topic_alias = std::uint16_t{1};
     CHECK(bounded.publish(message).error() == MqttError::topic_alias_invalid);
     message.topic = "oversized/topic";
     CHECK(bounded.publish(message).error() == Errc::limit_exceeded);
@@ -180,7 +180,7 @@ void outbound_aliases() {
     options.version = Version::v5; options.max_output = 1024;
     auto blocked = connected(broker, options, ack);
     CHECK(blocked.publish(publish("fill", QoS::at_most_once, 0, std::string(980, 'x'))).has_value());
-    message = publish("blocked/topic", QoS::at_most_once, 0, std::string(100, 'x')); message.properties.topic_alias = 2;
+    message = publish("blocked/topic", QoS::at_most_once, 0, std::string(100, 'x')); message.properties.topic_alias = std::uint16_t{2};
     CHECK(blocked.publish(message).error() == Errc::would_block);
     broker.take(blocked);
     message.topic.clear(); message.payload.clear();
@@ -191,7 +191,7 @@ void outbound_aliases() {
     CHECK(tight.publish(original).has_value());
     sent = broker.take(tight);
     CHECK(sent.size() == 1 && !std::get<Publish>(sent[0]).properties.topic_alias);
-    original.properties.topic_alias = 1;
+    original.properties.topic_alias = std::uint16_t{1};
     CHECK(tight.publish(original).error() == MqttError::packet_too_large);
     original.topic.clear();
     CHECK(tight.publish(original).error() == MqttError::topic_alias_invalid);
@@ -202,11 +202,11 @@ void alias_resume() {
     Broker broker;
     ClientOptions options; options.clean_start = false; options.client_id = "alias-session";
     options.outbound_topic_alias_maximum = 2;
-    Connack ack; ack.properties.topic_alias_maximum = 2;
+    Connack ack; ack.properties.topic_alias_maximum = std::uint16_t{2};
     auto session = connected(broker, options, ack);
-    auto first = publish("topic/original", QoS::at_least_once); first.properties.topic_alias = 2;
+    auto first = publish("topic/original", QoS::at_least_once); first.properties.topic_alias = std::uint16_t{2};
     const auto a = *session.publish(first);
-    auto reference = publish("", QoS::exactly_once); reference.properties.topic_alias = 2;
+    auto reference = publish("", QoS::exactly_once); reference.properties.topic_alias = std::uint16_t{2};
     const auto b = *session.publish(reference);
     const auto c = *session.publish(publish("topic/released", QoS::exactly_once));
     first.topic = "topic/reassigned"; first.qos = QoS::at_most_once;
@@ -224,8 +224,8 @@ void alias_resume() {
         CHECK(current->connect(0).has_value());
         broker.take(*current);
         ack.session_present = true;
-        ack.properties.topic_alias_maximum = 1;
-        ack.properties.receive_maximum = 1;
+        ack.properties.topic_alias_maximum = std::uint16_t{1};
+        ack.properties.receive_maximum = std::uint16_t{1};
         CHECK(broker.send(*current, ack).has_value());
         auto sent = broker.take(*current);
         CHECK(sent.size() == 2);
@@ -234,7 +234,7 @@ void alias_resume() {
             CHECK(resend.topic == "topic/original" && resend.packet_id == a && resend.dup && resend.properties.topic_alias == 1);
             CHECK(std::get<Ack>(sent[1]).packet_id == c && std::get<Ack>(sent[1]).type == PacketType::pubrel);
         }
-        reference.properties.topic_alias = 2;
+        reference.properties.topic_alias = std::uint16_t{2};
         CHECK(current->publish(reference).error() == MqttError::topic_alias_invalid);
         CHECK(broker.send(*current, Ack{PacketType::puback, a, reason::success, {}}).has_value());
         sent = broker.take(*current);

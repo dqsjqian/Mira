@@ -51,10 +51,10 @@ and lifecycle regressions. Evidence is scoped to its tested revision/configurati
 HTTP/2 and HTTP/3 are separate optional modules. Shared field vocabulary is in
 `http_common`; neither includes this module's HTTP/1 connection machinery.
 
-**A time bound that is on by default.** `ServerOptions::idle_timeout` and
-`request_timeout` exist and are forwarded, but both default to zero, which is
-off. A server exposed to the internet should set them; leaving them at the
-default bounds a slow peer by message size only.
+**A time bound that is on by default.** `ServerOptions::idle_timeout`,
+`ServerOptions::request_timeout` and `ClientOptions::request_timeout` default
+to 60 seconds. An explicit zero disables the corresponding window. Adjust
+the request timeout when increasing message limits for large or slow transfers.
 
 Upload sources may accept `OperationOptions` to receive the exchange's stop
 token and absolute deadline. Server handlers can accept the same options as a

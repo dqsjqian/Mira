@@ -203,7 +203,7 @@ auto client = Mira::tls::Context::client({
 | Idle window between requests | **Success** — closing a quiet keep-alive connection is its normal ending |
 | Request window mid-exchange | `Errc::timed_out`, connection closed |
 
-No 408 is sent: announcing it would require a second budget the caller never granted. Both windows default to off; internet-exposed services should set them explicitly.
+No 408 is sent: announcing it would require a second budget the caller never granted. Both windows default to 60 seconds; an explicit zero disables them. Adjust them for larger transfers.
 </details>
 
 ## 📋 Platform matrix
@@ -213,8 +213,8 @@ No 408 is sent: announcing it would require a second budget the caller never gra
 | macOS | kqueue | Base/TLS/H2/H3 runtime tests, ASan/UBSan, independent HTTP/3 curl and Retry interoperability |
 | Linux | epoll | GCC/Clang runtime tests, GCC ASan/UBSan, independent HTTP/3 curl and Retry interoperability |
 | Windows | IOCP | Native MSVC/MinGW base/TLS/H2/H3 tests; MSVC independent HTTP/3 curl and Retry interoperability |
-| iOS | kqueue | Host smoke and unsigned cross-build passed; no device run without a signing profile |
-| Android | epoll | Non-TLS module cross-build, **NDK 29+**; no device-runtime evidence |
+| iOS | kqueue | arm64 Simulator base/TLS/H2/H3/DNSSEC runtime passed; no physical-device run without a matching signing profile |
+| Android | epoll | arm64 Emulator base/TLS/H2/H3/DNSSEC runtime passed, **NDK 29+**; no physical-device evidence |
 
 CI also covers installed packages and dependency isolation, protocol fuzzing, MQTT/mosquitto interoperability, and official Autobahn client/server tests including compression. The Linux, macOS and Windows MSVC protocol jobs require independent HTTP/3 and Retry interoperability. Configurations without an independent HTTP3 curl, such as the sanitizer jobs, count the corresponding cases as skipped.
 

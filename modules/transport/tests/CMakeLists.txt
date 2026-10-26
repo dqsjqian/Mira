@@ -7,6 +7,17 @@ set_tests_properties(transport.dns_config PROPERTIES TIMEOUT 15)
 add_executable(mira_transfer_tests test_transfer.cpp)
 target_link_libraries(mira_transfer_tests PRIVATE Mira::transport Mira::warnings)
 target_include_directories(mira_transfer_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+get_target_property(mira_transfer_core_type mira_core TYPE)
+if((CMAKE_SYSTEM_NAME STREQUAL "Linux" OR ANDROID) AND
+   mira_transfer_core_type STREQUAL "STATIC_LIBRARY")
+    # --wrap only rewrites references at this link step. A shared core's
+    # sendfile calls were already linked and cannot reach these probes.
+    # Shared builds still run the real transfer, EOF and SIGPIPE cases.
+    target_compile_definitions(mira_transfer_tests PRIVATE
+        MIRA_TEST_WRAP_SENDFILE=1 _LARGEFILE64_SOURCE=1)
+    target_link_options(mira_transfer_tests PRIVATE
+        "LINKER:--wrap=sendfile" "LINKER:--wrap=sendfile64")
+endif()
 add_test(NAME transport.transfer COMMAND mira_transfer_tests)
 set_tests_properties(transport.transfer PROPERTIES TIMEOUT 60)
 
