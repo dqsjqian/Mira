@@ -204,18 +204,20 @@ jobs:
             mingw-w64-ucrt-x86_64-openssl
             mingw-w64-ucrt-x86_64-nghttp2
             mingw-w64-ucrt-x86_64-zlib
-            mingw-w64-ucrt-x86_64-python
-            mingw-w64-ucrt-x86_64-python-pip
-      - name: Install forgedeps into the selected MinGW Python
+      - name: Select the supported Python for the MinGW shell
+        # The MSYS2 UCRT64 interpreter lags the supported version, so drive the
+        # tooling with the interpreter installed by setup-python instead.
+        run: echo "MIRA_PYTHON=$(cygpath -u "$pythonLocation")/python.exe" >> "$GITHUB_ENV"
+      - name: Install forgedeps into the selected Python
         run: |
-          python -m pip install --break-system-packages -r requirements-build.txt
-          python -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
+          $MIRA_PYTHON -m pip install --break-system-packages -r requirements-build.txt
+          $MIRA_PYTHON -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
       - name: Configure with TLS and HTTP3
-        run: python scripts/ci/dependency_session.py -- cmake -S . -B build/mingw -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_DNSSEC=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON
+        run: $MIRA_PYTHON scripts/ci/dependency_session.py -- cmake -S . -B build/mingw -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_DNSSEC=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON
       - name: Build
-        run: python scripts/ci/dependency_session.py -- cmake --build build/mingw --parallel
+        run: $MIRA_PYTHON scripts/ci/dependency_session.py -- cmake --build build/mingw --parallel
       - name: Test
-        run: python scripts/ci/dependency_session.py -- ctest --no-tests=error --test-dir build/mingw --output-on-failure
+        run: $MIRA_PYTHON scripts/ci/dependency_session.py -- ctest --no-tests=error --test-dir build/mingw --output-on-failure
 
   # Coroutine frame lifetime is the easiest thing here to get subtly wrong and
   # the hardest to notice without a sanitizer. The event loop raises the
