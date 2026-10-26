@@ -88,6 +88,9 @@ def main(argv=None) -> int:
     parser.add_argument("--generator", help="CMake generator (default: Ninja if available)")
     parser.add_argument("--cmake-arg", action="append", default=[],
                         help="Extra -DNAME=VALUE passed to CMake")
+    parser.add_argument("--deps-home", type=Path, help="Shared ForgeDeps workspace")
+    parser.add_argument("--deps-environment", type=Path, help="Verify and reuse an existing dependency environment receipt")
+    parser.add_argument("--offline", action="store_true", help="Use only locked sources already in the shared workspace")
     args = parser.parse_args(argv)
 
     if args.mode == "clean":
@@ -151,27 +154,31 @@ def main(argv=None) -> int:
             return 1
         configure_cmd.append(extra)
 
-    print(f"[build] Configuring {build_type}")
-    run(configure_cmd)
-
-    # Build
-    print(f"[build] Building with {args.jobs} jobs")
-    run(["cmake", "--build", str(build_dir), "--parallel", str(args.jobs)])
-
-    # Test
+    configure_cmd += ["-DFORGEDEPS_PYTHON_EXECUTABLE=" + sys.executable,
+                      "-DMIRA_DEPENDENCY_CONFIGURATION=" + build_type]
+    if args.deps_home:
+        configure_cmd.append("-DFORGEDEPS_HOME=" + str(args.deps_home.resolve()))
+    if args.deps_environment:
+        configure_cmd.append("-DFORGEDEPS_ENVIRONMENT=" + str(args.deps_environment.resolve()))
+    commands = [configure_cmd,
+                ["cmake", "--build", str(build_dir), "--config", build_type, "--parallel", str(args.jobs)]]
     if not args.no_test:
-        print("[build] Running tests")
-        result = subprocess.run(
-            ["ctest", "--test-dir", str(build_dir), "--output-on-failure",
-             "--parallel", str(args.jobs)],
-        )
-        if result.returncode != 0:
-            print("[build] Some tests failed (UDP tests fail in sandboxed environments)",
-                  file=sys.stderr)
-            return result.returncode
-
+        commands.append(["ctest", "--test-dir", str(build_dir), "-C", build_type,
+                         "--output-on-failure", "--parallel", str(args.jobs)])
+    from forgedeps.build_kit.session import run_session
+    environment = dict(os.environ)
+    if args.offline:
+        environment["FORGEDEPS_OFFLINE"] = "1"
+    if args.deps_environment:
+        environment["FORGEDEPS_ENVIRONMENT"] = str(args.deps_environment.resolve())
+    if args.deps_home:
+        environment["FORGEDEPS_HOME"] = str(args.deps_home.resolve())
+    run_session(commands, env=environment,
+                receipts=[args.deps_environment] if args.deps_environment else (),
+                run_command=lambda command, env: run(command, env=env))
     print(f"[build] Complete: {build_dir}")
     return 0
+
 
 
 if __name__ == "__main__":

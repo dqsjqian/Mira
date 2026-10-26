@@ -296,8 +296,8 @@ Build H2/H3 after installing OpenSSL 3.5+ and setting `OPENSSL_ROOT_DIR`:
 
 ```bash
 python3 -m pip install -r requirements-build.txt
-python3 scripts/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
-cmake -S . -B build/protocols -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix" -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"
+python3 -m forgedeps init /path/to/shared-workspace
+python3 scripts/build.py --build-dir build/protocols --tls --http2 --http3
 cmake --build build/protocols -j
 ctest --test-dir build/protocols --output-on-failure
 "$OPENSSL_ROOT_DIR/bin/openssl" req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 2 -subj /CN=localhost -addext subjectAltName=DNS:localhost

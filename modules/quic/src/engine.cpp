@@ -29,7 +29,15 @@ constexpr int budget = -100001;
 Result<std::string> trust_fingerprint(SSL_CTX* context) {
     auto* store = SSL_CTX_get_cert_store(context);
     if (!store) return std::unexpected(quic_error(invalid));
-    const auto* objects = reinterpret_cast<const OPENSSL_STACK*>(X509_STORE_get0_objects(store));
+    const auto release_objects = [](STACK_OF(X509_OBJECT)* objects) {
+        OPENSSL_sk_pop_free(reinterpret_cast<OPENSSL_STACK*>(objects), [](void* object) {
+            X509_OBJECT_free(static_cast<X509_OBJECT*>(object));
+        });
+    };
+    std::unique_ptr<STACK_OF(X509_OBJECT), decltype(release_objects)> snapshot(
+        X509_STORE_get1_objects(store), release_objects);
+    if (!snapshot) return std::unexpected(quic_error(invalid));
+    const auto* objects = reinterpret_cast<const OPENSSL_STACK*>(snapshot.get());
     const auto count = OPENSSL_sk_num(objects);
     if (count <= 0) return std::unexpected(quic_error(invalid));
     using Digest = std::array<unsigned char, 32>;

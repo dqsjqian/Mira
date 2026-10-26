@@ -1,139 +1,98 @@
 #!/usr/bin/env python3
-"""Build a hash-pinned HTTP/3 curl in the repository build tree for independent tests.
-
-This is an explicit verification tool, never run by library configuration.
-The existing protocol dependency prefix and OpenSSL 3.5+ are prerequisites.
-"""
+"""Build a locked HTTP/3 curl artifact against an existing protocol environment."""
 from __future__ import annotations
-
 import argparse
+import json
 import os
-import shlex
-import sys
 from pathlib import Path
+import shlex
 import subprocess
-import tempfile
 
-from build_protocol_deps import extract, output_path, positive_jobs, run, sha256
+from forgedeps.artifacts import BuildRequest, Environment
+from forgedeps.environments import read_environment, write_environment
+from forgedeps.home import prepare_home
+from forgedeps.source_cache import fetch_archive
+from forgedeps.store import build_package
+from forgedeps.toolchains import probe_toolchain
+from forgerecipes import make_curl_recipe, recipe_input_files
+from forgerecipes.bindings import build_curl
+from build_protocol_deps import output_path, positive_jobs
 
-VERSION = "8.22.0"
-# SHA256 from the curl project's immutable GitHub release asset metadata.
-DIGEST = "f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7"
+VERSION = '8.22.0'
+DIGEST = 'f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7'
 REPO = Path(__file__).resolve().parents[2]
 
 
-def static_dependency(prefix, name, windows):
-    names = (f"{name}_static.lib", f"lib{name}_static.a", f"lib{name}.a") if windows else (f"lib{name}.a",)
-    for filename in names:
-        candidate = prefix / "lib" / filename
-        if candidate.is_file():
-            return candidate
-    raise ValueError(f"static {name} library not found in dependency prefix")
+def required_artifacts(environment, names):
+    all_artifacts = {}
+    def visit(item):
+        previous = all_artifacts.get(item.name)
+        if previous and previous != item:
+            raise ValueError('Conflicting protocol artifact: ' + item.name)
+        all_artifacts[item.name] = item
+        for dependency in item.requires:
+            visit(dependency)
+    for item in environment.artifacts:
+        visit(item)
+    missing = set(names) - set(all_artifacts)
+    if missing:
+        raise ValueError('Protocol environment is missing curl dependencies: ' + ', '.join(sorted(missing)))
+    return tuple(all_artifacts[name] for name in names)
 
 
-def configuration_arguments(args, prefix, openssl, install, windows):
-    options = [f"-DCMAKE_BUILD_TYPE={args.config}", f"-DCMAKE_TRY_COMPILE_CONFIGURATION={args.config}",
-               f"-DCMAKE_PREFIX_PATH={prefix};{openssl}", f"-DOPENSSL_ROOT_DIR={openssl}",
-               f"-DCMAKE_INSTALL_PREFIX={install}"]
-    if args.generator:
-        options += ["-G", args.generator]
-    if args.architecture:
-        options += ["-A", args.architecture]
-    if args.toolchain:
-        options += [f"-DCMAKE_TOOLCHAIN_FILE={args.toolchain.resolve().as_posix()}"]
-    if windows:
-        options += ["-DCURL_USE_PKGCONFIG=OFF", "-DCURL_USE_SCHANNEL=OFF",
-                    "-DCMAKE_C_FLAGS=-DNGTCP2_STATICLIB -DNGHTTP3_STATICLIB -DNGHTTP2_STATICLIB"]
-        for variable, library in (("NGTCP2_LIBRARY", "ngtcp2"),
-                                  ("NGTCP2_CRYPTO_OSSL_LIBRARY", "ngtcp2_crypto_ossl"),
-                                  ("NGHTTP3_LIBRARY", "nghttp3"), ("NGHTTP2_LIBRARY", "nghttp2")):
-            options += [f"-D{variable}={static_dependency(prefix, library, windows).as_posix()}"]
-        for library in ("NGTCP2", "NGHTTP3", "NGHTTP2"):
-            options += [f"-D{library}_INCLUDE_DIR={(prefix / 'include').as_posix()}"]
-    return options
-
-
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prefix", type=Path, default=REPO / "build/protocol-deps/prefix")
-    parser.add_argument("--openssl-root", type=Path, required=True)
-    parser.add_argument("--path", type=Path, default=REPO / "build/interop-curl")
-    parser.add_argument("--jobs", type=positive_jobs, default=4)
-    parser.add_argument("--offline", action="store_true")
-    parser.add_argument("--config", choices=("Debug", "Release", "RelWithDebInfo", "MinSizeRel"), default="Release")
-    parser.add_argument("--generator", "-G")
-    parser.add_argument("--architecture", "-A")
-    parser.add_argument("--toolchain", type=Path)
+    parser.add_argument('--environment', type=Path, required=True,
+                        help='Mira configure output forgedeps-environment.json')
+    parser.add_argument('--path', type=Path, default=REPO / 'build/interop-curl')
+    parser.add_argument('--home', type=Path)
+    parser.add_argument('--jobs', type=positive_jobs, default=4)
+    parser.add_argument('--offline', action='store_true')
     args = parser.parse_args()
-    if args.toolchain and not args.toolchain.is_file():
-        parser.error("--toolchain must name an existing file")
+    root = prepare_home(args.home)
     work = output_path(args.path)
-    prefix = args.prefix.resolve()
-    openssl = args.openssl_root.resolve()
-    if not (openssl / "include/openssl/ssl.h").is_file():
-        parser.error("--openssl-root must contain include/openssl/ssl.h")
-    if not (prefix / "include/ngtcp2/ngtcp2_crypto_ossl.h").is_file():
-        parser.error("--prefix must contain the built ngtcp2 ossl dependencies")
-    cache = work / "cache"
-    cache.mkdir(parents=True, exist_ok=True)
-    # curl uses underscore tags rather than the v<version> release convention.
-    archive = cache / f"curl-{VERSION}.tar.xz"
-    if archive.exists():
-        if archive.is_symlink() or not archive.is_file() or sha256(archive) != DIGEST:
-            raise ValueError("cached curl archive failed SHA256 verification")
-    elif args.offline:
-        raise ValueError(f"offline archive missing: {archive}")
-    else:
-        with tempfile.TemporaryDirectory(prefix="download-", dir=work) as temp:
-            candidate = Path(temp) / archive.name
-            tag = f"curl-{VERSION.replace('.', '_')}"
-            url = f"https://github.com/curl/curl/releases/download/{tag}/{archive.name}"
-            run(["curl", "-fL", "--retry", "2", "--connect-timeout", "30",
-                 "--max-time", "180", url, "-o", str(candidate)])
-            if sha256(candidate) != DIGEST:
-                raise ValueError("downloaded curl archive failed SHA256 verification")
-            candidate.replace(archive)
-    # The ngtcp2 ossl .pc file requires libssl. Make pkg-config use the same
-    # OpenSSL prefix as CMake, not the distro libssl (which may lack QUIC).
-    pkg_paths = [prefix / "lib/pkgconfig", openssl / "lib/pkgconfig",
-                 openssl / "lib64/pkgconfig"]
-    previous = os.environ.get("PKG_CONFIG_PATH", "")
-    os.environ["PKG_CONFIG_PATH"] = os.pathsep.join(
-        [str(path) for path in pkg_paths] + ([previous] if previous else []))
-    if os.name == "nt":
-        # Reused MSBuild nodes outlive the build and keep handles on its tree.
-        os.environ["MSBUILDDISABLENODEREUSE"] = "1"
-    # Cleanup runs after a successful install; a Windows process that still
-    # holds a handle in the scratch tree must not turn that success into a
-    # failure. Leftovers stay inside the ignored build directory.
-    with tempfile.TemporaryDirectory(prefix="source-", dir=work, ignore_cleanup_errors=True) as temp:
-        source = extract(archive, Path(temp), f"curl-{VERSION}")
-        build = Path(temp) / "build"
-        install = work / "prefix"
-        extra = []
-        if sys.platform.startswith("linux") and (openssl / "lib/libssl.a").is_file():
-            # curl's raw NGTCP2 library list has no CMake dependency edge to
-            # OpenSSL. GNU ld needs the static TLS archives after that adapter,
-            # not only in curl's earlier TLS list. Standard libraries are last.
-            tls_tail = " ".join(shlex.quote(str(openssl / "lib" / name))
-                                for name in ("libssl.a", "libcrypto.a"))
-            extra.append(f"-DCMAKE_C_STANDARD_LIBRARIES={tls_tail} -ldl -pthread")
-        run(["cmake", "-S", str(source), "-B", str(build),
-             *configuration_arguments(args, prefix, openssl, install, os.name == "nt"),
-             "-DCURL_USE_OPENSSL=ON", "-DUSE_NGTCP2=ON", "-DUSE_NGHTTP2=ON",
-             "-DBUILD_SHARED_LIBS=OFF", "-DBUILD_STATIC_LIBS=ON", "-DBUILD_STATIC_CURL=ON",
-             "-DBUILD_TESTING=OFF", "-DBUILD_LIBCURL_DOCS=OFF", "-DBUILD_MISC_DOCS=OFF",
-             "-DCURL_USE_LIBPSL=OFF", "-DCURL_USE_LIBSSH2=OFF",
-             "-DCURL_BROTLI=OFF", "-DCURL_ZSTD=OFF", *extra])
-        run(["cmake", "--build", str(build), "--config", args.config, "--parallel", str(args.jobs)])
-        run(["cmake", "--install", str(build), "--config", args.config])
-    binary = install / "bin" / ("curl.exe" if os.name == "nt" else "curl")
-    version = subprocess.check_output([str(binary), "--version"], text=True, timeout=10)
-    print(version)
-    if "HTTP3" not in version:
-        raise RuntimeError("built curl lacks HTTP3 support")
-    print(f"HTTP/3 interop client: {binary}")
+    environment = read_environment(args.environment)
+    recipe = make_curl_recipe(cli=True, http2=True, http3=True)
+    requires = required_artifacts(environment, recipe.requires)
+    with environment.lease():
+        # The read lease verifies manifests before their recorded toolchain is
+        # used. Reprobe those compiler/ABI inputs; never replace the dependencies.
+        dependency = next(item for item in requires if item.name == 'ngtcp2')
+        previous = json.loads(dependency.manifest.read_text(encoding='utf-8'))['inputs']['target']
+        settings = previous['cmake']
+        option_names = ('CMAKE_C_FLAGS', 'CMAKE_CXX_FLAGS', 'CMAKE_EXE_LINKER_FLAGS',
+                        'CMAKE_SHARED_LINKER_FLAGS', 'CMAKE_STATIC_LINKER_FLAGS',
+                        'CMAKE_OSX_ARCHITECTURES', 'CMAKE_OSX_SYSROOT', 'CMAKE_OSX_DEPLOYMENT_TARGET',
+                        'CMAKE_SYSROOT', 'CMAKE_MSVC_RUNTIME_LIBRARY')
+        options = [f'-D{name}={settings[name]}' for name in option_names if name in settings]
+        options.extend(recipe.options)
+        options.append('-DCMAKE_INSTALL_LIBDIR=lib')
+        quote = subprocess.list2cmdline if os.name == 'nt' else shlex.join
+        compiler = lambda key: quote([previous[key]['path'], *previous[key].get('arguments', [])])
+        target = probe_toolchain(configuration=previous['configuration'],
+            c=compiler('c'), cxx=compiler('cxx'), toolchain=settings.get('CMAKE_TOOLCHAIN_FILE'),
+            cmake_options=options, environment=previous['environment'], home=root)
+        source = fetch_archive('curl', VERSION,
+            f'https://github.com/curl/curl/releases/download/curl-{VERSION.replace(".", "_")}/curl-{VERSION}.tar.xz',
+            DIGEST, root / 'downloads/curl', offline=args.offline)
+        request = BuildRequest(name='curl', source=Path(source['source_dir']), builder=build_curl,
+            recipe_input_files=recipe_input_files('curl'), target=target,
+            options={'cmake_options': options}, environment=target['environment'], requires=requires,
+            artifacts=(*recipe.artifacts, 'bin/curl.exe' if os.name == 'nt' else 'bin/curl'),
+            license_files=recipe.license_files, jobs=args.jobs, configuration=previous['configuration'])
+        artifact = build_package(request, home=root)
+    result = Environment((artifact,))
+    with result.lease():
+        write_environment(work / 'environment.json', result)
+        binary = artifact.prefix / 'bin' / ('curl.exe' if os.name == 'nt' else 'curl')
+        version = subprocess.check_output([str(binary), '--version'], text=True, timeout=10)
+        if 'HTTP3' not in version:
+            raise RuntimeError('Built curl lacks HTTP3 support')
+        work.mkdir(parents=True, exist_ok=True)
+        (work / 'binary.txt').write_text(str(binary) + '\n', encoding='utf-8')
+        print(version)
+        print(f'HTTP/3 interop client: {binary}')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

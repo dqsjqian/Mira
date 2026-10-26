@@ -37,6 +37,8 @@ option(MIRA_ENABLE_WEBSOCKET "Build WebSocket (OpenSSL Crypto and zlib for optio
 option(MIRA_ENABLE_HTTP2 "Build the optional nghttp2 HTTP/2 module" OFF)
 option(MIRA_ENABLE_HTTP3 "Build the optional QUIC and HTTP/3 modules" OFF)
 
+include(cmake/SharedDependencies.cmake)
+
 # Off by default when embedded: a project that pulls Mira in via
 # add_subdirectory() has not asked to install our headers alongside its own.
 option(MIRA_INSTALL "Generate install and package-config rules"

@@ -1,1 +1,3 @@
-aria-deps @ git+https://github.com/dqsjqian/AriaDeps.git@v0.3.0
+# Install with the same interpreter used for the build entry point.
+forgedeps @ git+https://github.com/dqsjqian/ForgeDeps.git@56c1f51c31560900a08b3a61eadc31e37aec06da
+forgerecipes @ git+https://github.com/dqsjqian/ForgeRecipes.git@102d8f068bd113ee60a7da978b1273be58b22ead

@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+from forgedeps.environments import read_environment
 from pathlib import Path
 import subprocess
 import tempfile
@@ -123,13 +124,15 @@ static_assert(std::string_view{{MIRA_VERSION_STRING}} == "{version}");
                           ('CMAKE_GENERATOR_TOOLSET', '-T')]:
             if cache.get(key):
                 common.extend([flag, cache[key]])
-        prefixes = str(prefix) + ';' + cache.get('CMAKE_PREFIX_PATH', '')
+        receipt = build / 'forgedeps-environment.json'
+        shared = read_environment(receipt).prefixes if receipt.is_file() else ()
+        prefixes = ';'.join([str(prefix), *map(str, shared), cache.get('CMAKE_PREFIX_PATH', '')])
         common.extend(['-DCMAKE_PREFIX_PATH=' + prefixes,
                        '-DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF',
                        '-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF'])
         def case(name, find, *, source=None, links='transport http',
                  checks='', hidden=False, success=True, diagnostic=None, disabled=(),
-                 requested_version=''):
+                 requested_version='', prelude=''):
             directory = root / name
             directory.mkdir()
             # Isolation is a property of each test project. Some intentionally
@@ -146,7 +149,7 @@ static_assert(std::string_view{{MIRA_VERSION_STRING}} == "{version}");
                 openssl_root = Path(cache['OPENSSL_ROOT_DIR']).as_posix()
                 settings += f'set(OPENSSL_ROOT_DIR [==[{openssl_root}]==])\n'
             text = ('cmake_minimum_required(VERSION 3.21)\n'
-                    'project(consumer LANGUAGES CXX)\n' + settings +
+                    'project(consumer LANGUAGES CXX)\n' + prelude + settings +
                     f'find_package(Mira {requested_version} REQUIRED {find})\n' + checks + '\n')
             if source:
                 (directory / 'main.cpp').write_text(version_checks + source, encoding='utf-8')
@@ -196,6 +199,14 @@ endforeach()
             f'  message(FATAL_ERROR "Installed component not loaded {component}")\nendif()'
             for component in installed)
         case('all', '', source=BASE_SOURCE, checks=checks)
+        if 'tls' in installed:
+            case('parent-tls-targets', 'COMPONENTS tls',
+                 prelude='find_package(OpenSSL 3.0 REQUIRED COMPONENTS SSL Crypto)\n',
+                 disabled=('OpenSSL',), checks='if(NOT TARGET Mira::tls)\n'
+                 'message(FATAL_ERROR "Parent TLS targets were not reused")\nendif()')
+            case('parent-partial-tls-targets', 'COMPONENTS tls',
+                 prelude='add_library(OpenSSL::Crypto INTERFACE IMPORTED)\n',
+                 success=False, diagnostic='incomplete OpenSSL target set')
         if 'http2' in installed:
             case('h2-link', 'COMPONENTS http2', links='http2', source='''
 #include <mira/http2/session.hpp>

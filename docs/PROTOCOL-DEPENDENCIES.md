@@ -1,13 +1,40 @@
 # Protocol dependency maintenance
 
 Mira pins source versions, Git revisions and SHA256 hashes in
-`scripts/protocol-dependencies.json`. The build recipes in
-`scripts/_recipes/__init__.py` use the same records. CMake does not download
-dependencies; `scripts/ci/build_protocol_deps.py` verifies and builds the archives.
+`scripts/protocol-dependencies.json`. Library builders and patches come from
+[ForgeRecipes](https://github.com/dqsjqian/ForgeRecipes). Mira keeps only module
+selection in `scripts/ci/protocol_config.py`.
 
-Dependency resolution, source preparation and transactional prefix installation
-use the shared [AriaDeps](https://github.com/dqsjqian/AriaDeps) package, pinned by
-`requirements-build.txt`. Mira owns its protocol recipes and feature choices.
+[ForgeDeps](https://github.com/dqsjqian/ForgeDeps) owns source workspaces, target
+identities and one current installed artifact per library/target. CMake prepares
+only enabled dependencies with its actual compiler, configuration and ABI flags.
+The build directory contains `forgedeps-environment.json`, not a merged third-party
+prefix. OpenSSL is part of the locked dependency graph; an arbitrary
+`OPENSSL_ROOT_DIR` cannot replace that library. A host OpenSSL executable may
+still be used as an independent certificate-generation or interoperability tool.
+
+Install `requirements-build.txt`, initialize a shared workspace once, and use:
+
+```sh
+python -m forgedeps init /path/to/shared-workspace
+python scripts/build.py --tls --websocket --http2 --http3
+```
+
+The build runner holds artifact leases across configuration, compilation and
+tests. Raw CI commands use `scripts/ci/dependency_session.py`; it discovers
+receipts from build directories and reruns configuration while holding the
+selected generations. `--offline` requires already verified source inputs.
+
+The independent HTTP/3 curl is also a shared artifact, built with the exact
+protocol artifact references from the consumer's environment:
+
+```sh
+python scripts/ci/build_interop_curl.py --environment build/protocols/forgedeps-environment.json
+```
+
+Its executable path is recorded in `build/interop-curl/binary.txt`; its own
+`environment.json` retains all transitive generations for leased test commands.
+
 For any required third-party capability, first verify the latest upstream
 release. If a reproducible defect remains, maintain a focused fork with a
 failing-upstream regression, supported-platform CI, immutable releases and a

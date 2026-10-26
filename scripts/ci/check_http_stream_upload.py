@@ -19,12 +19,12 @@ def certificates(directory, openssl):
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     for name in ("ca", "unrelated"):
-        run("req", "-config", str(config), "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+        run("req", "-sha256", "-config", str(config), "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
             "-pkeyopt", "ec_param_enc:named_curve",
             "-nodes", "-keyout", f"{name}.key", "-out", f"{name}.pem", "-days", "1",
             "-subj", f"/CN=Mira {name}", "-addext", "basicConstraints=critical,CA:TRUE",
             "-addext", "keyUsage=critical,keyCertSign,cRLSign")
-    run("req", "-config", str(config), "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+    run("req", "-sha256", "-config", str(config), "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
         "-pkeyopt", "ec_param_enc:named_curve",
         "-nodes", "-keyout", "server.key", "-out", "server.csr", "-subj", "/CN=localhost")
     extension = directory / "server.ext"
@@ -32,7 +32,7 @@ def certificates(directory, openssl):
                          "keyUsage=critical,digitalSignature\n"
                          "extendedKeyUsage=serverAuth\n"
                          "subjectAltName=DNS:localhost,IP:127.0.0.1\n", encoding="ascii")
-    run("x509", "-req", "-in", "server.csr", "-CA", "ca.pem", "-CAkey", "ca.key",
+    run("x509", "-sha256", "-req", "-in", "server.csr", "-CA", "ca.pem", "-CAkey", "ca.key",
         "-CAcreateserial", "-out", "server.pem", "-days", "1", "-extfile", "server.ext")
 
 

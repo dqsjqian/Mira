@@ -1,0 +1,68 @@
+# Select only dependencies required by enabled Mira modules. The generic bridge
+# records exact compiler/configuration identities and shared artifact generations.
+set(_mira_dependencies)
+if(MIRA_ENABLE_TLS OR MIRA_ENABLE_DNSSEC OR MIRA_ENABLE_WEBSOCKET OR MIRA_ENABLE_HTTP3)
+    list(APPEND _mira_dependencies openssl)
+endif()
+if(MIRA_ENABLE_WEBSOCKET)
+    list(APPEND _mira_dependencies zlib)
+endif()
+if(MIRA_ENABLE_HTTP2)
+    list(APPEND _mira_dependencies nghttp2)
+endif()
+if(MIRA_ENABLE_HTTP3)
+    list(APPEND _mira_dependencies nghttp3 ngtcp2)
+endif()
+if(NOT _mira_dependencies)
+    return()
+endif()
+if(FORGEDEPS_PYTHON_EXECUTABLE)
+    set(Python3_EXECUTABLE "${FORGEDEPS_PYTHON_EXECUTABLE}")
+elseif(DEFINED ENV{FORGEDEPS_PYTHON_EXECUTABLE})
+    set(Python3_EXECUTABLE "$ENV{FORGEDEPS_PYTHON_EXECUTABLE}")
+endif()
+find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+set(ForgeDeps_PYTHON_EXECUTABLE "${Python3_EXECUTABLE}")
+execute_process(COMMAND "${Python3_EXECUTABLE}" -m forgedeps cmake-dir
+    RESULT_VARIABLE _mira_package_result OUTPUT_VARIABLE _mira_package_dir
+    ERROR_VARIABLE _mira_package_error OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT _mira_package_result EQUAL 0)
+    message(FATAL_ERROR "Install Mira requirements-build.txt with ${Python3_EXECUTABLE}: ${_mira_package_error}")
+endif()
+include("${_mira_package_dir}/ForgeDeps.cmake")
+set(_mira_dependency_configuration "${CMAKE_BUILD_TYPE}")
+if(NOT _mira_dependency_configuration)
+    set(MIRA_DEPENDENCY_CONFIGURATION Release CACHE STRING "Shared dependency configuration for multi-config generators")
+    set(_mira_dependency_configuration "${MIRA_DEPENDENCY_CONFIGURATION}")
+endif()
+string(JOIN "," _mira_dependency_selection ${_mira_dependencies})
+set(_mira_offline)
+if(DEFINED ENV{FORGEDEPS_OFFLINE} AND NOT "$ENV{FORGEDEPS_OFFLINE}" STREQUAL "0")
+    set(_mira_offline OFFLINE)
+endif()
+if(FORGEDEPS_HOME)
+    list(APPEND _mira_offline HOME "${FORGEDEPS_HOME}")
+endif()
+forgedeps_environment(${_mira_offline} FILE "${CMAKE_CURRENT_LIST_DIR}/../scripts/protocol-dependencies.json"
+    PROJECT_CONFIG "${CMAKE_CURRENT_LIST_DIR}/../scripts/ci/protocol_config.py"
+    ONLY "${_mira_dependency_selection}" PROFILE mira
+    CONFIGURATION "${_mira_dependency_configuration}"
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/forgedeps-environment.json"
+    PREFIXES _mira_dependency_prefixes)
+
+# Pin library discovery to the selected graph even if the calling shell exposes
+# a different host OpenSSL installation for its command-line test executable.
+file(READ "${CMAKE_CURRENT_BINARY_DIR}/forgedeps-environment.json" _mira_environment)
+string(JSON _mira_ref_count LENGTH "${_mira_environment}" refs)
+math(EXPR _mira_last_ref "${_mira_ref_count} - 1")
+foreach(_index RANGE 0 ${_mira_last_ref})
+    string(JSON _name GET "${_mira_environment}" refs ${_index} name)
+    string(JSON _prefix GET "${_mira_environment}" refs ${_index} prefix)
+    if(_name STREQUAL "openssl")
+        set(OPENSSL_ROOT_DIR "${_prefix}")
+        set(OPENSSL_USE_STATIC_LIBS TRUE)
+    elseif(_name STREQUAL "zlib")
+        set(ZLIB_ROOT "${_prefix}")
+        set(ZLIB_USE_STATIC_LIBS TRUE)
+    endif()
+endforeach()

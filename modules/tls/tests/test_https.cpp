@@ -86,16 +86,18 @@ Certificate generate_certificate(EVP_PKEY* key,
     require(X509_gmtime_adj(X509_getm_notBefore(certificate.get()), -3600) != nullptr);
     require(X509_gmtime_adj(X509_getm_notAfter(certificate.get()), 86400) != nullptr);
     require(X509_set_pubkey(certificate.get(), key) == 1);
-    X509_NAME* subject = X509_get_subject_name(certificate.get());
-    require(X509_NAME_add_entry_by_txt(subject,
+    std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> subject{X509_NAME_new(), X509_NAME_free};
+    require(subject != nullptr);
+    require(X509_NAME_add_entry_by_txt(subject.get(),
                                        "CN",
                                        MBSTRING_ASC,
                                        reinterpret_cast<const unsigned char*>(common_name.data()),
                                        static_cast<int>(common_name.size()),
                                        -1,
                                        0) == 1);
+    require(X509_set_subject_name(certificate.get(), subject.get()) == 1);
     require(X509_set_issuer_name(certificate.get(),
-                                 issuer != nullptr ? X509_get_subject_name(issuer) : subject) == 1);
+                                 issuer != nullptr ? X509_get_subject_name(issuer) : subject.get()) == 1);
     X509* authority = issuer != nullptr ? issuer : certificate.get();
     extension(certificate.get(),
               authority,
@@ -145,8 +147,12 @@ std::vector<std::byte> generate_ocsp(X509* subject, X509* issuer, X509* signer, 
         produced_offset == 0 ? 0UL : OCSP_NOTIME) == 1);
     if (corrupt_signature) {
         auto* signature = const_cast<ASN1_OCTET_STRING*>(OCSP_resp_get0_signature(basic.get()));
-        require(signature && signature->length > 0);
-        signature->data[0] ^= 1;
+        require(signature && ASN1_STRING_length(signature) > 0);
+        const auto size = ASN1_STRING_length(signature);
+        const auto* data = ASN1_STRING_get0_data(signature);
+        std::vector<unsigned char> corrupt(data, data + size);
+        corrupt[0] ^= 1;
+        require(ASN1_STRING_set(signature, corrupt.data(), size) == 1);
     }
     std::unique_ptr<OCSP_RESPONSE, decltype(&OCSP_RESPONSE_free)> response{
         OCSP_response_create(OCSP_RESPONSE_STATUS_SUCCESSFUL, basic.get()), OCSP_RESPONSE_free};

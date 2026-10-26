@@ -4,6 +4,14 @@ Version source, compatibility policy and consumption instructions are maintained
 in the [release guide](docs/RELEASES.md). Version headings below are historical
 records; they are not additional definitions of the current build version.
 
+## Unreleased
+
+- Build optional protocol dependencies through the shared ForgeDeps artifact
+  store and external ForgeRecipes, including locked OpenSSL and installed SDKs.
+- Hold dependency generations across builds, tests and independent HTTP/3 curl
+  interoperability. Keep application source and dependency artifacts separate.
+- Support OpenSSL 4 certificate APIs while retaining OpenSSL 3.5 QUIC support.
+
 ## [1.2.0] - 2026-10-26
 
 ### Added

@@ -154,10 +154,12 @@ struct CertificateFiles {
         require(X509_gmtime_adj(X509_getm_notBefore(cert.get()), -3600) != nullptr);
         require(X509_gmtime_adj(X509_getm_notAfter(cert.get()), 86400) != nullptr);
         require(X509_set_pubkey(cert.get(), private_key.get()) == 1);
-        auto* name = X509_get_subject_name(cert.get());
-        require(X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+        std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> name{X509_NAME_new(), X509_NAME_free};
+        require(name != nullptr);
+        require(X509_NAME_add_entry_by_txt(name.get(), "CN", MBSTRING_ASC,
                     reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0) == 1);
-        require(X509_set_issuer_name(cert.get(), name) == 1);
+        require(X509_set_subject_name(cert.get(), name.get()) == 1);
+        require(X509_set_issuer_name(cert.get(), name.get()) == 1);
         X509V3_CTX ext_context{};
         X509V3_set_ctx(&ext_context, cert.get(), cert.get(), nullptr, nullptr, 0);
         std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)> ext(

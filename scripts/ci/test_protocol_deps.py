@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 import build_protocol_deps as deps
-from aria_deps import deps_build as pipeline
+from forgedeps import deps_build as pipeline
 import build_interop_curl as interop
 from types import SimpleNamespace
 
@@ -23,45 +23,55 @@ class ProtocolMigrationTests(unittest.TestCase):
         with mock.patch.object(pipeline.urllib.request, 'urlopen', side_effect=AssertionError('network')):
             resolution = pipeline.read_resolved(lock)
             locked = pipeline.locked_recipes(resolution, recipes)
-        self.assertEqual({dep.name for dep in locked}, {'nghttp2', 'nghttp3', 'ngtcp2'})
+        self.assertEqual({dep.name for dep in locked}, {'openssl', 'zlib', 'nghttp2', 'nghttp3', 'ngtcp2'})
         for actual, expected in zip(locked, recipes):
-            self.assertEqual(actual.version, expected.version)
-            self.assertEqual(actual.sha256, expected.sha256)
+            if expected.version:
+                self.assertEqual(actual.version, expected.version)
+                self.assertEqual(actual.sha256, expected.sha256)
 
-    def test_cli_preserves_openssl_toolchain_generator_architecture_and_configuration(self):
+    def test_cli_records_shared_environment_and_preserves_build_settings(self):
+        from forgedeps.artifacts import Environment
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            ssl = root / 'ssl'
-            (ssl / 'include/openssl').mkdir(parents=True)
-            (ssl / 'include/openssl/ssl.h').write_text('fixture')
             toolchain = root / 'toolchain.cmake'
             toolchain.write_text('# fixture')
             argv = ['build_protocol_deps.py', '--path', str(root / 'work'),
-                    '--openssl-root', str(ssl), '--toolchain', str(toolchain),
+                    '--toolchain', str(toolchain), '--home', str(root),
                     '--generator', 'Visual Studio 18 2026', '--architecture', 'x64',
                     '--config', 'Debug', '--offline']
             seen = {}
-            def install(*args, **kwargs):
+            def build(*args, **kwargs):
                 seen.update(kwargs)
                 seen['generator'] = os.environ.get('CMAKE_GENERATOR')
                 seen['platform'] = os.environ.get('CMAKE_GENERATOR_PLATFORM')
                 self.assertEqual(args[0], deps.REPO / 'scripts/protocol-dependencies.json')
+                return Environment(())
             with mock.patch.object(deps.sys, 'argv', argv), \
                     mock.patch.dict(os.environ, {'CMAKE_GENERATOR': 'Ninja'}, clear=False), \
-                    mock.patch.object(pipeline, 'install', side_effect=install):
+                    mock.patch.object(deps, 'build_environment', side_effect=build):
                 deps.main()
                 self.assertEqual(os.environ['CMAKE_GENERATOR'], 'Ninja')
-            self.assertEqual(seen['build_config'], 'Debug')
-            self.assertEqual(seen['toolchain'], str(toolchain.resolve()))
+            self.assertEqual(seen['configuration'], 'Debug')
+            self.assertEqual(seen['toolchain'], toolchain.resolve())
             self.assertEqual(seen['generator'], 'Visual Studio 18 2026')
             self.assertEqual(seen['platform'], 'x64')
-            self.assertIn('-DOPENSSL_ROOT_DIR=' + ssl.resolve().as_posix(), seen['cmake_options'])
+            self.assertEqual(seen['only'], deps.PROTOCOLS)
             self.assertTrue(seen['offline'])
+            self.assertTrue((root / 'work/environment.json').is_file())
+
+    def test_untracked_system_openssl_is_rejected_before_build(self):
+        with mock.patch.object(deps.sys, 'argv', ['build_protocol_deps.py', '--openssl-root', '/system/ssl']), \
+                mock.patch.object(deps, 'build_environment') as build:
+            with self.assertRaises(SystemExit):
+                deps.main()
+            build.assert_not_called()
 
     def test_windows_recipes_require_real_static_libraries(self):
         with mock.patch.object(deps.sys, 'platform', 'win32'):
             recipes = deps.make_config().recipes
         for recipe in recipes:
+            if recipe.name not in ('nghttp2', 'nghttp3', 'ngtcp2'):
+                continue
             self.assertIn('-DSTATIC_LIB_SUFFIX=_static', recipe.options)
             self.assertIn('-DENABLE_LIB_ONLY=ON', recipe.options)
             self.assertIn('-DBUILD_TESTING=OFF', recipe.options)
@@ -76,33 +86,21 @@ class ProtocolMigrationTests(unittest.TestCase):
 
 
 class InteropConfigurationTests(unittest.TestCase):
-    def test_configuration_and_dependency_paths(self):
-        args = SimpleNamespace(config="Debug", generator="Visual Studio 17 2022",
-                               architecture="x64", toolchain=Path("toolchain.cmake"))
-        with mock.patch.object(Path, "is_file", return_value=True):
-            flags = interop.configuration_arguments(args, Path("deps"), Path("ssl"), Path("out"), True)
-        self.assertIn("-DCMAKE_BUILD_TYPE=Debug", flags)
-        self.assertIn("-DCMAKE_TRY_COMPILE_CONFIGURATION=Debug", flags)
-        self.assertIn("Visual Studio 17 2022", flags)
-        self.assertIn("x64", flags)
-        self.assertIn("-DCURL_USE_SCHANNEL=OFF", flags)
-        self.assertIn("-DNGTCP2_CRYPTO_OSSL_LIBRARY=deps/lib/ngtcp2_crypto_ossl_static.lib", flags)
-        self.assertIn("-DNGHTTP3_LIBRARY=deps/lib/nghttp3_static.lib", flags)
-        self.assertTrue(any(item.startswith("-DCMAKE_TOOLCHAIN_FILE=") for item in flags))
+    def test_existing_artifact_graph_is_required_without_rebuilding_dependencies(self):
+        from forgedeps.artifacts import Artifact, Environment
+        ssl = Artifact('openssl', 'target', Path('/ssl'), 'ssl-fingerprint', 'ssl-generation')
+        tcp = Artifact('ngtcp2', 'target', Path('/tcp'), 'tcp-fingerprint', 'tcp-generation', (ssl,))
+        result = interop.required_artifacts(Environment((tcp,)), ('openssl', 'ngtcp2'))
+        self.assertEqual(result, (ssl, tcp))
+        with self.assertRaisesRegex(ValueError, 'missing curl dependencies: nghttp3'):
+            interop.required_artifacts(Environment((tcp,)), ('nghttp3',))
 
-    def test_mingw_archive_fallback_and_missing_library(self):
-        with mock.patch.object(Path, "is_file", lambda path: path.name == "libngtcp2_static.a"):
-            self.assertEqual(interop.static_dependency(Path("deps"), "ngtcp2", True),
-                             Path("deps/lib/libngtcp2_static.a"))
-        with mock.patch.object(Path, "is_file", return_value=False):
-            with self.assertRaises(ValueError):
-                interop.static_dependency(Path("deps"), "ngtcp2", True)
-
-    def test_posix_keeps_native_dependency_discovery(self):
-        args = SimpleNamespace(config="Release", generator=None, architecture=None, toolchain=None)
-        flags = interop.configuration_arguments(args, Path("deps"), Path("ssl"), Path("out"), False)
-        self.assertIn("-DCMAKE_BUILD_TYPE=Release", flags)
-        self.assertFalse(any("STATICLIB" in item or "SCHANNEL" in item for item in flags))
+    def test_conflicting_dependency_generations_are_rejected(self):
+        from forgedeps.artifacts import Artifact, Environment
+        first = Artifact('openssl', 'target', Path('/ssl'), 'first', 'first')
+        second = Artifact('openssl', 'target', Path('/ssl'), 'second', 'second')
+        with self.assertRaisesRegex(ValueError, 'Conflicting protocol artifact: openssl'):
+            interop.required_artifacts(Environment((first, second)), ('openssl',))
 
 
 class ProtocolLicenseTests(unittest.TestCase):
