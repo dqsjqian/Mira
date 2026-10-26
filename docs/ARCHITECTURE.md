@@ -606,10 +606,11 @@ business-transaction exactly-once or Retry token single-use enforcement.
 Set `Limits::enable_connect_protocol` explicitly. A client waits for actual
 peer `SETTINGS_ENABLE_CONNECT_PROTOCOL` before submitting `request_stream`
 with `:method=CONNECT`, `:protocol`, `:scheme`, `:authority` and `:path`.
-Servers accept using `respond_stream`. Successful 2xx establishes a tunnel,
-except status 204: pinned nghttp2/nghttp3 treat it as bodyless, so Mira returns
-`not_supported` rather than claiming a usable tunnel. Ordinary CONNECT proxying
-is not implemented. Tunnel consumption returns flow-control credit; unread and
+Servers accept using `respond_stream`. Successful 2xx, including 204, establishes
+a tunnel with the pinned maintenance forks. The libraries expose
+`NGHTTP2_HAS_CONNECT_2XX_TUNNEL` / `NGHTTP3_HAS_CONNECT_2XX_TUNNEL`; builds using
+upstream libraries without this capability still return `not_supported` for 204.
+Status codes are preserved. Ordinary CONNECT proxying is not implemented. Tunnel consumption returns flow-control credit; unread and
 retained output remain bounded. FIN and RESET stay distinct terminal states.
 
 `http2::ConnectStream<Driver>` / `http3::ConnectStream<Driver>` borrow accepted

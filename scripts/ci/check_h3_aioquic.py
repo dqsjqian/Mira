@@ -2,7 +2,8 @@
 """Independent QUIC/TLS/QPACK stack: aioquic 1.3.0 vs a Mira loopback peer.
 
 Checks plain H3, accepted early GET, rejected early GET with 1-RTT fallback,
-and RFC 9220 WebSocket Extended CONNECT binary/control/close exchanges.
+and RFC 9220 WebSocket Extended CONNECT binary/control/close and half-close
+exchanges with status 200 and, when the dependency supports it, raw status 204.
 No certificate verification bypass; missing aioquic fails, never passes/skips.
 """
 from __future__ import annotations
@@ -12,6 +13,7 @@ import json
 import sys
 from pathlib import Path
 import queue
+import re
 import struct
 import subprocess
 import threading
@@ -45,6 +47,7 @@ class Peer(QuicConnectionProtocol):
                 for name in ("head", "end"):
                     if not state[name].done():
                         state[name].set_exception(RuntimeError(f"QUIC closed: {event.error_code} {event.reason_phrase}"))
+                state["changed"].set()
         for item in self.h3.handle_event(event):
             state = self.requests.get(item.stream_id)
             if state is None:
@@ -55,21 +58,24 @@ class Peer(QuicConnectionProtocol):
                     state["head"].set_result(None)
             if isinstance(item, DataReceived):
                 state["body"].extend(item.data)
+                state["changed"].set()
                 if len(state["body"]) > 1024 * 1024:
                     raise RuntimeError("response capacity exceeded")
             if item.stream_ended and not state["end"].done():
                 state["end"].set_result(None)
+                state["changed"].set()
         settings = self.h3.received_settings
         if settings is not None and settings.get(Setting.ENABLE_CONNECT_PROTOCOL) == 1:
             self.ready_settings.set()
 
-    def request(self, method=b"GET", protocol=None):
+    def request(self, method=b"GET", protocol=None, path=b"/interop"):
         stream = self._quic.get_next_available_stream_id()
         loop = asyncio.get_running_loop()
-        state = {"head": loop.create_future(), "end": loop.create_future(), "headers": [], "body": bytearray()}
+        state = {"head": loop.create_future(), "end": loop.create_future(), "headers": [],
+                 "body": bytearray(), "changed": asyncio.Event()}
         self.requests[stream] = state
         headers = [(b":method", method), (b":scheme", b"https"),
-                   (b":authority", b"localhost"), (b":path", b"/interop")]
+                   (b":authority", b"localhost"), (b":path", path)]
         if protocol:
             headers += [(b":protocol", protocol), (b"sec-websocket-version", b"13"),
                         (b"sec-websocket-protocol", b"interop")]
@@ -106,7 +112,16 @@ def frames(data):
     return result
 
 
-async def verify(port, ca):
+async def wait_for_body(response, length):
+    while len(response["body"]) < length:
+        if response["end"].done():
+            await response["end"]
+            raise RuntimeError("tunnel ended before its expected reply")
+        response["changed"].clear()
+        await response["changed"].wait()
+
+
+async def verify(port, ca, connect_204):
     tickets = []
     ticket_event = asyncio.Event()
     def ticket(value):
@@ -117,7 +132,8 @@ async def verify(port, ca):
                                    supported_versions=[QuicProtocolVersion.VERSION_1])
         result.load_verify_locations(cafile=str(ca))
         return result
-    report = {"stack": "aioquic", "tests": [], "scope": "aioquic client to Mira server; loopback"}
+    report = {"stack": "aioquic", "tests": [], "scope": "aioquic client to Mira server; loopback",
+              "dependency_connect_2xx_tunnel": connect_204, "connect_statuses": []}
     async with connect("127.0.0.1", port, configuration=configuration(), create_protocol=Peer,
                        session_ticket_handler=ticket) as client:
         _, response = client.request()
@@ -143,20 +159,34 @@ async def verify(port, ca):
             assert dict(response["headers"])[b"x-mira-early"] == (b"1" if expected else b"0")
             assert response["body"] == (b"early" if expected else b"one-rtt")
             report["tests"].append("0rtt-accepted" if expected else "0rtt-rejected-1rtt-fallback")
-    async with connect("127.0.0.1", port, configuration=configuration(), create_protocol=Peer) as client:
-        await asyncio.wait_for(client.ready_settings.wait(), 10)
-        stream, response = client.request(b"CONNECT", b"websocket")
-        await asyncio.wait_for(response["head"], 10)
-        headers = dict(response["headers"])
-        assert headers[b":status"] == b"200" and headers[b"sec-websocket-protocol"] == b"interop"
-        payload = bytes(i % 251 for i in range(8192))
-        wire = frame(2, payload) + frame(9, b"ping") + frame(8, struct.pack("!H", 1000))
-        client.h3.send_data(stream, wire, end_stream=True)
-        client.transmit()
-        await asyncio.wait_for(response["end"], 10)
-        assert frames(response["body"]) == [(2, payload), (10, b"ping"), (8, struct.pack("!H", 1000))]
-        report["tests"].append("extended-connect-websocket-binary-ping-close")
-    report["passed"] = True
+    for status in ((b"200", b"204") if connect_204 else (b"200",)):
+        async with connect("127.0.0.1", port, configuration=configuration(), create_protocol=Peer) as client:
+            await asyncio.wait_for(client.ready_settings.wait(), 10)
+            stream, response = client.request(b"CONNECT", b"websocket", b"/interop/" + status)
+            await asyncio.wait_for(response["head"], 10)
+            headers = dict(response["headers"])
+            assert headers[b":status"] == status, headers
+            assert headers[b"sec-websocket-protocol"] == b"interop", headers
+            payload = bytes(i % 251 for i in range(8192))
+            client.h3.send_data(stream, frame(2, payload) + frame(9, b"ping"), end_stream=False)
+            client.transmit()
+            # Two unmasked replies: 4-byte extended binary header, 2-byte pong header.
+            await asyncio.wait_for(wait_for_body(response, 4 + len(payload) + 2 + len(b"ping")), 10)
+            assert frames(response["body"]) == [(2, payload), (10, b"ping")]
+            assert not response["end"].done(), "server closed before client half-close"
+            client.h3.send_data(stream, frame(8, struct.pack("!H", 1000)), end_stream=True)
+            client.transmit()
+            # The peer waits for remote_end before writing the close reply, so
+            # receiving it proves the reverse direction survived the client's FIN.
+            await asyncio.wait_for(response["end"], 10)
+            assert frames(response["body"]) == [(2, payload), (10, b"ping"), (8, struct.pack("!H", 1000))]
+            raw_status = headers[b":status"].decode("ascii")
+            report["connect_statuses"].append({"requested": status.decode("ascii"), "received": raw_status})
+            report["tests"].append(f"extended-connect-{raw_status}-websocket-binary-ping-close-halfclose")
+    report["verified_tests_passed"] = True
+    # Upstream compatibility can validate 200 without claiming the fork's 204 coverage.
+    report["passed"] = True if connect_204 else None
+    report["untested"] = [] if connect_204 else ["CONNECT 204: dependency capability is absent"]
     return report
 
 
@@ -166,6 +196,8 @@ def main():
     parser.add_argument("--certificate", type=Path, required=True)
     parser.add_argument("--key", type=Path, required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--require-connect-204", action="store_true",
+                        help="fail unless the peer advertises and passes CONNECT 204 support")
     args = parser.parse_args()
     process = subprocess.Popen([str(args.server.resolve()), str(args.certificate.resolve()), str(args.key.resolve())],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
@@ -180,9 +212,13 @@ def main():
     stderr.start()
     try:
         line = ready.get(timeout=10)
-        if not line.startswith("PORT="):
+        startup = re.fullmatch(r"PORT=(\d+) CONNECT_2XX_TUNNEL=([01])\n?", line)
+        if not startup:
             raise RuntimeError(f"bad startup: {line!r}")
-        report = asyncio.run(asyncio.wait_for(verify(int(line[5:]), args.certificate), 60))
+        connect_204 = startup.group(2) == "1"
+        if args.require_connect_204 and not connect_204:
+            raise RuntimeError("CONNECT 204 required, but dependency capability is absent")
+        report = asyncio.run(asyncio.wait_for(verify(int(startup.group(1)), args.certificate, connect_204), 60))
         report["server_diagnostics"] = errors
         text = json.dumps(report, ensure_ascii=False, indent=2)
         print(text)

@@ -1,7 +1,6 @@
-# Verified dependency: nghttp3 1.15.0 (MIT); dependencies are not downloaded automatically.
-# nghttp3-1.15.0.tar.xz SHA256:
-# 6da0cd06b428d32a54c58137838505d9dc0371a900bb8070a46b29e1ceaf2e0f
-# Official source: https://github.com/ngtcp2/nghttp3/releases/download/v1.15.0/nghttp3-1.15.0.tar.xz
+# Protocol library versions, revisions and hashes are pinned in
+# scripts/protocol-dependencies.json; see docs/PROTOCOL-DEPENDENCIES.md.
+# No dependency downloads occur during CMake configuration.
 find_path(MIRA_NGHTTP3_INCLUDE_DIR nghttp3/nghttp3.h REQUIRED)
 find_library(MIRA_NGHTTP3_LIBRARY NAMES nghttp3 nghttp3_static NAMES_PER_DIR REQUIRED)
 file(STRINGS "${MIRA_NGHTTP3_INCLUDE_DIR}/nghttp3/version.h" _mira_nghttp3_version_line

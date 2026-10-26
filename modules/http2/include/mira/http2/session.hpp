@@ -54,7 +54,7 @@ struct Stream {
 // Closed streams still count against the quota until release; body flow-control credit is returned
 // only after take_body/read_connect. Extended CONNECT is opt-in; ordinary CONNECT, server push,
 // h2c Upgrade, and sending informational/trailers are not supported.
-// The pinned dependency treats 204 as bodyless; 204 tunnels are explicitly unsupported.
+// CONNECT 204 requires the dependency's NGHTTP2_HAS_CONNECT_2XX_TUNNEL capability.
 class Session {
 public:
     // Conservative lifetime reservation for retained headers/bodies and wire

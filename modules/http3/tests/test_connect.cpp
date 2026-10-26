@@ -11,6 +11,11 @@
 #include <string>
 
 using namespace Mira;
+constexpr unsigned tunnel_statuses[]{200, 201,
+#if defined(NGHTTP3_HAS_CONNECT_2XX_TUNNEL) && NGHTTP3_HAS_CONNECT_2XX_TUNNEL
+    204,
+#endif
+};
 void check(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
 template<class T> T require(Result<T> result, std::source_location location = std::source_location::current()) {
     if (!result) throw std::runtime_error(result.error().message() + " at " + std::to_string(location.line()));
@@ -81,7 +86,7 @@ void ready(Driver& driver) {
     check(driver.client.ready() && driver.server.ready(), "HTTP3 handshake");
     driver.settle();
 }
-void websocket_roundtrip(const char* cert, const char* key, bool compression) {
+void websocket_roundtrip(const char* cert, const char* key, bool compression, unsigned status) {
     auto pair = Pair::create(cert, key, true);
     auto& client = pair.client; auto& server = pair.server;
     Driver driver{client, server};
@@ -104,7 +109,7 @@ void websocket_roundtrip(const char* cert, const char* key, bool compression) {
     for (const auto& event : server.take_events())
         if (event.kind == http3::Event::Kind::headers && event.stream_id == id) received_request = event.fields;
     auto selected = require(ws::negotiate_extended_server(received_request, options));
-    http3::Headers response{{":status", "201"}};
+    http3::Headers response{{":status", std::to_string(status)}};
     response.insert(response.end(), selected.fields.begin(), selected.fields.end());
     require(server.respond_stream(id, response)); driver.settle();
     check(require(client.connect_state(id)).accepted, "2xx acceptance");
@@ -112,13 +117,16 @@ void websocket_roundtrip(const char* cert, const char* key, bool compression) {
     http3::Headers received_response;
     for (const auto& event : client.take_events())
         if (event.kind == http3::Event::Kind::headers && event.stream_id == id) received_response = event.fields;
-    auto negotiated = require(ws::negotiate_extended_client(201, received_response, options));
+    check(std::any_of(received_response.begin(), received_response.end(), [&](const auto& h) {
+        return h.name == ":status" && h.value == std::to_string(status);
+    }), "CONNECT response status changed on the wire");
+    auto negotiated = require(ws::negotiate_extended_client(status, received_response, options));
     check(negotiated.subprotocol == "chat.v2" && negotiated.compression.enabled == compression,
           "extended handshake negotiation mismatch");
     ws::Connection client_ws{outbound, ws::Role::client, ws::Limits{}, options};
     ws::Connection server_ws{inbound, ws::Role::server, ws::Limits{}, options};
-    require(client_ws.adopt_extended_connect("websocket", 201, negotiated));
-    require(server_ws.adopt_extended_connect("websocket", 201, negotiated));
+    require(client_ws.adopt_extended_connect("websocket", status, negotiated));
+    require(server_ws.adopt_extended_connect("websocket", status, negotiated));
     check(!client_ws.handshake("localhost").sync_get(), "H1 Upgrade after adoption");
     for (int round = 0; round < 20; ++round) {
         auto payload = bytes(std::string(2048, static_cast<char>('a' + round)));
@@ -146,7 +154,7 @@ void websocket_roundtrip(const char* cert, const char* key, bool compression) {
     check(require(client.connect_state(id)).closed && require(server.connect_state(id)).closed, "FIN did not close");
     require(client.release_connect(id)); require(server.release_connect(id));
 }
-void lifecycle(const char* cert, const char* key) {
+void lifecycle(const char* cert, const char* key, unsigned status) {
     auto disabled = Pair::create(cert, key, false);
     Driver disabled_driver{disabled.client, disabled.server}; ready(disabled_driver);
     check(!disabled.client.request_stream(request_headers()), "CONNECT without SETTINGS accepted");
@@ -167,10 +175,12 @@ void lifecycle(const char* cert, const char* key) {
     auto rejected = require(c.request_stream(request_headers()));
     auto id = require(c.request_stream(request_headers())); d.settle();
     require(s.respond(rejected, {{":status", "403"}}, bytes("no")));
+#if !defined(NGHTTP3_HAS_CONNECT_2XX_TUNNEL) || !NGHTTP3_HAS_CONNECT_2XX_TUNNEL
     auto unsupported = s.respond_stream(id, {{":status", "204"}});
     check(!unsupported && unsupported.error() == Errc::not_supported, "204 dependency limitation hidden");
-    check(!s.respond_stream(id, {{":status", "200"}, {"content-length", "0"}}), "tunnel content-length accepted");
-    require(s.respond_stream(id, {{":status", "200"}})); d.settle();
+#endif
+    check(!s.respond_stream(id, {{":status", std::to_string(status)}, {"content-length", "0"}}), "tunnel content-length accepted");
+    require(s.respond_stream(id, {{":status", std::to_string(status)}})); d.settle();
     check(!require(c.connect_state(rejected)).accepted, "403 adopted");
     std::array<std::byte, 8192> buffer{};
     check(!c.read_connect(rejected, buffer), "rejected stream readable");
@@ -222,6 +232,18 @@ void lifecycle(const char* cert, const char* key) {
         found = e.data == bytes("ok"); require(c.consume(other, e.data.size()));
     }
     check(found && c.ready() && s.ready(), "reset disrupted another stream");
+    const auto no_content = require(c.request({{":method", "GET"}, {":scheme", "https"},
+                                               {":authority", "localhost"}, {":path", "/no-content"}}));
+    d.settle();
+    check(!s.respond(no_content, {{":status", "204"}}, bytes("forbidden")), "ordinary 204 accepted a body");
+    require(s.respond(no_content, {{":status", "204"}})); d.settle();
+    bool ended = false;
+    for (const auto& event : c.take_events()) if (event.stream_id == no_content) {
+        check(event.kind != http3::Event::Kind::body && event.kind != http3::Event::Kind::reset,
+              "ordinary 204 semantics changed");
+        ended |= event.kind == http3::Event::Kind::end;
+    }
+    check(ended, "ordinary 204 response did not end");
 }
 void rejected_streaming_length(const char* cert, const char* key) {
     auto pair = Pair::create(cert, key, true);
@@ -243,17 +265,18 @@ void rejected_streaming_length(const char* cert, const char* key) {
         if (event.kind == http3::Event::Kind::end) ended = true;
     }
     check(ended && body == bytes("abc"), "rejected CONNECT lost incremental body");
+    check(c.ready() && s.ready(), "valid rejected CONNECT body closed the connection");
 }
 
-void shared_tunnel_budget(const char* cert, const char* key) {
+void shared_tunnel_budget(const char* cert, const char* key, unsigned status) {
     auto pair = Pair::create(cert, key, true, 4);
     auto& c = pair.client; auto& s = pair.server;
     Driver d{c, s}; ready(d);
     const auto a = require(c.request_stream(request_headers()));
     const auto b = require(c.request_stream(request_headers())); d.settle();
     static_cast<void>(s.take_events());
-    require(s.respond_stream(a, {{":status", "200"}}));
-    require(s.respond_stream(b, {{":status", "200"}})); d.settle();
+    require(s.respond_stream(a, {{":status", std::to_string(status)}}));
+    require(s.respond_stream(b, {{":status", std::to_string(status)}})); d.settle();
     static_cast<void>(c.take_events());
     for (const auto id : {a, b, a, b}) {
         require(c.write_connect(id, bytes("x"))); d.settle();
@@ -355,23 +378,54 @@ void rejected_wire_length(const char* cert, const char* key) {
         wire.push_back(std::byte{0});
         wire.push_back(static_cast<std::byte>(payload.size()));
         const auto data = bytes(payload); wire.insert(wire.end(), data.begin(), data.end());
-        require(s.transport().write(id, wire, true)); d.settle();
+        require(s.transport().write(id, wire, true));
+#if defined(NGHTTP3_HAS_CONNECT_2XX_TUNNEL) && NGHTTP3_HAS_CONNECT_2XX_TUNNEL
+        // The fork validates non-2xx CONNECT Content-Length in its parser.
+        // A negative read_stream2 result is connection-fatal; do not drive it again.
+        bool parser_rejected = false;
+        for (int round = 0; round < 80 && !parser_rejected; ++round) {
+            auto packet = require(s.poll(d.now));
+            if (!packet.empty()) {
+                auto received = c.receive(packet, d.now);
+                if (!received) {
+                    check(received.error() == http3::http3_error(NGHTTP3_ERR_MALFORMED_HTTP_MESSAGING),
+                          "unexpected rejected CONNECT parser error");
+                    parser_rejected = true;
+                    break;
+                }
+            }
+            auto reply = require(c.poll(d.now));
+            if (!reply.empty()) require(s.receive(reply, d.now));
+            d.now += 1'000'000;
+            if (c.expiry() <= d.now) require(c.handle_expiry(d.now));
+            if (s.expiry() <= d.now) require(s.handle_expiry(d.now));
+        }
+        check(parser_rejected && c.closed() && !c.ready(), "malformed rejected CONNECT body escaped parser validation");
+        check(!c.poll(d.now), "failed rejected CONNECT parser produced application data");
+#else
+        d.settle();
         bool reset = false;
         for (auto& event : c.take_events()) {
             reset |= event.kind == http3::Event::Kind::reset && event.stream_id == id;
             if (event.kind == http3::Event::Kind::body) require(c.consume(id, event.data.size()));
         }
         check(reset && c.ready(), "malformed rejected CONNECT body did not reset the stream");
+#endif
     }
 }
 int main(int argc, char** argv) {
     if (argc != 3) return 2;
     try {
-        websocket_roundtrip(argv[1], argv[2], false); websocket_roundtrip(argv[1], argv[2], true);
-        lifecycle(argv[1], argv[2]); wire_validation(argv[1], argv[2]);
+        for (const unsigned status : tunnel_statuses) {
+            websocket_roundtrip(argv[1], argv[2], false, status);
+            websocket_roundtrip(argv[1], argv[2], true, status);
+            lifecycle(argv[1], argv[2], status);
+            shared_tunnel_budget(argv[1], argv[2], status);
+            std::cout << "HTTP/3 CONNECT status " << status << " passed\n";
+        }
+        wire_validation(argv[1], argv[2]);
         rejected_streaming_length(argv[1], argv[2]);
         rejected_wire_length(argv[1], argv[2]);
-        shared_tunnel_budget(argv[1], argv[2]);
         std::cout << "HTTP/3 Extended CONNECT passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n'; return 1;

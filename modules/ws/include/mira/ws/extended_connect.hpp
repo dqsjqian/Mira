@@ -18,7 +18,7 @@ Result<http::Headers> extended_connect_request(std::string_view authority,
     std::string_view path = "/", const HandshakeOptions& options = {}, Limits limits = {});
 Result<ExtendedHandshake> accept_extended_connect(std::span<const http::Header> request,
     const HandshakeOptions& options = {}, Limits limits = {});
-// Accept 2xx except 204, which the pinned engines cannot tunnel (not_supported).
+// Validate all successful 2xx responses. The transport engine validates tunnel support.
 Result<Negotiated> validate_extended_connect(std::span<const http::Header> response,
     const HandshakeOptions& offered = {}, Limits limits = {});
 

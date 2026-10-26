@@ -1,8 +1,6 @@
-# Verified dependency: nghttp2 1.70.0, MIT (upstream COPYING). No network downloads.
-# Official release tar.xz SHA256: e05cb1388eaca3830aded4ccf20044b6e1ac1a61411dcca11b0437c4285c8bc2
-# v1.70.0 commit: 85e300c79fb6dbcfa9c1013215c8710c1c2cd3d2
-# 1.61 is the floor for the *2 / max_continuations APIs this code uses; other
-# versions have not been run-verified.
+# Protocol library versions, revisions and hashes are pinned in
+# scripts/protocol-dependencies.json; see docs/PROTOCOL-DEPENDENCIES.md.
+# No dependency downloads occur during CMake configuration.
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 find_package(NGHTTP2 1.61 REQUIRED)
 

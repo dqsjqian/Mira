@@ -4,37 +4,37 @@
       "artifact": "release-asset",
       "asset": "nghttp2-{version}.tar.xz",
       "provider": "github",
-      "repo": "nghttp2/nghttp2",
+      "repo": "dqsjqian/nghttp2",
       "resolved": {
-        "checksum_source": "verified official release archive",
-        "request_hash": "b9fe94b2b6b6626823ff8da077f44f8f3bcc51e44d7a68d46818c3fdcfd57af7",
-        "requested": "1.70.0",
-        "revision": "85e300c79fb6dbcfa9c1013215c8710c1c2cd3d2",
-        "sha256": "e05cb1388eaca3830aded4ccf20044b6e1ac1a61411dcca11b0437c4285c8bc2",
-        "tag": "v1.70.0",
-        "url": "https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.xz",
-        "version": "1.70.0"
+        "checksum_source": "github-release-asset",
+        "request_hash": "e74cb0b1e012fdd9175d5dfbdd0989fb99a4edc191ca37ec9a22009a5a099870",
+        "requested": "1.70.0-mira.1",
+        "revision": "33c0ac7bf85716293d4f7fbc3437a4021e07e63e",
+        "sha256": "311eb7c6deddfafb3927b1d9cf6f26ca0c9a4450039c47d564f6d0ad42d48db8",
+        "tag": "v1.70.0-mira.1",
+        "url": "https://github.com/dqsjqian/nghttp2/releases/download/v1.70.0-mira.1/nghttp2-1.70.0-mira.1.tar.xz",
+        "version": "1.70.0-mira.1"
       },
       "tag_prefix": "v",
-      "version": "1.70.0"
+      "version": "1.70.0-mira.1"
     },
     "nghttp3": {
       "artifact": "release-asset",
       "asset": "nghttp3-{version}.tar.xz",
       "provider": "github",
-      "repo": "ngtcp2/nghttp3",
+      "repo": "dqsjqian/nghttp3",
       "resolved": {
-        "checksum_source": "verified official release archive",
-        "request_hash": "55cab2fc72a19c629ce24a5e2f3fcb1dcee8bcceb092709f9b088bd2b8956e70",
-        "requested": "1.15.0",
-        "revision": "d326f4c1eb3f6a780d77793b30e16756c498f913",
-        "sha256": "6da0cd06b428d32a54c58137838505d9dc0371a900bb8070a46b29e1ceaf2e0f",
-        "tag": "v1.15.0",
-        "url": "https://github.com/ngtcp2/nghttp3/releases/download/v1.15.0/nghttp3-1.15.0.tar.xz",
-        "version": "1.15.0"
+        "checksum_source": "github-release-asset",
+        "request_hash": "3d3c2906b8abfe948a6e2db2ddef079de909b6ac8e53b45114bf519f2f93f4e1",
+        "requested": "1.18.0-mira.1",
+        "revision": "8b47f1718cad4a3b99ee5a4f92060362466f8a6e",
+        "sha256": "178f27b9da86e7cd609f56b752e8442baeb3c10fbbb3a51c32b3be31ffba7c87",
+        "tag": "v1.18.0-mira.1",
+        "url": "https://github.com/dqsjqian/nghttp3/releases/download/v1.18.0-mira.1/nghttp3-1.18.0-mira.1.tar.xz",
+        "version": "1.18.0-mira.1"
       },
       "tag_prefix": "v",
-      "version": "1.15.0"
+      "version": "1.18.0-mira.1"
     },
     "ngtcp2": {
       "artifact": "release-asset",

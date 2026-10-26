@@ -198,12 +198,14 @@ struct Engine::Impl {
                         stream.field_bytes = 0;
                         return reset(s.conn, id, NGHTTP3_H3_MESSAGE_ERROR, p, nullptr);
                     }
+#if !defined(NGHTTP3_HAS_CONNECT_2XX_TUNNEL) || !NGHTTP3_HAS_CONNECT_2XX_TUNNEL
                     if (status == "204") {
                         s.header_bytes -= stream.field_bytes;
                         stream.fields.clear();
                         stream.field_bytes = 0;
                         return reset(s.conn, id, NGHTTP3_H3_REQUEST_CANCELLED, p, nullptr);
                     }
+#endif
                     stream.accepted = success_status(stream.fields);
                     const auto length = field(stream.fields, "content-length");
                     if (!stream.accepted && status != "304" && !length.empty()) {
@@ -852,7 +854,9 @@ Result<void> Engine::respond_impl(std::int64_t id, const Headers& fields,
         it->second.error || !it->second.headers_received)
         return std::unexpected(http3_error(invalid));
     const bool connect = !it->second.protocol.empty();
+#if !defined(NGHTTP3_HAS_CONNECT_2XX_TUNNEL) || !NGHTTP3_HAS_CONNECT_2XX_TUNNEL
     if (connect && field(fields, ":status") == "204") return fail(Errc::not_supported);
+#endif
     if (auto r = s.valid_fields(fields, body, streaming, false, connect, it->second.head); !r) return r;
     if (connect && success_status(fields) && !streaming) return fail(Errc::invalid_argument);
     return s.submit(id, fields, body, streaming);

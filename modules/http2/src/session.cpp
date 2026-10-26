@@ -298,8 +298,10 @@ struct Session::Impl {
                     } else if (self.role == Role::client && !e.protocol.empty()) {
                         if (!valid_headers(e.block, false, std::nullopt, self.limits, true))
                             return self.reset(e.visible.id, make_error_code(Errc::invalid_argument), NGHTTP2_PROTOCOL_ERROR);
+#if !defined(NGHTTP2_HAS_CONNECT_2XX_TUNNEL) || !NGHTTP2_HAS_CONNECT_2XX_TUNNEL
                         if (field(e.block, ":status") == "204")
                             return self.reset(e.visible.id, make_error_code(Errc::not_supported), NGHTTP2_CANCEL);
+#endif
                         e.accepted = success_status(e.block);
                         const auto length = field(e.block, "content-length");
                         if (!e.accepted && field(e.block, ":status") != "304" && !length.empty()) {
@@ -566,7 +568,9 @@ Result<void> Session::respond_impl(std::int32_t id, const Headers& headers,
         return fail(Errc::would_block);
     auto& e = it->second;
     const bool accepting = !e.protocol.empty() && success_status(headers);
+#if !defined(NGHTTP2_HAS_CONNECT_2XX_TUNNEL) || !NGHTTP2_HAS_CONNECT_2XX_TUNNEL
     if (accepting && field(headers, ":status") == "204") return fail(Errc::not_supported);
+#endif
     if (!valid_headers(headers, false, streaming ? std::nullopt : std::optional{body.size()}, s.limits,
                        !e.protocol.empty(), e.head) || (accepting && !streaming))
         return fail(Errc::invalid_argument);

@@ -483,6 +483,7 @@ jobs:
       - name: Verify independent H3 early data and Extended CONNECT
         run: >
           build/aioquic-venv/bin/python scripts/ci/check_h3_aioquic.py
+          --require-connect-204
           --server build/protocols/mira_h3_advanced_peer
           --certificate build/protocols/modules/quic/tests/cert.pem
           --key build/protocols/modules/quic/tests/key.pem

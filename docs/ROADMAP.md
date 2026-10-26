@@ -84,8 +84,8 @@ require-native refuses rather than misreporting this as zero-copy.
 **Still not implemented.** Linux pipe splice and MSG_ZEROCOPY error-queue
 completion. These remain separate from file sendfile support; P2-3 is not
 represented as an entirely completed Linux zero-copy matrix. Windows native
-runtime evidence for the new TransmitFile path must come from CI; a MinGW
-cross-build alone is not that evidence.
+runtime evidence for the new TransmitFile path is covered by the Windows IOCP
+Debug and Release CI jobs; a MinGW cross-build alone is not that evidence.
 
 **Design sketch.** A transport-level `send_file` (and, separately,
 zero-copy send of userspace buffers):
@@ -185,8 +185,9 @@ which is an environment skip, not successful local-socket evidence. No security
 policy is disabled to make a test pass.
 
 Windows native IOCP, explicit Unix-domain/ancillary rejection and link-local
-zone dialing evidence from 2026-10-26 is recorded in ARCHITECTURE.md. P2-9 remains
-blocked by the pinned nghttp2 1.70/nghttp3 1.15 HTTP messaging engines: 204 is
-classified as bodyless before CONNECT processing. Mira retains explicit
-not_supported rather than disabling protocol checks or rewriting status codes.
+zone dialing evidence from 2026-10-26 is recorded in ARCHITECTURE.md. P2-9 CONNECT
+204 uses the maintained nghttp2 1.70.0-mira.1 / nghttp3 1.18.0-mira.1 forks.
+Their capability macros enable 204 without status rewriting; upstream libraries
+without that capability retain explicit `not_supported`. See
+[protocol dependency maintenance](PROTOCOL-DEPENDENCIES.md).
 P2-2 io_uring remains the Linux-specific deferred work described above.

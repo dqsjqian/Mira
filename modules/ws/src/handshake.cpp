@@ -557,7 +557,6 @@ Result<ConnectHandshake> negotiate_extended_server(std::span<const http::Header>
 Result<Negotiated> negotiate_extended_client(unsigned status, std::span<const http::Header> fields,
     const HandshakeOptions& offered, Limits limits) {
     if (status < 200 || status >= 300) return fail(make_error_code(Errc::invalid_handshake));
-    if (status == 204) return fail(Mira::Errc::not_supported);
     if (auto valid = validate_options(offered, Role::client, limits); !valid) return fail(valid.error());
     auto head = connect_fields(fields, limits, true);
     if (!head) return fail(head.error());

@@ -11,6 +11,11 @@
 #include <string>
 
 using namespace Mira;
+constexpr unsigned tunnel_statuses[]{200, 201,
+#if defined(NGHTTP2_HAS_CONNECT_2XX_TUNNEL) && NGHTTP2_HAS_CONNECT_2XX_TUNNEL
+    204,
+#endif
+};
 using Bytes = std::vector<std::byte>;
 void check(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
 template<class T> T require(Result<T> result) {
@@ -68,7 +73,7 @@ struct Driver {
 };
 static_assert(BoundedStream<http2::ConnectStream<Driver>>);
 
-void websocket_roundtrip(bool compression) {
+void websocket_roundtrip(bool compression, unsigned status) {
     auto client = session(http2::Role::client, true), server = session(http2::Role::server, true);
     Driver driver{client, server};
     check(!client.peer_connect_protocol_enabled() && !server.local_connect_protocol_enabled(), "SETTINGS optimistic");
@@ -89,19 +94,22 @@ void websocket_roundtrip(bool compression) {
     check(require(server.connect_state(id)).protocol == "websocket", "protocol lost");
     check(!require(client.connect_state(id)).accepted, "optimistic acceptance");
     auto selected = require(ws::negotiate_extended_server(server.stream(id)->headers, options));
-    http2::Headers response{{":status", "201"}};
+    http2::Headers response{{":status", std::to_string(status)}};
     response.insert(response.end(), selected.fields.begin(), selected.fields.end());
     require(server.respond_stream(id, response));
     driver.drive();
     check(require(client.connect_state(id)).accepted, "2xx acceptance missing");
     http2::ConnectStream inbound{server, id, driver}, outbound{client, id, driver};
-    auto negotiated = require(ws::negotiate_extended_client(201, client.stream(id)->headers, options));
+    check(std::any_of(client.stream(id)->headers.begin(), client.stream(id)->headers.end(), [&](const auto& h) {
+        return h.name == ":status" && h.value == std::to_string(status);
+    }), "CONNECT response status changed on the wire");
+    auto negotiated = require(ws::negotiate_extended_client(status, client.stream(id)->headers, options));
     check(negotiated.subprotocol == "chat.v2" && negotiated.compression.enabled == compression,
           "extended handshake negotiation mismatch");
     ws::Connection client_ws{outbound, ws::Role::client, ws::Limits{}, options};
     ws::Connection server_ws{inbound, ws::Role::server, ws::Limits{}, options};
-    require(client_ws.adopt_extended_connect("websocket", 201, negotiated));
-    require(server_ws.adopt_extended_connect("websocket", 201, negotiated));
+    require(client_ws.adopt_extended_connect("websocket", status, negotiated));
+    require(server_ws.adopt_extended_connect("websocket", status, negotiated));
     check(!client_ws.handshake("localhost").sync_get(), "adopt still allowed H1 Upgrade");
     for (int round = 0; round < 20; ++round) {
         auto payload = bytes(std::string(2048, static_cast<char>('a' + round)));
@@ -130,7 +138,7 @@ void websocket_roundtrip(bool compression) {
     require(client.release(id)); require(server.release(id));
 }
 
-void lifecycle_and_validation() {
+void lifecycle_and_validation(unsigned status) {
     auto client = session(http2::Role::client, false), server = session(http2::Role::server, false);
     Driver driver{client, server};
     driver.drive();
@@ -153,14 +161,16 @@ void lifecycle_and_validation() {
     const auto id = require(c.request_stream(request_headers()));
     d.drive();
     require(s.respond(rejected, {{":status", "403"}}, bytes("no")));
+#if !defined(NGHTTP2_HAS_CONNECT_2XX_TUNNEL) || !NGHTTP2_HAS_CONNECT_2XX_TUNNEL
     auto unsupported = s.respond_stream(id, {{":status", "204"}});
     check(!unsupported && unsupported.error() == Errc::not_supported, "204 dependency limitation hidden");
-    check(!s.respond_stream(id, {{":status", "200"}, {"content-length", "0"}}), "tunnel content-length accepted");
-    require(s.respond_stream(id, {{":status", "200"}})); d.drive();
+#endif
+    check(!s.respond_stream(id, {{":status", std::to_string(status)}, {"content-length", "0"}}), "tunnel content-length accepted");
+    require(s.respond_stream(id, {{":status", std::to_string(status)}})); d.drive();
     check(!require(c.connect_state(rejected)).accepted, "403 adopted");
     std::array<std::byte, 8192> read{};
     check(!c.read_connect(rejected, read), "rejected stream readable as tunnel");
-    check(!s.respond_stream(id, {{":status", "200"}}), "duplicate response");
+    check(!s.respond_stream(id, {{":status", std::to_string(status)}}), "duplicate response");
     const Bytes block(8192, std::byte{0x42});
     for (int n = 0; n < 4; ++n) require(c.write_body(id, block));
     auto blocked = c.write_connect(id, block);
@@ -172,8 +182,15 @@ void lifecycle_and_validation() {
                                             {":authority", "localhost"}, {":path", "/other"}}));
     d.drive(); require(s.respond(ordinary, {{":status", "200"}}, bytes("ok"))); d.drive();
     check(require(c.take_body(ordinary)) == bytes("ok"), "other stream disrupted");
+    const auto no_content = require(c.request({{":method", "GET"}, {":scheme", "https"},
+                                               {":authority", "localhost"}, {":path", "/no-content"}}));
+    d.drive();
+    check(!s.respond(no_content, {{":status", "204"}}, bytes("forbidden")), "ordinary 204 accepted a body");
+    require(s.respond(no_content, {{":status", "204"}})); d.drive();
+    check(c.stream(no_content)->remote_end && !c.stream(no_content)->error && c.stream(no_content)->body.empty(),
+          "ordinary 204 semantics changed");
     const auto half = require(c.request_stream(request_headers())); d.drive();
-    require(s.respond_stream(half, {{":status", "200"}})); d.drive();
+    require(s.respond_stream(half, {{":status", std::to_string(status)}})); d.drive();
     require(c.finish_body(half)); d.drive();
     check(require(s.connect_state(half)).remote_end, "half-close invisible");
     require(s.write_connect(half, bytes("after-fin"))); d.drive();
@@ -273,11 +290,11 @@ Task<void> pending_cancel(http2::ConnectStream<WaitingDriver>& stream, std::stop
     auto result = co_await stream.read_some(buffer, {.stop = stop});
     check(!result && result.error() == Errc::cancelled, "pending cancellation failed"); done = true;
 }
-Task<void> async_lifecycle(EventLoop& loop) {
+Task<void> async_lifecycle(EventLoop& loop, unsigned status) {
     auto c = session(http2::Role::client, false), s = session(http2::Role::server, true);
     Driver wire{c, s}; wire.drive();
     auto id = require(c.request_stream(request_headers())); wire.drive();
-    require(s.respond_stream(id, {{":status", "200"}})); wire.drive();
+    require(s.respond_stream(id, {{":status", std::to_string(status)}})); wire.drive();
     WaitingDriver driver{loop, wire}; http2::ConnectStream stream{c, id, driver};
     bool done = false;
     TaskScope scope; scope.spawn(pending_read(stream, done));
@@ -295,10 +312,15 @@ Task<void> async_lifecycle(EventLoop& loop) {
 }
 int main() {
     try {
-        websocket_roundtrip(false); websocket_roundtrip(true);
-        lifecycle_and_validation(); wire_validation();
+        auto loop = require(EventLoop::create());
+        for (const unsigned status : tunnel_statuses) {
+            websocket_roundtrip(false, status); websocket_roundtrip(true, status);
+            lifecycle_and_validation(status);
+            require(loop.run_until_complete(async_lifecycle(loop, status)));
+            std::cout << "HTTP/2 CONNECT status " << status << " passed\n";
+        }
+        wire_validation();
         rejected_streaming_length(); rejected_wire_length();
-        auto loop = require(EventLoop::create()); require(loop.run_until_complete(async_lifecycle(loop)));
         std::cout << "HTTP/2 Extended CONNECT passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n'; return 1;

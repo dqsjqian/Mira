@@ -4,6 +4,36 @@ Version source, compatibility policy and consumption instructions are maintained
 in the [release guide](docs/RELEASES.md). Version headings below are historical
 records; they are not additional definitions of the current build version.
 
+## [1.2.0] - 2026-10-26
+
+### Added
+
+- Explicit file-transfer policies, native/copied byte accounting and bounded
+  fallback transfers, including Linux/macOS sendfile and Windows TransmitFile.
+- Opt-in TCP TLS 1.3 early data with explicit replay-safe policy and independent
+  OpenSSL acceptance/rejection checks.
+- Explicit HTTP client cookie/cache state, MQTT outbound topic aliases and
+  optional locally validated DNSSEC queries.
+- Successful CONNECT 204 tunnels through maintained nghttp2/nghttp3 releases,
+  capability-gated for compatibility with upstream installations. Tests cover
+  bidirectional DATA, WebSocket negotiation, half-close and independent aioquic.
+- Shared AriaDeps 0.3.0 dependency tooling with immutable fork source pins.
+
+### Fixed
+
+- Age DNSSEC evidence TTLs during asynchronous key/proof retrieval.
+- Validate suspended transfer cancellation, deadlines, truncation and files
+  larger than 4 GiB; preserve shared-library builds with test instrumentation.
+- Avoid Windows cookie-expiry calendar overflow and MQTT narrowing warnings.
+- Make Windows TLS interoperability checks byte-exact and synchronized, and
+  classify aborted test sockets without weakening application-data assertions.
+- Apply CONNECT tunnel semantics before ordinary bodyless-response rules while
+  retaining normal Content-Length validation for failed CONNECT responses.
+
+Physical-device validation and Linux io_uring, splice and MSG_ZEROCOPY remain
+explicit boundaries in the README and roadmap. Simulator/emulator results do
+not establish physical-device acceptance.
+
 ## [1.1.1] - 2026-10-08
 
 ### Fixed

@@ -144,21 +144,17 @@ void forbidden_and_injected_fields() {
     invalid(validate_extended_connect(duplicate_response));
 }
 void status_and_subprotocols() {
-    for (unsigned status : {200U, 201U, 202U, 205U, 299U}) {
+    for (unsigned status : {200U, 201U, 202U, 204U, 205U, 299U}) {
         http::Headers response{{":status", std::to_string(status)}};
         CHECK(validate_extended_connect(response).has_value());
         CHECK(negotiate_extended_client(status, response).has_value());
+        CHECK(negotiate_extended_client(status, {}).has_value());
         invalid(negotiate_extended_client(status == 200 ? 201 : 200, response));
     }
     for (std::string_view status : {"", "099", "101", "199", "300", "403", "599", "600", "2000", "+200", "20x", " 200"}) {
         http::Headers response{{":status", std::string(status)}};
         invalid(validate_extended_connect(response));
     }
-    http::Headers no_content{{":status", "204"}};
-    auto unsupported = validate_extended_connect(no_content);
-    CHECK(!unsupported && unsupported.error() == Mira::Errc::not_supported);
-    unsupported = negotiate_extended_client(204, {});
-    CHECK(!unsupported && unsupported.error() == Mira::Errc::not_supported);
     for (const http::Headers& response : {http::Headers{{":status", "200"}, {":status", "200"}},
                                            http::Headers{{"x-test", "a"}, {":status", "200"}},
                                            http::Headers{{":status", "200"}, {":method", "CONNECT"}}})

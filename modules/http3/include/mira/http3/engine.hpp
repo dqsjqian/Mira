@@ -59,7 +59,7 @@ struct Event {
 /// the same stream IDs. A server that accepted 0-RTT becomes ready() before handshake completion
 /// and answers in 0.5-RTT; early requests with unsafe methods are answered 425 (Too Early)
 /// automatically and never surfaced. There is no anti-replay guarantee for surfaced early requests.
-/// The pinned dependency treats 204 as bodyless; 204 tunnels are explicitly unsupported.
+/// CONNECT 204 requires the dependency's NGHTTP3_HAS_CONNECT_2XX_TUNNEL capability.
 /// Incoming body is delivered in chunks and the window is restored via consume. Outgoing chunks
 /// remain stable until acknowledged; max_buffered_body bounds the connection-wide retained body.
 class Engine {

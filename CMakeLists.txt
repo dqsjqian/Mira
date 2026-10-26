@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(Mira
-    VERSION 1.1.1
+    VERSION 1.2.0
     DESCRIPTION "Coroutine-native C++23 networking library — transport, protocols, and nothing else"
     LANGUAGES CXX
 )
@@ -170,7 +170,7 @@ endif()
 
 if(MIRA_BUILD_TESTS AND MIRA_ENABLE_HTTP3 AND MIRA_ENABLE_WEBSOCKET)
     add_executable(mira_h3_advanced_peer scripts/ci/h3_advanced_peer.cpp)
-    target_link_libraries(mira_h3_advanced_peer PRIVATE Mira::http3 Mira::ws Mira::warnings)
+    target_link_libraries(mira_h3_advanced_peer PRIVATE Mira::http3 Mira::ws Mira::warnings mira_nghttp3)
 endif()
 
 # ── Benchmarks ──────────────────────────────────────────────────────────────

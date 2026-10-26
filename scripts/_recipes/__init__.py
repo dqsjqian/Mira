@@ -34,9 +34,9 @@ def protocol_licenses(prefix: Path, source: Path, dep: Dependency) -> list[str]:
 
 RECIPES: tuple[Dependency, ...] = (
     Dependency(
-        name="nghttp2", version="1.70.0",
-        url="https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.xz",
-        sha256="e05cb1388eaca3830aded4ccf20044b6e1ac1a61411dcca11b0437c4285c8bc2",
+        name="nghttp2", version="1.70.0-mira.1",
+        url="https://github.com/dqsjqian/nghttp2/releases/download/v1.70.0-mira.1/nghttp2-1.70.0-mira.1.tar.xz",
+        sha256="311eb7c6deddfafb3927b1d9cf6f26ca0c9a4450039c47d564f6d0ad42d48db8",
         license="MIT", license_files=("COPYING",), root="", kind="cmake",
         options=(
             "-DBUILD_SHARED_LIBS=OFF", "-DBUILD_STATIC_LIBS=ON",
@@ -46,9 +46,9 @@ RECIPES: tuple[Dependency, ...] = (
         artifacts=("lib/libnghttp2.a", "include/nghttp2/nghttp2.h"),
     ),
     Dependency(
-        name="nghttp3", version="1.15.0",
-        url="https://github.com/ngtcp2/nghttp3/releases/download/v1.15.0/nghttp3-1.15.0.tar.xz",
-        sha256="6da0cd06b428d32a54c58137838505d9dc0371a900bb8070a46b29e1ceaf2e0f",
+        name="nghttp3", version="1.18.0-mira.1",
+        url="https://github.com/dqsjqian/nghttp3/releases/download/v1.18.0-mira.1/nghttp3-1.18.0-mira.1.tar.xz",
+        sha256="178f27b9da86e7cd609f56b752e8442baeb3c10fbbb3a51c32b3be31ffba7c87",
         license="MIT", license_files=("COPYING",), root="", kind="cmake",
         options=(
             "-DENABLE_SHARED_LIB=OFF", "-DENABLE_STATIC_LIB=ON",

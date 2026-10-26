@@ -4,6 +4,8 @@
 #include "mira/ws/extended_connect.hpp"
 #include "mira/ws/frame.hpp"
 
+#include <nghttp3/nghttp3.h>
+
 #include <array>
 #include <iostream>
 #include <map>
@@ -12,6 +14,11 @@
 using namespace Mira;
 using namespace std::chrono_literals;
 namespace {
+#if defined(NGHTTP3_HAS_CONNECT_2XX_TUNNEL) && NGHTTP3_HAS_CONNECT_2XX_TUNNEL
+constexpr bool connect_2xx_tunnel = true;
+#else
+constexpr bool connect_2xx_tunnel = false;
+#endif
 template<class T> T require(Result<T> value) {
     if (!value) throw std::runtime_error(value.error().message());
     return std::move(*value);
@@ -42,7 +49,8 @@ Task<void> serve(EventLoop& loop, const char* certificate, const char* key) {
     auto server = require(http3::make_server(options, {}, limits));
     std::map<std::pair<quic::Listener::Id, std::int64_t>, Request> requests;
     std::map<std::pair<quic::Listener::Id, std::int64_t>, Tunnel> tunnels;
-    std::cout << "PORT=" << options.local.port() << '\n' << std::flush;
+    std::cout << "PORT=" << options.local.port()
+              << " CONNECT_2XX_TUNNEL=" << (connect_2xx_tunnel ? 1 : 0) << '\n' << std::flush;
     std::array<std::byte, 65536> input{};
     const auto end = Clock::now() + 90s;
     while (Clock::now() < end) {
@@ -61,7 +69,15 @@ Task<void> serve(EventLoop& loop, const char* certificate, const char* key) {
                         handshake.subprotocols = {"interop"};
                         handshake.require_subprotocol = true;
                         auto negotiated = require(ws::negotiate_extended_server(event.fields, handshake));
-                        negotiated.fields.insert(negotiated.fields.begin(), {":status", "200"});
+                        const auto path = std::find_if(event.fields.begin(), event.fields.end(),
+                            [](const auto& field) { return field.name == ":path"; });
+                        if (path == event.fields.end() ||
+                            (path->value != "/interop/200" && path->value != "/interop/204"))
+                            throw std::runtime_error("unexpected test CONNECT path");
+                        const std::string status = path->value == "/interop/204" ? "204" : "200";
+                        if (status == "204" && !connect_2xx_tunnel)
+                            throw std::runtime_error("dependency lacks CONNECT 204 support");
+                        negotiated.fields.insert(negotiated.fields.begin(), {":status", status});
                         require(engine.respond_stream(event.stream_id, negotiated.fields));
                         tunnels.try_emplace(token);
                     } else {
@@ -112,6 +128,13 @@ Task<void> serve(EventLoop& loop, const char* certificate, const char* key) {
                     it = tunnels.erase(it);
                     continue;
                 }
+            }
+            if (tunnel.close) {
+                // Keep the reply direction open after the client's QUIC FIN.
+                // Only then send the WebSocket close reply and our own FIN.
+                const auto state = require(engine->connect_state(stream));
+                if (!state.remote_end) { ++it; continue; }
+                if (state.local_end) throw std::runtime_error("client FIN closed both directions");
             }
             if (tunnel.offset != tunnel.output.size()) {
                 auto written = engine->write_connect(stream, std::span<const std::byte>{tunnel.output}.subspan(tunnel.offset));
