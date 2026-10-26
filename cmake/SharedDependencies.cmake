@@ -21,7 +21,7 @@ if(FORGEDEPS_PYTHON_EXECUTABLE)
 elseif(DEFINED ENV{FORGEDEPS_PYTHON_EXECUTABLE})
     set(Python3_EXECUTABLE "$ENV{FORGEDEPS_PYTHON_EXECUTABLE}")
 endif()
-find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+find_package(Python3 3.14 REQUIRED COMPONENTS Interpreter)
 set(ForgeDeps_PYTHON_EXECUTABLE "${Python3_EXECUTABLE}")
 execute_process(COMMAND "${Python3_EXECUTABLE}" -m forgedeps cmake-dir
     RESULT_VARIABLE _mira_package_result OUTPUT_VARIABLE _mira_package_dir

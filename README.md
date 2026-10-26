@@ -269,7 +269,7 @@ cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON
 cmake --build build/tls -j && ctest --test-dir build/tls --output-on-failure
 ```
 
-可选高版本协议：`MIRA_ENABLE_HTTP2=ON` / `MIRA_ENABLE_HTTP3=ON`（默认关闭，不自动联网下载；依赖版本与 SHA256 固定在 `tools/protocol-dependencies.json`）。显式依赖构建入口需要 Python 3.10+；先在同一个 Python 环境安装 `requirements-build.txt` 中固定版本的构建工具。
+可选高版本协议：`MIRA_ENABLE_HTTP2=ON` / `MIRA_ENABLE_HTTP3=ON`（默认关闭，不自动联网下载；依赖版本与 SHA256 固定在 `tools/protocol-dependencies.json`）。显式依赖构建入口需要 Python 3.14+；先在同一个 Python 环境安装 `requirements-build.txt` 中固定版本的构建工具。
 
 ### 最小 client / server 示例
 

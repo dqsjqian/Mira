@@ -13,10 +13,12 @@
 #include <coroutine>
 #include <cstddef>
 #include <cstdio>
+#include <source_location>
 #include <ctime>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/ocsp.h>
@@ -42,10 +44,21 @@ std::span<const std::byte> bytes_of(std::string_view text) {
     return {reinterpret_cast<const std::byte*>(text.data()), text.size()};
 }
 
-void require(bool condition) {
-    if (!condition) {
-        throw std::runtime_error("TLS test certificate generation failed");
+// A failure names the call site, the OpenSSL error queue, and the header and
+// library versions, so a mismatched OpenSSL is visible in the CI log.
+void require(bool condition, std::source_location where = std::source_location::current()) {
+    if (condition) {
+        return;
     }
+    std::string message = "TLS test certificate generation failed at line " + std::to_string(where.line()) +
+                          " (headers " OPENSSL_VERSION_TEXT ", library " + OpenSSL_version(OPENSSL_VERSION) + ")";
+    for (unsigned long code = ERR_get_error(); code != 0; code = ERR_get_error()) {
+        std::array<char, 256> text{};
+        ERR_error_string_n(code, text.data(), text.size());
+        message += "\n  ";
+        message += text.data();
+    }
+    throw std::runtime_error(message);
 }
 
 using Key = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;

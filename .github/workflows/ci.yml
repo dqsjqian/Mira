@@ -204,9 +204,14 @@ jobs:
             mingw-w64-ucrt-x86_64-openssl
             mingw-w64-ucrt-x86_64-nghttp2
             mingw-w64-ucrt-x86_64-zlib
+            make
+            perl
+      # OpenSSL's MinGW build runs its Unix recipes with MSYS make and perl;
+      # it deliberately does not mix in mingw32-make or cmd.exe.
       - name: Select the supported Python for the MinGW shell
-        # The MSYS2 UCRT64 interpreter lags the supported version, so drive the
-        # tooling with the interpreter installed by setup-python instead.
+        # update: false keeps the MSYS2 package snapshot fixed, so its Python
+        # is not guaranteed to be the supported version. Drive the tooling
+        # with the interpreter installed by setup-python instead.
         run: echo "MIRA_PYTHON=$(cygpath -u "$pythonLocation")/python.exe" >> "$GITHUB_ENV"
       - name: Install forgedeps into the selected Python
         run: |
