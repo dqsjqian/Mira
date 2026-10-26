@@ -110,7 +110,7 @@ def h1(server, tls):
 def rejected_socket(client):
     try:
         assert client.recv(1) == b"", "admission-rejected connection received application data"
-    except (ConnectionResetError, ssl.SSLEOFError):
+    except (ConnectionResetError, ConnectionAbortedError, ssl.SSLEOFError):
         pass
 
 
@@ -169,7 +169,7 @@ def verify_handshake_limit(executable, cert, key, tls):
             for byte in hello:
                 try:
                     stalled.sendall(bytes((byte,)))
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     break
                 sent += 1
                 readable, _, _ = select.select([stalled], [], [], 0.025)

@@ -74,6 +74,13 @@ class EarlyDataRunnerTests(unittest.TestCase):
             self.assertEqual(server.event('DONE'), 'DONE')
             self.assertIn('No early data received', server.finish())
 
+    def test_wire_input_bypasses_windows_newline_translation(self):
+        script = "import sys; assert sys.stdin.buffer.readline() == b'ticket-ready\\n'"
+        with Process([sys.executable, '-c', script]) as peer:
+            peer.process.stdin.reconfigure(newline='\r\n')
+            peer.send('ticket-ready\n')
+            peer.finish()
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -40,8 +40,10 @@ class Process:
                 return line
 
     def send(self, text):
-        self.process.stdin.write(text)
-        self.process.stdin.flush()
+        # These are wire-protocol bytes, not platform text. In particular, a
+        # Windows TextIOWrapper must not turn LF into CRLF before s_server reads it.
+        self.process.stdin.buffer.write(text.encode('ascii'))
+        self.process.stdin.buffer.flush()
 
     def finish(self):
         self.process.wait(timeout=15)
