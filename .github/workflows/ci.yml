@@ -21,7 +21,9 @@ concurrency:
 #   Android     NDK r30
 #   MinGW-w64   MSYS2 UCRT64, packages updated at job start (GCC 16)
 env:
-  FORGEDEPS_HOME: ${{ github.workspace }}/../forgedeps
+  # Not under github.workspace: a container job resolves that expression to
+  # the host path in one step and to the container mount in another.
+  FORGEDEPS_HOME: ${{ runner.temp }}/forgedeps
   GCC_VERSION: "16"
   LLVM_VERSION: "23"
   PYTHON_VERSION: "3.14"
