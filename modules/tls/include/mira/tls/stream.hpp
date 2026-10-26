@@ -34,7 +34,8 @@ namespace Mira::tls {
 /// Wire I/O has no deadline and is never cancelled merely to change a deadline:
 /// cancellation may discard bytes already transferred by the kernel.
 ///
-/// Ciphertext is bounded by a BIO pair and two 16 KiB buffers. Output is sent in
+/// 密文受 BIO pair 和两个 16 KiB 缓冲限制；早期载荷按需额外预留至多 16 KiB。
+/// Output is sent in
 /// generation order, and an operation only waits for output it generated. There
 /// are no idle background reads. Await every started Task before moving or
 /// destroying the Stream; otherwise the process terminates. The loop, transport
@@ -43,8 +44,8 @@ namespace Mira::tls {
 template<BoundedStream Underlying>
 class Stream {
 public:
-    // A conservative reservation for the two BIOs and wire input/output buffers.
-    // OpenSSL internals, caller spans and allocator overhead are not included.
+    // 默认预留两个 BIO 和密文收发缓冲；早期载荷预算由 Engine 按需额外申请。
+    // 不包含 OpenSSL 内部、调用方 span 及分配器开销。
     static constexpr std::size_t reserved_buffer_bytes = Engine::reserved_buffer_bytes + 32 * 1024;
     [[nodiscard]] static Result<Stream>
     create(EventLoop& loop, Underlying& underlying, const Context& context,
@@ -79,6 +80,29 @@ public:
     [[nodiscard]] Task<Result<void>> handshake(OperationOptions options = {}) {
         return run_void(state_, Operation::handshake, std::move(options));
     }
+    /// 与普通握手同样独占，沿用同一个绝对截止时间和取消语义。
+    /// source 在任务完成前须保持有效；只允许显式声明可安全重放的载荷。
+    [[nodiscard]] Task<Result<std::size_t>> handshake_early_data(
+        std::span<const std::byte> source, EarlyDataPolicy policy, OperationOptions options = {}) {
+        return run_early(state_, source, policy, std::move(options));
+    }
+    [[nodiscard]] Result<void> resume(SessionTicket ticket) {
+        if (!state_ || state_->thread != std::this_thread::get_id() || state_->failed)
+            return fail(make_error_code(Errc::invalid_state));
+        if (state_->active.load(std::memory_order_acquire) != 0)
+            return fail(make_error_code(Errc::operation_in_progress));
+        return state_->engine.resume(std::move(ticket));
+    }
+    [[nodiscard]] Result<std::optional<SessionTicket>> take_session() {
+        if (!state_ || state_->thread != std::this_thread::get_id() || state_->failed)
+            return fail(make_error_code(Errc::invalid_state));
+        if (state_->active.load(std::memory_order_acquire) != 0)
+            return fail(make_error_code(Errc::operation_in_progress));
+        return state_->engine.take_session();
+    }
+    [[nodiscard]] EarlyDataStatus early_data_status() const noexcept {
+        return state_ ? state_->engine.early_data_status() : EarlyDataStatus::not_attempted;
+    }
     [[nodiscard]] Task<Result<std::size_t>> read_some(std::span<std::byte> destination,
                                                      OperationOptions options = {}) {
         return run(state_, Operation::read, destination, {}, std::move(options));
@@ -112,7 +136,7 @@ public:
     }
 
 private:
-    enum class Operation { handshake, read, write, shutdown };
+    enum class Operation { handshake, early_handshake, read, write, shutdown };
     enum class Phase { ready, input, output, finished };
 
     struct Request {
@@ -362,6 +386,9 @@ private:
         Result<Engine::Step> result = fail(make_error_code(Errc::invalid_state));
         switch (request.operation) {
         case Operation::handshake: result = state.engine.handshake(); break;
+        case Operation::early_handshake:
+            result = state.engine.handshake_early_data(request.source, EarlyDataPolicy::replay_safe);
+            break;
         case Operation::read: result = state.engine.read(request.destination); break;
         case Operation::write: result = state.engine.write(request.source); break;
         case Operation::shutdown: result = state.engine.shutdown(); break;
@@ -376,7 +403,8 @@ private:
                 request.phase = Phase::finished;
             } else {
                 fail_session(state, &request, result.error(), {},
-                             request.operation == Operation::handshake);
+                             request.operation == Operation::handshake ||
+                             request.operation == Operation::early_handshake);
             }
             return true;
         }
@@ -546,7 +574,8 @@ private:
             co_return fail(make_error_code(Errc::invalid_state));
         if (options.stop.stop_requested()) co_return fail(Mira::Errc::cancelled);
         if (options.deadline && *options.deadline <= Clock::now()) co_return fail(Mira::Errc::timed_out);
-        const bool exclusive = operation == Operation::handshake || operation == Operation::shutdown;
+        const bool exclusive = operation == Operation::handshake || operation == Operation::early_handshake ||
+                               operation == Operation::shutdown;
         const auto index = operation == Operation::write ? 1U : 0U;
         const auto* reader = state->requests[0];
         if (state->requests[index] || (exclusive && state->requests[1]) ||
@@ -558,6 +587,15 @@ private:
         co_await AwaitRequest{state, request, forward};
         if (request.exception) std::rethrow_exception(request.exception);
         co_return request.result;
+    }
+
+    static Task<Result<std::size_t>> run_early(std::shared_ptr<State> state,
+                                              std::span<const std::byte> source,
+                                              EarlyDataPolicy policy, OperationOptions options) {
+        if (policy != EarlyDataPolicy::replay_safe || source.empty() ||
+            source.size() > Engine::max_early_data_bytes)
+            co_return fail(Mira::Errc::invalid_argument);
+        co_return co_await run(std::move(state), Operation::early_handshake, {}, source, std::move(options));
     }
 
     static Task<Result<void>> run_void(std::shared_ptr<State> state, Operation operation,

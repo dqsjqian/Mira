@@ -3,6 +3,8 @@
 #include "socket_compat.hpp"
 
 #include <array>
+#include <algorithm>
+#include <vector>
 
 namespace Mira::transport::tcp {
 namespace {
@@ -36,6 +38,95 @@ Task<Result<std::size_t>> Socket::writev_some(
         co_return fail(Errc::invalid_argument);
     }
     co_return co_await loop_->writev(handle_, pieces, std::move(options));
+}
+
+Task<Result<TransferResult>> Socket::send_file(
+    const FileSource& file, std::uint64_t offset, std::size_t count,
+    TransferOptions transfer, OperationOptions options) {
+    if (options.stop.stop_requested()) co_return fail(Errc::cancelled);
+    if (options.deadline && *options.deadline <= Clock::now()) co_return fail(Errc::timed_out);
+    if (!loop_ || !valid() || file.native_handle() == invalid_handle ||
+        transfer.chunk_size == 0 || transfer.chunk_size > 1024 * 1024 ||
+        (transfer.mode != TransferMode::copy && transfer.mode != TransferMode::prefer_native &&
+         transfer.mode != TransferMode::require_native) ||
+        offset > file.size() || static_cast<std::uint64_t>(count) > file.size() - offset)
+        co_return fail(Errc::invalid_argument);
+    EventLoop* loop = loop_;
+    const NativeHandle socket = handle_;
+    if (!transfer_state_) transfer_state_ = std::make_shared<TransferState>();
+    auto state = transfer_state_;
+    if (state->busy) co_return fail(Errc::invalid_argument);
+    state->busy = true;
+    struct Guard { std::shared_ptr<TransferState> state; ~Guard() { state->busy = false; } } guard{state};
+    bool copying = transfer.mode == TransferMode::copy;
+    std::vector<std::byte> buffer;
+    TransferResult result;
+    while (result.bytes < count) {
+        if (state->closed) co_return fail(Errc::cancelled);
+        if (options.stop.stop_requested()) co_return fail(Errc::cancelled);
+        if (options.deadline && *options.deadline <= Clock::now()) co_return fail(Errc::timed_out);
+        const auto amount = (std::min)(count - result.bytes, transfer.chunk_size);
+        if (!copying) {
+            const auto sent = co_await loop->send_file(socket, file.native_handle(), offset + result.bytes, amount, options);
+            if (!sent) {
+                if (sent.error() != make_error_code(Errc::not_supported) ||
+                    transfer.mode == TransferMode::require_native) co_return fail(sent.error());
+                copying = true;
+                continue;
+            }
+            if (*sent == 0) co_return fail(Errc::eof);
+            if (*sent > amount) co_return fail(Errc::invalid_argument);
+            result.bytes += *sent;
+            result.native_bytes += *sent;
+        } else {
+            if (buffer.empty()) buffer.resize(transfer.chunk_size);
+            const auto read = file.read_at(offset + result.bytes, std::span{buffer}.first(amount));
+            if (!read) co_return fail(read.error());
+            if (*read == 0) co_return fail(Errc::eof);
+            std::size_t written = 0;
+            while (written < *read) {
+                if (state->closed) co_return fail(Errc::cancelled);
+                const auto sent = co_await loop->write(socket,
+                    std::span<const std::byte>{buffer}.subspan(written, *read - written), options);
+                if (!sent) co_return fail(sent.error());
+                if (*sent == 0 || *sent > *read - written) co_return fail(Errc::invalid_argument);
+                written += *sent;
+                result.bytes += *sent;
+                result.copied_bytes += *sent;
+            }
+        }
+        if (result.bytes < count) co_await loop->yield();
+    }
+    co_return result;
+}
+
+Task<Result<TransferResult>> Socket::send_buffer(
+    std::span<const std::byte> source, TransferOptions transfer, OperationOptions options) {
+    if (options.stop.stop_requested()) co_return fail(Errc::cancelled);
+    if (options.deadline && *options.deadline <= Clock::now()) co_return fail(Errc::timed_out);
+    if (!loop_ || !valid() || transfer.chunk_size == 0 || transfer.chunk_size > 1024 * 1024 ||
+        (transfer.mode != TransferMode::copy && transfer.mode != TransferMode::prefer_native &&
+         transfer.mode != TransferMode::require_native)) co_return fail(Errc::invalid_argument);
+    if (transfer.mode == TransferMode::require_native) co_return fail(Errc::not_supported);
+    EventLoop* loop = loop_;
+    const NativeHandle socket = handle_;
+    if (!transfer_state_) transfer_state_ = std::make_shared<TransferState>();
+    auto state = transfer_state_;
+    if (state->busy) co_return fail(Errc::invalid_argument);
+    state->busy = true;
+    struct Guard { std::shared_ptr<TransferState> state; ~Guard() { state->busy = false; } } guard{state};
+    TransferResult result;
+    while (result.bytes < source.size()) {
+        if (state->closed) co_return fail(Errc::cancelled);
+        const auto amount = (std::min)(source.size() - result.bytes, transfer.chunk_size);
+        const auto sent = co_await loop->write(socket, source.subspan(result.bytes, amount), options);
+        if (!sent) co_return fail(sent.error());
+        if (*sent == 0 || *sent > amount) co_return fail(Errc::invalid_argument);
+        result.bytes += *sent;
+        result.copied_bytes += *sent;
+        if (result.bytes < source.size()) co_await loop->yield();
+    }
+    co_return result;
 }
 
 Result<Endpoint> Socket::peer_endpoint() const {
@@ -79,6 +170,8 @@ void Socket::close() noexcept {
     // cancellation handler may close (or destroy) this wrapper reentrantly.
     const NativeHandle handle = std::exchange(handle_, invalid_handle);
     EventLoop* loop = std::exchange(loop_, nullptr);
+    auto transfer = std::move(transfer_state_);
+    if (transfer) transfer->closed = true;
     if (loop != nullptr) {
         loop->detach(handle);
     }

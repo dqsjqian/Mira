@@ -32,6 +32,9 @@ class BasicClient {
 public:
     using Connection = typename Factory::Connection;
     using SessionType = Session<Connection>;
+    [[nodiscard]] static constexpr std::string_view scheme() requires requires { Factory::scheme; } {
+        return Factory::scheme;
+    }
 private:
     using Pool = ConnectionPool<Connection>;
     using Key = std::pair<std::string, std::uint16_t>;

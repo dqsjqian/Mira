@@ -20,6 +20,7 @@ private:
 };
 
 struct HttpFactory {
+    static constexpr std::string_view scheme = "http";
     using Connection = HttpConnection;
     [[nodiscard]] Task<Result<std::unique_ptr<Connection>>> operator()(
         EventLoop&, transport::tcp::Socket socket, const std::string&,

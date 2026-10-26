@@ -7,9 +7,11 @@
 add_library(mira_transport
     src/endpoint.cpp
     src/tcp.cpp
+    src/transfer.cpp
     src/udp.cpp
     src/local.cpp
     src/resolver.cpp
+    src/dns_config.cpp
 )
 
 add_library(Mira::transport ALIAS mira_transport)
@@ -28,7 +30,9 @@ target_link_libraries(mira_transport
 )
 
 if(WIN32)
-    target_link_libraries(mira_transport PUBLIC ws2_32 mswsock)
+    target_link_libraries(mira_transport PUBLIC ws2_32 mswsock iphlpapi)
+elseif(APPLE)
+    target_link_libraries(mira_transport PRIVATE resolv)
 endif()
 
 set_target_properties(mira_transport PROPERTIES

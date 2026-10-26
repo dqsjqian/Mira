@@ -33,6 +33,8 @@ std::string str(const Bytes& bytes) { return {reinterpret_cast<const char*>(byte
 struct BrokerStats {
     int pings = 0;
     int publishes = 0;
+    int alias_definitions = 0;
+    int alias_uses = 0;
     bool disconnected = false;
     std::optional<Version> version;
 };
@@ -42,6 +44,7 @@ Task<void> broker(Socket peer, BrokerStats& stats, std::uint8_t refuse = 0, std:
     Version version = Version::v5;
     Bytes pending;
     std::map<std::string, QoS> subscriptions;
+    std::map<std::uint16_t, std::string> topic_aliases;
     std::uint16_t next_id = 1;
     const auto send = [&](const Packet& packet) -> Task<Result<void>> {
         auto wire = encode(packet, version);
@@ -65,6 +68,7 @@ Task<void> broker(Socket peer, BrokerStats& stats, std::uint8_t refuse = 0, std:
                 stats.version = version;
                 Connack ack{false, refuse, {}};
                 if (version == Version::v5 && !refuse) {
+                    ack.properties.topic_alias_maximum = 2;
                     if (c->client_id.empty()) ack.properties.assigned_client_identifier = "assigned-1";
                     if (server_keep_alive) ack.properties.server_keep_alive = server_keep_alive;
                 }
@@ -84,6 +88,18 @@ Task<void> broker(Socket peer, BrokerStats& stats, std::uint8_t refuse = 0, std:
                 }
                 replies.push_back(ack);
             } else if (auto* p = std::get_if<Publish>(&packet)) {
+                if (const auto alias = p->properties.topic_alias) {
+                    CHECK(*alias > 0 && *alias <= 2);
+                    if (p->topic.empty()) {
+                        CHECK(topic_aliases.contains(*alias));
+                        if (!topic_aliases.contains(*alias)) co_return;
+                        p->topic = topic_aliases.at(*alias);
+                        ++stats.alias_uses;
+                    } else {
+                        topic_aliases[*alias] = p->topic;
+                        ++stats.alias_definitions;
+                    }
+                }
                 ++stats.publishes;
                 if (p->qos == QoS::at_least_once) replies.push_back(Ack{PacketType::puback, p->packet_id, reason::success, {}});
                 if (p->qos == QoS::exactly_once) replies.push_back(Ack{PacketType::pubrec, p->packet_id, reason::success, {}});
@@ -132,6 +148,7 @@ Task<void> exchange(EventLoop& loop, Version version) {
     if (!stream) co_return;
     ClientOptions options;
     options.version = version;
+    options.outbound_topic_alias_maximum = version == Version::v5 ? 2 : 0;
     options.client_id = version == Version::v5 ? "" : "v3-client";
     options.keep_alive = 0;
     const OperationOptions io{.deadline = Clock::now() + 10s};
@@ -186,6 +203,8 @@ Task<void> exchange(EventLoop& loop, Version version) {
     CHECK(bye.has_value() && client.closed());
     co_await scope.join();
     CHECK(stats.disconnected && stats.publishes == 4);
+    if (version == Version::v5) CHECK(stats.alias_definitions == 2 && stats.alias_uses == 2);
+    else CHECK(stats.alias_definitions == 0 && stats.alias_uses == 0);
 }
 
 Task<void> keep_alive(EventLoop& loop) {
@@ -562,7 +581,62 @@ Task<void> persistence_events() {
     }
 }
 
+Task<void> outbound_alias_reconnect() {
+    test::section("Client 部分发送后重连、检查点恢复不携带旧连接别名");
+    ClientOptions options;
+    options.client_id = "outbound-alias";
+    options.clean_start = false;
+    options.outbound_topic_alias_maximum = 2;
+    Connack ack;
+    ack.properties.topic_alias_maximum = 2;
+    ScriptedBroker previous;
+    previous.input.push_back(*encode(ack, Version::v5));
+    auto client = co_await Client<ScriptedBroker>::connect(previous, options);
+    CHECK(client.has_value());
+    if (!client) co_return;
+    previous.output.clear();
+    const auto first = co_await client->publish("original/topic", text("first"), QoS::at_least_once);
+    const auto second = co_await client->publish("original/topic", text("second"), QoS::exactly_once);
+    CHECK(first && second);
+    previous.write_budget = 2;
+    const auto failed = co_await client->publish("other/topic", text("partial"), QoS::at_least_once);
+    CHECK(!failed && failed.error() == Errc::timed_out && client->closed());
+    auto image = client->checkpoint("broker-alias");
+    CHECK(image.has_value());
+    if (!image) co_return;
+    const auto check = [](const ScriptedBroker& peer, bool aliases) {
+        std::span<const std::byte> bytes{peer.output};
+        std::vector<Publish> messages;
+        while (!bytes.empty()) {
+            auto packet = decode(bytes, Version::v5, Role::server);
+            CHECK(packet && packet->packet);
+            if (!packet || !packet->packet) break;
+            if (auto* p = std::get_if<Publish>(&*packet->packet)) messages.push_back(*p);
+            bytes = bytes.subspan(packet->consumed);
+        }
+        CHECK(messages.size() == 3);
+        if (messages.size() != 3) return;
+        CHECK(messages[0].topic == "original/topic" && messages[0].dup);
+        CHECK(messages[1].topic == (aliases ? "" : "original/topic") && messages[1].dup);
+        CHECK(messages[2].topic == "other/topic" && messages[2].dup);
+        for (const auto& message : messages) CHECK(message.properties.topic_alias.has_value() == aliases);
+    };
+    ScriptedBroker fresh;
+    ack.session_present = true;
+    ack.properties.topic_alias_maximum = 1;
+    fresh.input.push_back(*encode(ack, Version::v5));
+    CHECK((co_await client->reconnect(fresh)).has_value());
+    check(fresh, true);
+    ScriptedBroker restored_peer;
+    ack.properties.topic_alias_maximum.reset();
+    restored_peer.input.push_back(*encode(ack, Version::v5));
+    auto restored = co_await Client<ScriptedBroker>::restore(restored_peer, options, *image, "broker-alias");
+    CHECK(restored.has_value());
+    check(restored_peer, false);
+}
+
 Task<void> run(EventLoop& loop) {
+    co_await outbound_alias_reconnect();
     co_await persistence_events();
     co_await bounded_events_and_auth();
     co_await transport_failure_state();

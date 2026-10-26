@@ -26,6 +26,7 @@ private:
 /// Negotiates HTTP/1.1 only. Trust, client certificates and identity policy remain fixed.
 class HttpsFactory {
 public:
+    static constexpr std::string_view scheme = "https";
     using Connection = HttpsConnection;
     [[nodiscard]] static Result<HttpsFactory> create(tls::Context::ClientConfig config = {},
                                                                std::optional<ResourceBudget> buffer_budget = {}) {

@@ -24,7 +24,7 @@ Parameters:
     --websocket     Enable WebSocket module
                     (MIRA_ENABLE_WEBSOCKET=ON; needs OpenSSL Crypto + zlib).
     --http2         Enable nghttp2 HTTP/2 module (MIRA_ENABLE_HTTP2=ON).
-    --http3         Enable QUIC/HTTP-3 modules, experimental
+    --http3         Enable QUIC/HTTP-3 modules
                     (MIRA_ENABLE_HTTP3=ON).
     --bench         Build in-process benchmarks (MIRA_BUILD_BENCH=ON).
     --warnings-as-errors / --no-warnings-as-errors
@@ -81,7 +81,7 @@ def main(argv=None) -> int:
     parser.add_argument("--tls", action="store_true", help="Enable OpenSSL 3 TLS module")
     parser.add_argument("--websocket", action="store_true", help="Enable WebSocket module")
     parser.add_argument("--http2", action="store_true", help="Enable nghttp2 HTTP/2 module")
-    parser.add_argument("--http3", action="store_true", help="Enable QUIC/HTTP-3 modules (experimental)")
+    parser.add_argument("--http3", action="store_true", help="Enable QUIC/HTTP-3 modules")
     parser.add_argument("--bench", action="store_true", help="Build in-process benchmarks")
     parser.add_argument("--warnings-as-errors", action=argparse.BooleanOptionalAction, default=True,
                         help="Treat compiler warnings as errors (default: on; auto-off for GCC)")

@@ -32,6 +32,7 @@
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
+#include <cstdint>
 #include "mira/core/functional.hpp"  // mira::move_only_function — posted work
 #include <memory>
 #include <span>
@@ -113,6 +114,18 @@ public:
     [[nodiscard]] Task<Result<std::size_t>>
     writev(NativeHandle handle, std::span<const std::span<const std::byte>> pieces,
            OperationOptions options = {});
+
+    /// Transfer a bounded file region to a connected socket without a userspace
+    /// copy (sendfile / TransmitFile). Short transfers are normal; zero means
+    /// file EOF. Borrows both handles until completion, including cancellation
+    /// drain on IOCP. The source file must remain unmodified while the peer may
+    /// still be reading: kernel page references can outlive this completion.
+    /// File offset is explicit and the file's shared cursor is never changed.
+    /// File page faults can block the loop; use resident files for latency-
+    /// sensitive paths. not_supported is returned where no native path exists.
+    [[nodiscard]] Task<Result<std::size_t>> send_file(
+        NativeHandle socket, NativeHandle file, std::uint64_t offset,
+        std::size_t count, OperationOptions options = {});
 
     /// Accept one connection from a listening handle.
     ///

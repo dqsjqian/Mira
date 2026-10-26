@@ -83,7 +83,7 @@ static_assert(MIRA_VERSION == MIRA_VERSION_NUMBER({major}, {minor}, {patch}));
 static_assert(std::string_view{{MIRA_VERSION_STRING}} == "{version}");
 '''
     installed = ['core', 'transport', 'http', 'client', 'socks', 'dns', 'mqtt']
-    for component, option in [('tls', 'TLS'), ('ws', 'WEBSOCKET'), ('http2', 'HTTP2'), ('http3', 'HTTP3')]:
+    for component, option in [('tls', 'TLS'), ('ws', 'WEBSOCKET'), ('http2', 'HTTP2'), ('http3', 'HTTP3'), ('dnssec', 'DNSSEC')]:
         if cache.get('MIRA_ENABLE_' + option) == 'ON':
             installed.append(component)
     if 'http3' in installed:
@@ -185,7 +185,7 @@ foreach(component IN ITEMS core transport http)
     message(FATAL_ERROR "Missing standard component status ${component}")
   endif()
 endforeach()
-foreach(component IN ITEMS tls crypto ws http2 quic http3)
+foreach(component IN ITEMS tls crypto ws http2 quic http3 dnssec)
   if(TARGET Mira::${component})
     message(FATAL_ERROR "Unexpected optional component loaded ${component}")
   endif()
@@ -210,11 +210,33 @@ int main() {
 ''')
         case('optional-unknown', 'COMPONENTS core OPTIONAL_COMPONENTS unknown',
              checks='if(Mira_unknown_FOUND)\n  message(FATAL_ERROR "Unknown component unexpectedly found")\nendif()')
-        for component in ('tls', 'ws', 'http2'):
+        for component in ('tls', 'ws', 'http2', 'dnssec'):
             if component in installed:
                 case('explicit-' + component, 'COMPONENTS ' + component,
                      checks=f'if(NOT Mira_{component}_FOUND OR NOT TARGET Mira::{component})\n'
                             f'  message(FATAL_ERROR "Explicit component not loaded {component}")\nendif()')
+        if 'dnssec' in installed:
+            case('dnssec-link', 'COMPONENTS dnssec', links='dnssec', source='''
+#include <mira/dns/dnssec.hpp>
+int main() {
+    auto owner = Mira::dns::Name::parse("example.test");
+    Mira::dns::dnssec::Dnskey key;
+    key.flags = 257; key.algorithm = 15; key.public_key.resize(32);
+    auto ds = Mira::dns::dnssec::make_ds(*owner, key);
+    return ds && ds->digest.size() == 32 ? 0 : 1;
+}
+''')
+            case('dnssec-missing-crypto', 'COMPONENTS dnssec', disabled=('OpenSSL',),
+                 success=False, diagnostic="Mira component 'dnssec' is unavailable")
+            case('dns-without-crypto', 'COMPONENTS dns OPTIONAL_COMPONENTS dnssec', hidden=True,
+                 links='dns', source='''
+#include <mira/dns/message.hpp>
+int main() { return Mira::dns::Name::parse("example.test") ? 0 : 1; }
+''', checks='''
+if(TARGET Mira::dnssec OR TARGET Mira::crypto OR Mira_dnssec_FOUND)
+  message(FATAL_ERROR "DNS must remain usable without optional crypto")
+endif()
+''')
         if 'ws' in installed:
             no_zlib = ('ZLIB',)
             case('ws-missing-zlib', 'COMPONENTS ws', disabled=no_zlib, success=False,
@@ -313,16 +335,16 @@ endif()
 ''')
         case('unknown-required', 'COMPONENTS unknown', success=False,
              diagnostic="Mira component 'unknown' is unavailable")
-        optional = 'tls crypto ws http2 quic http3 unknown'
+        optional = 'tls crypto ws http2 quic http3 dnssec unknown'
         case('optional-hidden', 'COMPONENTS core OPTIONAL_COMPONENTS ' + optional,
              hidden=True, checks='''
-foreach(component IN ITEMS tls crypto ws http2 quic http3 unknown)
+foreach(component IN ITEMS tls crypto ws http2 quic http3 dnssec unknown)
   if(Mira_${component}_FOUND)
     message(FATAL_ERROR "Missing optional component unexpectedly found ${component}")
   endif()
 endforeach()
 ''')
-        for component in ['tls', 'http2', 'quic', 'http3']:
+        for component in ['tls', 'http2', 'quic', 'http3', 'dnssec']:
             case('missing-' + component, 'COMPONENTS ' + component,
                  hidden=True, success=False,
                  diagnostic=f"Mira component '{component}' is unavailable")

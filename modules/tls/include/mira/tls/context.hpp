@@ -1,13 +1,20 @@
 #pragma once
 
 #include "mira/core/error.hpp"
+#include "mira/core/early_data.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <span>
 #include <string_view>
 
 namespace Mira::tls {
+
+using Mira::EarlyDataPolicy;
+using Mira::EarlyDataStatus;
+using Mira::ReplayStore;
+using Mira::MemoryReplayStore;
 
 class Engine;
 
@@ -78,6 +85,12 @@ public:
         /// OpenSSL may filter mismatched responses; that proves neither validation
         /// nor transmission. Use client OcspPolicy::require when status is mandatory.
         std::span<const std::byte> ocsp_response{};
+        /// 默认禁用。显式开启要求 replay_store，且不能与 mTLS/CRL 同用。
+        /// 应用必须保证全部早期操作可安全重放；TLS 不解析 HTTP 方法。
+        EarlyDataPolicy early_data{EarlyDataPolicy::disabled};
+        std::shared_ptr<ReplayStore> replay_store{};
+        /// 当前进程票据域：1 秒至 7 天；reload_server 轮转密钥并使旧票据失效。
+        std::chrono::seconds ticket_lifetime{3600};
     };
 
     /// Client trust and optional mTLS identity configuration.

@@ -143,7 +143,9 @@ struct Record {
     std::string method;
     std::string target;
     bool auth = false;
+    bool proxy_auth = false;
     bool cookie = false;
+    std::string cookie_value;
     std::string custom;
     std::string body;
 };
@@ -184,7 +186,11 @@ struct Server {
                     std::from_chars(value.data(), value.data() + value.size(), content_length);
                 }
                 if (line.starts_with("Authorization:")) record.auth = true;
-                if (line.starts_with("Cookie:")) record.cookie = true;
+                if (line.starts_with("Proxy-Authorization:")) record.proxy_auth = true;
+                if (line.starts_with("Cookie:")) {
+                    record.cookie = true;
+                    record.cookie_value = std::string{Mira::client::detail::trim_redirect_ows(std::string_view{line}.substr(7))};
+                }
                 if (line.starts_with("X-Custom:")) {
                     auto value = line.substr(9);
                     while (!value.empty() && value.front() == ' ') value.erase(0, 1);
@@ -226,6 +232,20 @@ struct Server {
             else if (target == "/to-https") redirect(302, "https://other.test/secure");
             else if (target == "/cross") redirect(302, "http://other.test:8080/elsewhere");
             else if (target == "/elsewhere") ok("elsewhere");
+            else if (target == "/cookie-start") {
+                redirect(302, "/cookie-hop");
+                headers += "Set-Cookie: root=one; Path=/\r\nSet-Cookie: scoped=one; Path=/cookie-hop\r\n";
+            } else if (target == "/cookie-hop") redirect(302, "/cookie-end");
+            else if (target == "/cookie-end") ok(record.cookie_value);
+            else if (target == "/set-local") {
+                ok("set");
+                headers += "Set-Cookie: local=two; Path=/\r\n";
+            } else if (target == "/cache" || target == "/private-cache" || target == "/no-store" || target == "/cache-variant") {
+                ok(record.custom.empty() ? "cache-body" : record.custom);
+                headers += target == "/no-store" ? "Cache-Control: no-store, max-age=60\r\n" : "Cache-Control: max-age=60\r\n";
+                if (target == "/private-cache") headers += "Set-Cookie: secret=one; Path=/\r\n";
+                if (target == "/cache-variant") headers += "Vary: X-Custom\r\n";
+            }
             else if (target == "/max0") redirect(302, "/max1");
             else if (target == "/max1") redirect(302, "/max2");
             else if (target == "/max2") redirect(302, "/max3");
@@ -382,6 +402,85 @@ Task<void> loop_checks(EventLoop& loop, Server& server) {
             CHECK(result->status == 304);
             CHECK(result->body.empty());
         }
+    }
+    test::section("显式状态逐跳处理 Cookie，路径和跨源 Cookie 不泄露");
+    {
+        auto state = *RequestState::create({.cookies = CookieOptions{}, .cache = ResponseCacheOptions{}});
+        RedirectOptions policy{.state = state};
+        auto result = co_await request_with_redirects(*client, "http", "a.test", server_port, get("/cookie-start"), {}, policy);
+        CHECK_VALUE(result);
+        if (result) CHECK(body_text(result->body) == "root=one");
+        const auto hop = last_for(server, "/cookie-hop");
+        CHECK(hop && hop->cookie_value == "scoped=one; root=one");
+        auto local = co_await request_with_redirects(*client, "http", "other.test", 8080, get("/set-local"), {}, policy);
+        CHECK_VALUE(local);
+        auto cross = get("/cross");
+        cross.headers.append("Authorization", "Bearer first");
+        cross.headers.append("Proxy-Authorization", "Basic proxy");
+        cross.headers.append("Cookie", "manual=first");
+        result = co_await request_with_redirects(*client, "http", "a.test", server_port, std::move(cross), {}, policy);
+        CHECK_VALUE(result);
+        const auto destination = last_for(server, "/elsewhere");
+        CHECK(destination && !destination->auth && !destination->proxy_auth && destination->cookie_value == "local=two");
+        result = co_await request_with_redirects(*client, "http", "a.test", server_port, get("/cookie-end"));
+        CHECK(result && body_text(result->body).empty());
+        auto independent = *RequestState::create({.cookies = CookieOptions{}});
+        result = co_await request_with_redirects(*client, "http", "a.test", server_port, get("/cookie-end"), {}, {.state = independent});
+        CHECK(result && body_text(result->body).empty());
+        const auto before = server.records.size();
+        result = co_await request_with_redirects(*client, "https", "a.test", server_port, get("/cookie-end"), {}, policy);
+        CHECK(!result && result.error() == Errc::invalid_argument);
+        CHECK(server.records.size() == before);
+    }
+    test::section("缓存集成命中、变体、敏感请求绕过、失效和取消");
+    {
+        auto state = *RequestState::create({.cache = ResponseCacheOptions{}});
+        RedirectOptions policy{.state = state};
+        auto first = co_await request_with_redirects(*client, "http", "cache.test", server_port, get("/cache"), {}, policy);
+        CHECK_VALUE(first);
+        const auto before_hit = server.records.size();
+        auto hit = co_await request_with_redirects(*client, "http", "cache.test", server_port, get("/cache"), {}, policy);
+        CHECK(hit && body_text(hit->body) == "cache-body" && hit->headers.contains("Age"));
+        CHECK(server.records.size() == before_hit);
+        std::stop_source cancelled; cancelled.request_stop();
+        hit = co_await request_with_redirects(*client, "http", "cache.test", server_port, get("/cache"), {}, policy,
+            {.stop = cancelled.get_token()});
+        CHECK(!hit && hit.error() == Errc::cancelled);
+        hit = co_await request_with_redirects(*client, "http", "cache.test", server_port, get("/cache"), {}, policy,
+            {.deadline = Clock::now() - 1s});
+        CHECK(!hit && hit.error() == Errc::timed_out);
+        CHECK(server.records.size() == before_hit);
+        for (const auto header : {"Authorization", "Cookie", "Range", "Cache-Control"}) {
+            auto request = get("/cache"); request.headers.append(header, "x");
+            const auto before = server.records.size();
+            auto result = co_await request_with_redirects(*client, "http", "cache.test", server_port, request, {}, policy);
+            CHECK_VALUE(result);
+            CHECK(server.records.size() == before + 1);
+        }
+        for (const auto target : {"/private-cache", "/no-store"}) {
+            const auto before = server.records.size();
+            for (int i = 0; i < 2; ++i) {
+                auto result = co_await request_with_redirects(*client, "http", "cache.test", server_port, get(target), {}, policy);
+                CHECK_VALUE(result);
+            }
+            CHECK(server.records.size() == before + 2);
+        }
+        for (const auto value : {"en", "fr"}) {
+            auto request = get("/cache-variant"); request.headers.append("X-Custom", value);
+            auto result = co_await request_with_redirects(*client, "http", "cache.test", server_port, request, {}, policy);
+            CHECK(result && body_text(result->body) == value);
+            const auto before = server.records.size();
+            result = co_await request_with_redirects(*client, "http", "cache.test", server_port, request, {}, policy);
+            CHECK(result && body_text(result->body) == value && server.records.size() == before);
+        }
+        auto update = get("/write"); update.method = http::Method::post;
+        auto result = co_await request_with_redirects(*client, "http", "cache.test", server_port, update, {}, policy);
+        CHECK_VALUE(result);
+        const auto before = server.records.size();
+        result = co_await request_with_redirects(*client, "http", "cache.test", server_port, get("/cache"), {}, policy);
+        CHECK(result && server.records.size() == before + 1);
+        result = co_await request_with_redirects(*client, "http", "another.test", server_port, get("/cache"), {}, policy);
+        CHECK(result && server.records.size() == before + 2);
     }
 #ifdef MIRA_CLIENT_HAS_ZLIB
     test::section("redirected body composes with Content-Encoding decoding");

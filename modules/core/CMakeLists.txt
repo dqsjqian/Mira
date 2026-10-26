@@ -7,6 +7,7 @@
 
 add_library(mira_core
     src/error.cpp
+    src/early_data.cpp
     src/event_loop_common.cpp
 )
 

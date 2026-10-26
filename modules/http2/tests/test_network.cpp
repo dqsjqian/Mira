@@ -138,7 +138,7 @@ struct CertificateFiles {
         std::string suffix;
         constexpr char hex[] = "0123456789abcdef";
         for (auto value : random) { suffix += hex[value >> 4]; suffix += hex[value & 15]; }
-        directory = std::filesystem::path(MIRA_HTTP2_TEST_BINARY_DIR) / ("h2-cert-" + suffix);
+        directory = std::filesystem::temp_directory_path() / ("h2-cert-" + suffix);
         require(std::filesystem::create_directory(directory));
         std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
         certificate = (directory / "cert.pem").string(); key = (directory / "key.pem").string();

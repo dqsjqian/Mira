@@ -63,6 +63,12 @@ target_include_directories(mira_client_redirect_tests PRIVATE ${PROJECT_SOURCE_D
 add_test(NAME client_redirect COMMAND mira_client_redirect_tests)
 set_tests_properties(client_redirect PROPERTIES TIMEOUT 60)
 
+add_executable(mira_client_request_state_tests test_request_state.cpp)
+target_link_libraries(mira_client_request_state_tests PRIVATE Mira::client Mira::warnings)
+target_include_directories(mira_client_request_state_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+add_test(NAME client_request_state COMMAND mira_client_request_state_tests)
+set_tests_properties(client_request_state PROPERTIES TIMEOUT 60)
+
 add_executable(mira_client_decompress_tests test_decompress.cpp)
 target_link_libraries(mira_client_decompress_tests PRIVATE Mira::client Mira::warnings)
 target_include_directories(mira_client_decompress_tests PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)

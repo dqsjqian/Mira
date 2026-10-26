@@ -147,7 +147,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "$env:GITHUB_WORKSPACE/build/interop-curl/prefix/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Configure TLS
-        run: cmake -S . -B build/tls ${{ runner.os == 'Windows' && '-DCMAKE_CONFIGURATION_TYPES=Debug' || '-DCMAKE_BUILD_TYPE=Debug' }} -DCMAKE_CXX_STANDARD=${{ matrix.std }} -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON ${{ env.MIRA_PLATFORM_PROTOCOL_FLAGS }}
+        run: cmake -S . -B build/tls ${{ runner.os == 'Windows' && '-DCMAKE_CONFIGURATION_TYPES=Debug' || '-DCMAKE_BUILD_TYPE=Debug' }} -DCMAKE_CXX_STANDARD=${{ matrix.std }} -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_DNSSEC=ON ${{ env.MIRA_PLATFORM_PROTOCOL_FLAGS }}
       - name: Build TLS
         run: cmake --build build/tls --parallel --config Debug
       - name: Test TLS and HTTPS
@@ -198,7 +198,7 @@ jobs:
       - name: Build pinned MinGW QUIC and HTTP3 dependencies
         run: python scripts/ci/build_protocol_deps.py --path build/mingw-protocol-deps --openssl-root "$MINGW_PREFIX" --generator Ninja --config Debug
       - name: Configure with TLS and HTTP3
-        run: cmake -S . -B build/mingw -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON -DOPENSSL_ROOT_DIR="$MINGW_PREFIX" -DCMAKE_PREFIX_PATH="$PWD/build/mingw-protocol-deps/prefix"
+        run: cmake -S . -B build/mingw -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_DNSSEC=ON -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON -DOPENSSL_ROOT_DIR="$MINGW_PREFIX" -DCMAKE_PREFIX_PATH="$PWD/build/mingw-protocol-deps/prefix"
       - name: Build
         run: cmake --build build/mingw --parallel
       - name: Test
@@ -258,7 +258,7 @@ jobs:
       - name: Configure all protocols with ASan and UBSan
         run: >
           cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=Debug
-          -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON
+          -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_DNSSEC=ON
           -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON
           -DCMAKE_PREFIX_PATH="$PWD/build/asan-protocol-deps/prefix"
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
@@ -459,7 +459,7 @@ jobs:
         shell: bash
         run: >
           cmake -S . -B build/protocols -DCMAKE_BUILD_TYPE=Debug
-          -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON
+          -DMIRA_ENABLE_TLS=ON -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_DNSSEC=ON
           -DMIRA_ENABLE_HTTP2=ON
           -DMIRA_ENABLE_HTTP3=ON -DMIRA_BUILD_BENCH=ON
           -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix"

@@ -12,6 +12,22 @@
 
 namespace Mira::tls {
 
+/// 不透明、单次移动的 TLS 1.3 票据；绑定原客户端 Context 快照及对端名称。
+/// 不支持导出、复制或跨进程恢复；保存票据不会执行后台 I/O。
+class SessionTicket {
+public:
+    SessionTicket(SessionTicket&&) noexcept;
+    SessionTicket& operator=(SessionTicket&&) noexcept;
+    SessionTicket(const SessionTicket&) = delete;
+    SessionTicket& operator=(const SessionTicket&) = delete;
+    ~SessionTicket();
+private:
+    struct Impl;
+    explicit SessionTicket(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+    friend class Engine;
+};
+
 /// Synchronous memory-BIO state machine; it holds no socket and performs no
 /// asynchronous I/O. Calls on a single instance must be serialized; after each
 /// step, drain the ciphertext first, then supply whatever input is needed.
@@ -24,8 +40,9 @@ public:
     };
     static constexpr std::size_t buffer_capacity = 64 * 1024;
 
-    // Charges both fixed BIO buffers before SSL allocation and retains the charge
-    // until destruction. This excludes OpenSSL's internal allocations and RSS.
+    static constexpr std::size_t max_early_data_bytes = 16 * 1024;
+    // 默认只预留两个 BIO；早期载荷按需额外预留至多 16 KiB，完成或失效时释放。
+    // 不包含 OpenSSL 内部分配或 RSS。
     static constexpr std::size_t reserved_buffer_bytes = 2 * buffer_capacity;
     [[nodiscard]] static Result<Engine> create(const Context& context,
                                                std::string_view peer_name = {},
@@ -37,6 +54,18 @@ public:
     ~Engine();
 
     [[nodiscard]] Result<Step> handshake();
+    /// 完成握手并发送至多 16 KiB 安全载荷；首次调用复制载荷以保持重试字节不变。
+    /// 显式 replay_safe 必填。仅明确拒绝或没有兼容票据时在同连接 1-RTT 发送一次。
+    /// 取消、超时、传输及认证失败不得重试；complete 后再次调用返回 invalid_state。
+    /// WANT 重试期间须传入同样的载荷和策略，不能交替调用 handshake/read/write。
+    [[nodiscard]] Result<Step> handshake_early_data(std::span<const std::byte> source,
+                                                   EarlyDataPolicy policy);
+    /// 握手前消费票据。过期票据被消费但忽略，回到完整握手；身份/配置不匹配拒绝。
+    [[nodiscard]] Result<void> resume(SessionTicket ticket);
+    /// 完成读操作处理 NewSessionTicket 后可取一次；尚无票据时返回空 optional。
+    /// 显式 CA 且没有 mTLS/CRL/OCSP 的客户端才允许恢复；不导出 TLS 1.2 会话。
+    [[nodiscard]] Result<std::optional<SessionTicket>> take_session();
+    [[nodiscard]] EarlyDataStatus early_data_status() const noexcept;
     [[nodiscard]] Result<Step> read(std::span<std::byte> destination);
     [[nodiscard]] Result<Step> write(std::span<const std::byte> source);
     /// complete only means our close_notify has been generated; the caller must
@@ -59,6 +88,7 @@ public:
 private:
     struct Impl;
     explicit Engine(std::unique_ptr<Impl> impl) noexcept;
+    [[nodiscard]] Result<Step> drive_handshake();
     std::unique_ptr<Impl> impl_;
 };
 

@@ -39,6 +39,9 @@ if(MIRA_ENABLE_HTTP3)
     target_compile_features(bench_h3_soak PRIVATE cxx_std_23)
 endif()
 
+add_executable(bench_file_transfer file_transfer.cpp)
+target_link_libraries(bench_file_transfer PRIVATE Mira::transport Mira::warnings)
+
 add_executable(bench_h1_keepalive h1_keepalive.cpp)
 target_link_libraries(bench_h1_keepalive
     PRIVATE Mira::transport Mira::http Mira::warnings)

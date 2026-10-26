@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mira/core/error.hpp"
+#include "mira/core/early_data.hpp"
 #include "mira/transport/endpoint.hpp"
 
 #include <array>
@@ -94,8 +95,8 @@ class RetryValidation {
 };
 
 enum class MigrationPolicy { fixed_peer, validated };
-enum class EarlyDataPolicy { disabled, replay_safe };
-enum class EarlyDataStatus { not_attempted, pending, accepted, rejected };
+using Mira::EarlyDataPolicy;
+using Mira::EarlyDataStatus;
 enum class CongestionControl { cubic, reno, bbr };
 /// Called synchronously on the engine thread, including during destruction.
 /// The sink must not reenter the engine. Data is borrowed only for this call.
@@ -104,32 +105,10 @@ public:
     virtual ~QlogSink() = default;
     virtual void write(std::span<const std::byte> data, bool final) noexcept = 0;
 };
-/// Atomic anti-replay admission keyed by a service scope and the ClientHello
-/// random after TLS authenticates the resumed session's PSK binder. Implementations shared by ticket-domain members must
-/// claim atomically, retain until expires, and fail closed on storage failure.
-/// Callbacks are synchronous and must not block the event loop or reenter QUIC.
-class ReplayStore {
-public:
-    virtual ~ReplayStore() = default;
-    virtual bool claim(const std::array<std::byte, 32>& key, std::uint64_t now,
-                       std::uint64_t expires) noexcept = 0;
-};
-/// In-process, thread-safe bounded store. Full/clock rollback/allocation failure
-/// reject early data; live entries are never evicted. Share the same instance
-/// across all in-process engines using the same ServerContext. Restart loses
-/// memory, so do not restore old ticket keys after restart with a fresh store.
-class MemoryReplayStore final : public ReplayStore {
-public:
-    static Result<std::shared_ptr<MemoryReplayStore>> create(std::size_t max_entries = 4096);
-    ~MemoryReplayStore();
-    bool claim(const std::array<std::byte, 32>& key, std::uint64_t now,
-               std::uint64_t expires) noexcept override;
-    [[nodiscard]] std::size_t size() const noexcept;
-private:
-    struct Impl;
-    explicit MemoryReplayStore(std::unique_ptr<Impl> impl);
-    std::unique_ptr<Impl> impl_;
-};
+/// Source-compatible aliases to the protocol-neutral admission contract.
+/// QUIC keys include the service scope and authenticated ClientHello random.
+using Mira::ReplayStore;
+using Mira::MemoryReplayStore;
 class SessionCache;
 class ServerContext;
 struct Path {

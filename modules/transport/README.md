@@ -57,5 +57,27 @@ reasoning; this is a summary, not the specification.
 - `tcp::serve` adds connection admission, structured handlers and staged
   shutdown. Resource reservations are accounting limits, not process-RSS caps.
 
-Core backend tests exercise real loopback I/O on desktop CI; mobile builds are
-cross-compilation evidence unless a device run is explicitly recorded.
+## Explicit file transfer and resolver configuration
+
+`FileSource` owns a read-only regular file. `tcp::Socket::send_file` sends an
+explicit region with native Linux/macOS `sendfile` or Windows `TransmitFile`;
+`TransferMode::copy` exercises a bounded fallback, and `require_native` never
+silently copies. Results expose native/copied byte counts. Regular-file page
+faults and fallback reads can block; use resident files for latency-sensitive
+loops. The source must stay immutable until the peer consumes the bytes.
+Cancellation/deadline errors can follow partial wire output, so close rather
+than retry the original region. `send_buffer` currently uses the copy path and
+reports it honestly; Linux MSG_ZEROCOPY/error-queue completion is not implemented.
+`bench_file_transfer` compares the two file paths with byte-equality checks.
+
+`system_dns_config` snapshots default server configuration on Apple, Windows
+and Linux/BSD; `parse_resolver_config` bounds and validates an injected
+resolv.conf snapshot. Neither implements split-DNS/VPN policy. Use `Resolver`
+for native NSS/getaddrinfo semantics. Android callers supply Network
+LinkProperties DNS servers explicitly; undocumented property reads and public
+DNS fallbacks are deliberately absent.
+
+Mobile execution is explicitly distinguished from cross-compilation and
+physical-device evidence. `scripts/ci/run_mobile_tests.py` runs built CTest
+executables inside an iOS simulator or Android emulator, retaining per-test
+results and reporting host-side harnesses as skipped, not passed.

@@ -6,6 +6,8 @@
 #include <array>
 #include <chrono>
 #include <memory>
+#include <cstdlib>
+#include <vector>
 #if !MIRA_PLATFORM_WINDOWS
 #include <fcntl.h>
 #include <unistd.h>
@@ -16,7 +18,10 @@ namespace local = transport::local;
 Task<void> run(EventLoop& loop, std::string path) {
     auto listener = local::Listener::bind(loop, path);
     CHECK(listener.has_value());
-    if (!listener) co_return;
+    if (!listener) {
+        std::fprintf(stderr, "local bind: %s (%d)\n", listener.error().message().c_str(), listener.error().value());
+        co_return;
+    }
     CHECK(!local::Listener::bind(loop, path)); // Never unlink an existing path.
     OperationOptions io{.deadline = Clock::now() + 2s};
     auto client = co_await local::connect(loop, path, io);
@@ -79,13 +84,34 @@ int main() {
         CHECK(!unavailable && unavailable.error() == Errc::not_supported);
     }
 #else
-    std::array<char, 32> directory{};
-    const std::string pattern = "/tmp/mira-local-XXXXXX";
-    std::copy(pattern.begin(), pattern.end(), directory.begin());
+#if MIRA_PLATFORM_ANDROID
+    const char* temporary = std::getenv("TMPDIR");
+    const std::string root = temporary ? temporary : "/data/local/tmp";
+#else
+    const std::string root = "/tmp";
+#endif
+    const std::string pattern = root + "/mira-local-XXXXXX";
+    std::vector<char> directory(pattern.begin(), pattern.end());
+    directory.push_back('\0');
     auto* created = ::mkdtemp(directory.data());
     CHECK(created != nullptr);
     if (loop && created) {
         const std::string path = std::string(created) + "/stream";
+#if MIRA_PLATFORM_ANDROID
+        // The adb shell SELinux domain can forbid filesystem Unix sockets even
+        // inside its own writable directory. Preserve enforcement; report an
+        // environment skip, never a successful socket-runtime observation.
+        const auto probe_path = path + "-probe";
+        auto probe = local::Listener::bind(*loop, probe_path);
+        if (!probe && (probe.error() == std::errc::permission_denied ||
+                       probe.error() == std::errc::operation_not_permitted)) {
+            std::fprintf(stderr, "SKIP: Android security policy rejects Unix socket bind: %s\n",
+                         probe.error().message().c_str());
+            CHECK(::rmdir(created) == 0);
+            return test::failures == 0 ? 77 : 1;
+        }
+        if (probe) { probe->close(); CHECK(::unlink(probe_path.c_str()) == 0); }
+#endif
         CHECK(loop->run_until_complete(run(*loop, path)).has_value());
         test_move_reentrancy(*loop, path);
         // Only this test's own socket entry and private temporary directory.

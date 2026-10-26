@@ -398,6 +398,35 @@ public:
         return fail(error);
     }
 
+    [[nodiscard]] Result<detail::OperationId> submit_send_file(
+        NativeHandle socket, NativeHandle file, std::uint64_t offset, std::size_t count,
+        const OperationOptions& options, std::coroutine_handle<> coroutine,
+        Result<std::size_t>* result) {
+        if (shutting_down()) return fail(Errc::cancelled);
+        if (const auto rejected = detail::rejected_before_submit(options)) return fail(*rejected);
+        const auto transmit = resolve_extension<LPFN_TRANSMITFILE>(static_cast<SOCKET>(socket),
+                                                                   WSAID_TRANSMITFILE);
+        if (!transmit) {
+            if (transmit.error() == std::errc::operation_not_supported)
+                return fail(Errc::not_supported);
+            return fail(transmit.error());
+        }
+        const auto acquired = acquire_operation(Kind::write, coroutine, std::nullopt, options);
+        auto* operation = acquired.operation;
+        operation->size_result = result;
+        operation->socket = static_cast<SOCKET>(socket);
+        operation->overlapped.Offset = static_cast<DWORD>(offset & 0xffffffffULL);
+        operation->overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32U);
+        const auto amount = static_cast<DWORD>((std::min)(count, std::size_t{1024 * 1024}));
+        const BOOL submitted = (*transmit)(operation->socket, reinterpret_cast<HANDLE>(file),
+            amount, 0, &operation->overlapped, nullptr, 0);
+        if (submitted || ::WSAGetLastError() == WSA_IO_PENDING) return acquired.id;
+        const int native_error = ::WSAGetLastError();
+        discard(acquired.id);
+        if (native_error == WSAEOPNOTSUPP) return fail(Errc::not_supported);
+        return fail(socket_error(native_error));
+    }
+
     /// Scatter form of `submit_write`: WSASend gathers the descriptors in one
     /// overlapped submission, so the pieces reach the kernel unconcatenated.
     [[nodiscard]] Result<detail::OperationId>
@@ -1238,6 +1267,29 @@ Task<Result<std::size_t>> EventLoop::writev(NativeHandle handle,
     auto submit = [impl, handle, pieces, &options](std::coroutine_handle<> coroutine,
                                                    Result<std::size_t>* result) {
         return impl->submit_writev(handle, pieces, options, coroutine, result);
+    };
+    co_return co_await detail::await_operation<Result<std::size_t>>(
+        std::move(submit), detail::cancel_through(impl), options.stop);
+}
+
+Task<Result<std::size_t>> EventLoop::send_file(
+    NativeHandle socket, NativeHandle file, std::uint64_t offset,
+    std::size_t count, OperationOptions options) {
+    if (const auto rejected = detail::rejected_before_submit(options)) co_return fail(*rejected);
+    if (socket == invalid_handle || file == invalid_handle || file == 0 ||
+        offset > static_cast<std::uint64_t>((std::numeric_limits<LONGLONG>::max)()))
+        co_return fail(Errc::invalid_argument);
+    if (count == 0) co_return std::size_t{0};
+    auto* impl = impl_.get();
+    if (!impl || impl->shutting_down()) co_return fail(Errc::cancelled);
+    LARGE_INTEGER size{};
+    if (!::GetFileSizeEx(reinterpret_cast<HANDLE>(file), &size)) co_return fail(last_os_error());
+    if (offset >= static_cast<std::uint64_t>(size.QuadPart)) co_return std::size_t{0};
+    count = static_cast<std::size_t>((std::min)(static_cast<std::uint64_t>(count),
+        static_cast<std::uint64_t>(size.QuadPart) - offset));
+    auto submit = [impl, socket, file, offset, count, &options](std::coroutine_handle<> coroutine,
+                                                              Result<std::size_t>* result) {
+        return impl->submit_send_file(socket, file, offset, count, options, coroutine, result);
     };
     co_return co_await detail::await_operation<Result<std::size_t>>(
         std::move(submit), detail::cancel_through(impl), options.stop);

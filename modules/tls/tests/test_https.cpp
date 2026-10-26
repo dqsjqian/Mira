@@ -260,7 +260,7 @@ struct Certificates {
             suffix += hex[value & 15];
         }
         const auto candidate =
-            std::filesystem::path{MIRA_TLS_TEST_BINARY_DIR} / ("certificates-" + suffix);
+            std::filesystem::temp_directory_path() / ("mira-certificates-" + suffix);
         require(std::filesystem::create_directory(candidate));
         directory = candidate;
         std::filesystem::permissions(
@@ -1574,6 +1574,7 @@ struct EngineTransport {
     unsigned cancelled_writes = 0;
     unsigned reads = 0;
     unsigned writes = 0;
+    std::size_t fragment = tls::Engine::buffer_capacity;
 
     EngineTransport(EventLoop& loop, tls::Engine engine)
         : peer(std::move(engine)), available{loop}, read_completion{loop}, write_completion{loop} {}
@@ -1612,7 +1613,7 @@ struct EngineTransport {
                 co_return fail(waiting.error());
             }
         }
-        const auto size = std::min(bytes.size(), incoming.size());
+        const auto size = std::min({bytes.size(), incoming.size(), fragment});
         std::copy_n(incoming.begin(), size, bytes.begin());
         incoming.erase(incoming.begin(), incoming.begin() + static_cast<std::ptrdiff_t>(size));
         if (auto* stopped = std::exchange(stop_after_read, nullptr)) stopped->request_stop();
@@ -1629,6 +1630,7 @@ struct EngineTransport {
     Task<Result<std::size_t>> write_some(std::span<const std::byte> bytes, OperationOptions options = {}) {
         CHECK(!options.deadline);
         ++writes;
+        bytes = bytes.first(std::min(bytes.size(), fragment));
         const auto fed = peer.feed(bytes);
         CHECK(fed && *fed == bytes.size());
         if (!fed) co_return fail(fed.error());
@@ -2814,6 +2816,397 @@ void test_ocsp_server(const Certificates& certificates) {
     CHECK(handshake_contexts(*context, *requiring, "alpha.test", "h2").complete);
 }
 
+struct CountingReplayStore final : tls::ReplayStore {
+    std::shared_ptr<tls::MemoryReplayStore> memory;
+    std::size_t calls = 0;
+    bool reject = false;
+    CountingReplayStore() {
+        auto created = tls::MemoryReplayStore::create(64);
+        require(created.has_value());
+        memory = std::move(*created);
+    }
+    bool claim(const std::array<std::byte, 32>& key, std::uint64_t now,
+               std::uint64_t expires) noexcept override {
+        ++calls;
+        return !reject && memory->claim(key, now, expires);
+    }
+};
+
+tls::SessionTicket early_ticket(const tls::Context& server_context, const tls::Context& client_context) {
+    auto server = tls::Engine::create(server_context);
+    auto client = tls::Engine::create(client_context, "localhost");
+    require(server && client);
+    require(handshake_engines(*server, *client).complete);
+    const auto sent = server->write(bytes_of("ticket"));
+    require(sent && sent->transferred == 6);
+    transfer_engines(*server, *client);
+    std::array<std::byte, 32> bytes{};
+    const auto read = client->read(bytes);
+    require(read && read->transferred == 6);
+    auto ticket = client->take_session();
+    require(ticket && ticket->has_value());
+    auto duplicate = client->take_session();
+    CHECK(duplicate && !duplicate->has_value());
+    return std::move(**ticket);
+}
+
+void drive_early(tls::Engine& server, tls::Engine& client, std::span<const std::byte> payload) {
+    bool client_done = false;
+    bool server_done = false;
+    for (unsigned turn = 0; turn < 256 && (!client_done || !server_done); ++turn) {
+        if (!client_done) {
+            const auto step = client.handshake_early_data(payload, tls::EarlyDataPolicy::replay_safe);
+            require(step.has_value());
+            client_done = step->status == tls::Engine::Status::complete;
+            if (client_done) {
+                CHECK(step->transferred == payload.size());
+                auto reused_ticket = client.take_session();
+                CHECK(reused_ticket && !reused_ticket->has_value());
+            }
+        }
+        transfer_engines(client, server);
+        if (!server_done) {
+            const auto step = server.handshake();
+            require(step.has_value());
+            server_done = step->status == tls::Engine::Status::complete;
+        }
+        transfer_engines(server, client);
+    }
+    require(client_done && server_done);
+    std::array<std::byte, tls::Engine::max_early_data_bytes> bytes{};
+    const auto read = server.read(bytes);
+    require(read && read->status == tls::Engine::Status::complete);
+    CHECK(read->transferred == payload.size());
+    CHECK(std::equal(payload.begin(), payload.end(), bytes.begin()));
+    const auto more = server.read(bytes);
+    CHECK(more && more->status == tls::Engine::Status::want_input);
+    const auto repeated = client.handshake_early_data(payload, tls::EarlyDataPolicy::replay_safe);
+    CHECK(!repeated && repeated.error() == tls::Errc::invalid_state);
+}
+
+void test_early_replay(const Certificates& certificates) {
+    test::section("独立 OpenSSL 客户端复用同一票据，新 ClientHello 仍被 ReplayStore 拒绝");
+    auto store = std::make_shared<CountingReplayStore>();
+    const std::array identities{
+        tls::Context::ServerIdentity{"alpha.test", certificates.alpha, certificates.key},
+        tls::Context::ServerIdentity{"beta.test", certificates.beta, certificates.key}};
+    auto context = tls::Context::server(tls::Context::ServerConfig{
+        .cert_file = certificates.server, .key_file = certificates.key, .min_version = "1.3",
+        .identities = identities, .early_data = tls::EarlyDataPolicy::replay_safe, .replay_store = store});
+    require(context.has_value());
+    VerifiedClient warm{certificates, "alpha.test", "alpha.test"};
+    auto server = tls::Engine::create(*context);
+    CHECK(server.has_value());
+    if (!server) return;
+    const bool warm_complete = warm.handshake(*server);
+    CHECK(warm_complete);
+    if (!warm_complete) return;
+    std::array<std::byte, 32> bytes{};
+    std::size_t read = 0;
+    ERR_clear_error();
+    const auto warmed = SSL_read_ex(warm.ssl.get(), bytes.data(), bytes.size(), &read);
+    CHECK(warmed == 0 && SSL_get_error(warm.ssl.get(), warmed) == SSL_ERROR_WANT_READ);
+    std::unique_ptr<SSL_SESSION, decltype(&SSL_SESSION_free)> ticket{
+        SSL_SESSION_dup(SSL_get_session(warm.ssl.get())), SSL_SESSION_free};
+    CHECK(ticket != nullptr);
+    if (!ticket) return;
+    CHECK(SSL_SESSION_is_resumable(ticket.get()) == 1);
+    if (!SSL_SESSION_is_resumable(ticket.get())) return;
+    CHECK(SSL_SESSION_get_max_early_data(ticket.get()) == tls::Engine::max_early_data_bytes);
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        const auto name = attempt == 2 ? "beta.test" : "alpha.test";
+        VerifiedClient peer{certificates, name, name};
+        std::unique_ptr<SSL_SESSION, decltype(&SSL_SESSION_free)> copy{
+            SSL_SESSION_dup(ticket.get()), SSL_SESSION_free};
+        require(copy != nullptr);
+        // 模拟自行构造客户端：只改本地恢复元数据，不能更改服务端加密票据。
+        if (attempt == 2) require(SSL_SESSION_set1_hostname(copy.get(), name) == 1);
+        require(SSL_set_session(peer.ssl.get(), copy.get()) == 1);
+        std::size_t written = 0;
+        ERR_clear_error();
+        const auto early_write = SSL_write_early_data(peer.ssl.get(), "safe", 4, &written);
+        CHECK(early_write == 1 && written == 4);
+        if (early_write != 1) continue;
+        server = tls::Engine::create(*context);
+        require(server.has_value());
+        const bool complete = peer.handshake(*server);
+        CHECK(complete);
+        if (!complete) continue;
+        CHECK(SSL_session_reused(peer.ssl.get()) == (attempt == 2 ? 0 : 1));
+        CHECK(peer.peer_serial() == (attempt == 2 ? 7 : 5));
+        CHECK(SSL_get_early_data_status(peer.ssl.get()) ==
+            (attempt == 0 ? SSL_EARLY_DATA_ACCEPTED : SSL_EARLY_DATA_REJECTED));
+        const auto received = server->read(bytes);
+        if (attempt == 0) CHECK(received && received->transferred == 4);
+        else CHECK(received && received->status == tls::Engine::Status::want_input);
+    }
+    CHECK(store->calls == 2);
+    CHECK(store->memory->size() == 1);
+}
+
+Task<void> early_cancelled_task(GatedStream& stream, EngineTransport& transport, bool timeout) {
+    std::stop_source stop;
+    OperationOptions options;
+    if (timeout) options.deadline = Clock::now() + 5ms;
+    else {
+        options.stop = stop.get_token();
+        transport.stop_after_read = &stop;
+    }
+    transport.hold_read = true;
+    const auto result = co_await stream.handshake_early_data(bytes_of("safe"),
+        tls::EarlyDataPolicy::replay_safe, options);
+    CHECK(!result && result.error() == (timeout ? Errc::timed_out : Errc::cancelled));
+    const auto writes = transport.writes;
+    const auto retry = co_await stream.handshake_early_data(bytes_of("safe"),
+        tls::EarlyDataPolicy::replay_safe);
+    CHECK(!retry && retry.error() == tls::Errc::invalid_state);
+    CHECK(transport.writes == writes);
+    CHECK(!transport.peer_ready);
+    std::array<std::byte, 4> bytes{};
+    CHECK(!transport.peer.read(bytes));
+    CHECK(transport.cancelled_reads == 1);
+}
+
+void test_early_cancellation(const Certificates& certificates) {
+    test::section("TCP 早期数据取消和超时使会话终止，未完成握手载荷不向应用交付");
+    auto store = std::make_shared<CountingReplayStore>();
+    auto server = tls::Context::server(tls::Context::ServerConfig{
+        .cert_file = certificates.server, .key_file = certificates.key, .min_version = "1.3",
+        .early_data = tls::EarlyDataPolicy::replay_safe, .replay_store = store});
+    auto client = tls::Context::client(certificates.ca);
+    require(server && client);
+    for (const bool timeout : {false, true}) {
+        auto ticket = early_ticket(*server, *client);
+        auto loop = EventLoop::create();
+        auto peer = tls::Engine::create(*server);
+        require(loop && peer);
+        EngineTransport transport{*loop, std::move(*peer)};
+        ResourceBudget budget{GatedStream::reserved_buffer_bytes + tls::Engine::max_early_data_bytes};
+        {
+            auto stream = GatedStream::create(*loop, transport, *client, "localhost", budget);
+            require(stream && stream->resume(std::move(ticket)));
+            CHECK(loop->run_until_complete(early_cancelled_task(*stream, transport, timeout)).has_value());
+            CHECK(budget.used() == GatedStream::reserved_buffer_bytes);
+            CHECK(budget.stats().peak == GatedStream::reserved_buffer_bytes + tls::Engine::max_early_data_bytes);
+            CHECK(loop->outstanding() == 0);
+        }
+        CHECK(budget.used() == 0);
+    }
+}
+
+Task<void> stream_early_exchange(GatedStream& stream, EngineTransport& transport, bool rejected) {
+    std::stop_source stopped;
+    stopped.request_stop();
+    const auto cancelled = co_await stream.handshake_early_data(bytes_of("safe"),
+        tls::EarlyDataPolicy::replay_safe, {.stop = stopped.get_token()});
+    CHECK(!cancelled && cancelled.error() == Errc::cancelled);
+    const auto expired = co_await stream.handshake_early_data(bytes_of("safe"),
+        tls::EarlyDataPolicy::replay_safe, {.deadline = Clock::now()});
+    CHECK(!expired && expired.error() == Errc::timed_out);
+    CHECK(transport.writes == 0);
+    const auto result = co_await stream.handshake_early_data(bytes_of("safe"),
+        tls::EarlyDataPolicy::replay_safe, {.deadline = Clock::now() + 2s});
+    require(result.has_value());
+    CHECK(*result == 4);
+    CHECK(stream.early_data_status() == (rejected ? tls::EarlyDataStatus::rejected :
+        tls::EarlyDataStatus::accepted));
+    std::array<std::byte, 32> bytes{};
+    const auto read = transport.peer.read(bytes);
+    CHECK(read && read->transferred == 4);
+    CHECK(std::string_view(reinterpret_cast<const char*>(bytes.data()), 4) == "safe");
+    const auto extra = transport.peer.read(bytes);
+    CHECK(extra && extra->status == tls::Engine::Status::want_input);
+    CHECK(transport.writes > 4);
+}
+
+void test_early_stream(const Certificates& certificates) {
+    test::section("真实 Stream 驱动短密文 I/O，接受与拒绝载荷都只交付一次");
+    auto store = std::make_shared<CountingReplayStore>();
+    auto server = tls::Context::server(tls::Context::ServerConfig{
+        .cert_file = certificates.server, .key_file = certificates.key, .min_version = "1.3",
+        .early_data = tls::EarlyDataPolicy::replay_safe, .replay_store = store});
+    auto client = tls::Context::client(certificates.ca);
+    require(server && client);
+    for (const bool rejected : {false, true}) {
+        auto ticket = early_ticket(*server, *client);
+        auto loop = EventLoop::create();
+        auto peer = tls::Engine::create(*server);
+        require(loop && peer);
+        EngineTransport transport{*loop, std::move(*peer)};
+        transport.fragment = 73;
+        auto stream = GatedStream::create(*loop, transport, *client, "localhost");
+        require(stream && stream->resume(std::move(ticket)));
+        store->reject = rejected;
+        CHECK(loop->run_until_complete(stream_early_exchange(*stream, transport, rejected)).has_value());
+        CHECK(loop->outstanding() == 0);
+    }
+}
+
+void test_early_expiry(const Certificates& certificates) {
+    test::section("已装入票据在发送前过期会清除恢复状态并仅走 1-RTT");
+    auto store = std::make_shared<CountingReplayStore>();
+    auto server_context = tls::Context::server(tls::Context::ServerConfig{
+        .cert_file = certificates.server, .key_file = certificates.key, .min_version = "1.3",
+        .early_data = tls::EarlyDataPolicy::replay_safe, .replay_store = store, .ticket_lifetime = 1s});
+    auto client_context = tls::Context::client(certificates.ca);
+    require(server_context && client_context);
+    auto ticket = early_ticket(*server_context, *client_context);
+    auto client = tls::Engine::create(*client_context, "localhost");
+    auto server = tls::Engine::create(*server_context);
+    auto loop = EventLoop::create();
+    require(client && server && loop && client->resume(std::move(ticket)));
+    const auto wait = [&loop]() -> Task<void> {
+        CHECK((co_await loop->sleep_until(Clock::now() + 1100ms)).has_value());
+    };
+    CHECK(loop->run_until_complete(wait()).has_value());
+    drive_early(*server, *client, bytes_of("safe"));
+    CHECK(client->early_data_status() == tls::EarlyDataStatus::not_attempted);
+    CHECK(store->calls == 0);
+}
+
+void test_early_budget(const Certificates& certificates) {
+    test::section("早期缓冲按需计费，容量不足 fail closed，完成/读尽/失效均释放");
+    auto store = std::make_shared<CountingReplayStore>();
+    auto server_context = tls::Context::server(tls::Context::ServerConfig{
+        .cert_file = certificates.server, .key_file = certificates.key, .min_version = "1.3",
+        .early_data = tls::EarlyDataPolicy::replay_safe, .replay_store = store});
+    auto client_context = tls::Context::client(certificates.ca);
+    require(server_context && client_context);
+    constexpr auto base = tls::Engine::reserved_buffer_bytes;
+    constexpr auto early = tls::Engine::max_early_data_bytes;
+    ResourceBudget limited{base};
+    {
+        auto client = tls::Engine::create(*client_context, "localhost", limited);
+        require(client.has_value());
+        CHECK(limited.used() == base);
+        const auto result = client->handshake_early_data(bytes_of("safe"), tls::EarlyDataPolicy::replay_safe);
+        CHECK(!result && result.error() == Errc::would_block);
+        CHECK(client->output_pending() == 0);
+        CHECK(limited.used() == base);
+        CHECK(!client->handshake());
+    }
+    CHECK(limited.used() == 0);
+    ResourceBudget client_budget{base + early}, server_budget{base + early};
+    {
+        auto ticket = early_ticket(*server_context, *client_context);
+        auto client = tls::Engine::create(*client_context, "localhost", client_budget);
+        auto server = tls::Engine::create(*server_context, {}, server_budget);
+        require(client && server && client->resume(std::move(ticket)));
+        CHECK(client_budget.used() == base && server_budget.used() == base);
+        const auto first = client->handshake_early_data(bytes_of("safe"), tls::EarlyDataPolicy::replay_safe);
+        require(first.has_value());
+        CHECK(client_budget.used() == base + early);
+        transfer_engines(*client, *server);
+        const auto received = server->handshake();
+        require(received.has_value());
+        CHECK(server_budget.used() == base + early);
+        transfer_engines(*server, *client);
+        drive_early(*server, *client, bytes_of("safe"));
+        CHECK(client_budget.used() == base && server_budget.used() == base);
+    }
+    CHECK(client_budget.used() == 0 && server_budget.used() == 0);
+    {
+        auto client = tls::Engine::create(*client_context, "localhost", client_budget);
+        require(client.has_value());
+        const auto pending = client->handshake_early_data(bytes_of("safe"), tls::EarlyDataPolicy::replay_safe);
+        require(pending.has_value());
+        CHECK(client_budget.used() == base + early);
+        client->invalidate();
+        CHECK(client_budget.used() == base);
+    }
+    CHECK(client_budget.used() == 0);
+    {
+        auto server = tls::Engine::create(*server_context, {}, limited);
+        require(server.has_value());
+        const auto result = server->handshake();
+        CHECK(!result && result.error() == Errc::would_block);
+        CHECK(limited.used() == base && store->calls == 1);
+    }
+    CHECK(limited.used() == 0);
+    auto memory = tls::MemoryReplayStore::create(1);
+    require(memory.has_value());
+    std::array<std::byte, 32> key{};
+    CHECK((*memory)->claim(key, 1, 10));
+    CHECK(!(*memory)->claim(key, 2, 10));
+    key[0] = std::byte{1};
+    CHECK(!(*memory)->claim(key, 2, 10));
+    CHECK(!(*memory)->claim(key, 0, 10));
+    CHECK(!(*memory)->claim(key, 10, 10));
+    CHECK((*memory)->claim(key, 10, 20));
+}
+
+void test_early_data(const Certificates& certificates) {
+    test::section("TCP TLS1.3 早期数据接受、拒绝一次回退、票据轮转及配置隔离");
+    auto store = std::make_shared<CountingReplayStore>();
+    tls::Context::ServerConfig config{.cert_file = certificates.server, .key_file = certificates.key,
+        .min_version = "1.3", .early_data = tls::EarlyDataPolicy::replay_safe, .replay_store = store};
+    auto server_context = tls::Context::server(config);
+    auto client_context = tls::Context::client(certificates.ca);
+    require(server_context && client_context);
+    for (unsigned scenario = 0; scenario < 5; ++scenario) {
+        auto ticket = early_ticket(*server_context, *client_context);
+        auto client = tls::Engine::create(*client_context, "localhost");
+        require(client.has_value());
+        if (scenario != 3) require(client->resume(std::move(ticket)).has_value());
+        if (scenario == 2) require(server_context->reload_server(config).has_value());
+        if (scenario == 4) {
+            auto disabled = config;
+            disabled.early_data = tls::EarlyDataPolicy::disabled;
+            require(server_context->reload_server(disabled).has_value());
+        }
+        auto server = tls::Engine::create(*server_context);
+        require(server.has_value());
+        store->reject = scenario == 1;
+        const auto unsafe = client->handshake_early_data(bytes_of("unsafe"), tls::EarlyDataPolicy::disabled);
+        CHECK(!unsafe && unsafe.error() == Errc::invalid_argument);
+        CHECK(client->output_pending() == 0);
+        const std::array<std::byte, tls::Engine::max_early_data_bytes + 1> oversized{};
+        const auto too_large = client->handshake_early_data(oversized, tls::EarlyDataPolicy::replay_safe);
+        CHECK(!too_large && too_large.error() == Errc::invalid_argument);
+        CHECK(client->output_pending() == 0);
+        const std::string payload(scenario == 0 ? tls::Engine::max_early_data_bytes : 13, 'g');
+        drive_early(*server, *client, bytes_of(payload));
+        CHECK(client->early_data_status() == (scenario == 0 ? tls::EarlyDataStatus::accepted :
+            scenario == 3 ? tls::EarlyDataStatus::not_attempted : tls::EarlyDataStatus::rejected));
+        store->reject = false;
+    }
+    CHECK(store->calls == 2);
+    CHECK(store->memory->size() == 1);
+    require(server_context->reload_server(config).has_value());
+    auto other_context = tls::Context::client(certificates.ca);
+    auto other = tls::Engine::create(*other_context, "localhost");
+    require(other.has_value());
+    const auto mismatched = other->resume(early_ticket(*server_context, *client_context));
+    CHECK(!mismatched && mismatched.error() == Errc::invalid_argument);
+    auto wrong_peer = tls::Engine::create(*client_context, "127.0.0.1");
+    require(wrong_peer.has_value());
+    const auto peer_mismatch = wrong_peer->resume(early_ticket(*server_context, *client_context));
+    CHECK(!peer_mismatch && peer_mismatch.error() == Errc::invalid_argument);
+    auto policy_client = [&](tls::Context::ClientConfig policy) {
+        auto context = tls::Context::client(policy);
+        require(context.has_value());
+        auto engine = tls::Engine::create(*context, "localhost");
+        require(engine.has_value());
+        const auto rejected = engine->handshake_early_data(bytes_of("safe"), tls::EarlyDataPolicy::replay_safe);
+        CHECK(!rejected && rejected.error() == Errc::invalid_argument);
+        CHECK(engine->output_pending() == 0);
+    };
+    policy_client({});
+    policy_client({.ca_file = certificates.ca, .ocsp = tls::Context::OcspPolicy::require});
+    policy_client({.ca_file = certificates.ca, .revocation = {.crl_file = certificates.clean_crl}});
+    policy_client({.ca_file = certificates.ca, .cert_file = certificates.client, .key_file = certificates.client_key});
+    config.replay_store.reset();
+    CHECK(!tls::Context::server(config));
+    config.replay_store = store;
+    config.client_ca_file = certificates.ca;
+    CHECK(!tls::Context::server(config));
+    config.client_ca_file = {};
+    config.ticket_lifetime = 0s;
+    CHECK(!tls::Context::server(config));
+    config.ticket_lifetime = std::chrono::hours(24 * 7) + 1s;
+    CHECK(!tls::Context::server(config));
+}
+
 void test_configuration(const Certificates& certificates) {
     test::section("TLS configuration errors and error domains");
     const auto missing = (certificates.directory / "does-not-exist.pem").string();
@@ -2862,6 +3255,12 @@ int main(int argc, char** argv) {
         Certificates certificates;
         certificates.create();
         test_configuration(certificates);
+        test_early_data(certificates);
+        test_early_replay(certificates);
+        test_early_cancellation(certificates);
+        test_early_stream(certificates);
+        test_early_expiry(certificates);
+        test_early_budget(certificates);
         test_production_sni(certificates);
         test_sni_session_isolation_version(certificates, true);
         test_sni_session_isolation_version(certificates, false);

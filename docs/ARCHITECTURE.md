@@ -41,7 +41,7 @@ and remaining acceptance work must be described separately.
 | Cancellation and deadlines | `OperationOptions` on core/TCP/HTTP operations; TLS owns independent loop timers for each application request without rearming wire I/O; `BoundedStream` exposes cancellation support; registration is rolled back on allocation failure | Maintain runtime evidence for backend-specific completion races; a cancelled IOCP read may lose bytes, so that connection cannot be resumed; `stop()` is a stop-pumping request, not I/O cancellation |
 | Transport and composition | Completion-shaped TCP/UDP/local streams; `DatagramTransport` conformance assertions; bounded family-interleaved `tcp::dial`; separately composed HTTP/HTTPS client pools and grace-draining TCP serving | Maintain backend-specific teardown evidence; DNS is bounded system getaddrinfo, not independent asynchronous A/AAAA resolution |
 | Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered and streaming request bodies (`RequestBodyReader`), chunked trailers, connection-loop drain guarantees; request- and response-parser fuzzing in CI; curl interop exercised out-of-process against the example servers — HTTP/1.1 against the file server, real-nghttp2 HTTP/2 (prior knowledge, including concurrent streams) against `examples/h2_prior_knowledge_server`, native-QUIC HTTP/3 (ngtcp2 + nghttp3) against `examples/h3_server`; HTTP/1 `Expect: 100-continue` and duplex early responses; SOCKS5 against curl and independent Python peers; DoH against curl and Python peers; MQTT 3.1.1/5.0 against an independent Python broker and mosquitto | Protocol conformance evidence, slow-consumer backpressure bounds and bounded aggregate memory measurements |
-| Security and robustness | Duplex TLS with terminal cancellation, bounded parsers, shared accounting budgets, HTTP/WS/SOCKS/DNS/MQTT fuzzing, opt-in validated QUIC paths, explicit replay-safe raw-QUIC early data and HTTP/3 0-RTT with SETTINGS-bound ticket domains and automatic 425 for unsafe early requests | No complete anti-replay or process-RSS guarantee; longer exhaustion tests and mobile TLS runtime evidence remain open |
+| Security and robustness | Duplex TLS with terminal cancellation, bounded parsers, shared accounting budgets, HTTP/WS/SOCKS/DNS/MQTT fuzzing, opt-in validated QUIC paths, explicit replay-safe raw-QUIC early data and HTTP/3 0-RTT with SETTINGS-bound ticket domains and automatic 425 for unsafe early requests | No complete anti-replay or process-RSS guarantee; longer exhaustion tests and physical-device TLS evidence remain open |
 | Engineering evidence | Desktop CI, compression-inclusive Autobahn reports, sanitizer suites, Windows MSVC independent HTTP/3 curl and Retry checks, MinGW H2/H3 runtime tests, native Windows Release runs on MSVC VS2026 and UCRT64 MinGW GCC 16 (base and full protocol suites, 2026-10-26); revision-specific results in the [audit record](AUDIT-2026-09-30.md) | iOS lacks signed device evidence; Android devices and multi-host/WAN remain unverified; local soak results apply only to their recorded snapshots; no stable ABI promise |
 
 Rejecting ambiguous or malformed input is part of protocol correctness, not a
@@ -666,7 +666,17 @@ contract to the same status/media-type/size/identity/Age validation without
 coupling either protocol engine. Queries use id 0 and responses must answer
 the question. `query_udp` / `query_tcp` separately implement asynchronous
 wire exchanges on dedicated borrowed transports with explicit deadlines;
-server discovery, NSS, automatic TCP fallback and DNSSEC remain outside them.
+`query_with_tcp_fallback` composes a caller-provided TCP connector when a UDP
+response is truncated, without introducing transport dependencies. Default DNS
+server discovery is an explicit `transport::system_dns_config` snapshot;
+NSS/scoped system policy remains with the existing bounded getaddrinfo Resolver.
+Optional `Mira::dnssec` validates positive RRsets through explicit DS anchors,
+DNSKEY self-signatures and signed parent DS delegation. It supports algorithm
+13 (ECDSA-P256/SHA-256), 15 (Ed25519), and SHA-256 DS, bounds records/bytes/depth/
+queries/signature checks, and never trusts AD. Unknown algorithms, missing
+proof, wildcard expansion and negative answers fail closed. Trust anchors are
+replaced explicitly through trusted out-of-band policy, not RFC5011 learning.
+The default DNS component does not gain an OpenSSL dependency.
 
 `Mira::mqtt` covers MQTT 3.1.1 and 5.0 in three layers. The codec encodes and
 decodes all fifteen packet types for both roles and refuses to emit anything
@@ -704,8 +714,38 @@ Client entry point, which refuses undelivered events and pending I/O. Expired
 completion IDs remain reserved until consumed; restoration separates expiry
 notices from the CONNACK handshake budget. Atomic disk storage, confidentiality,
 business transactions and clock persistence remain caller responsibilities.
-This is not a WAL or business exactly-once. A broker, outbound topic aliases
-and automatic reconnect policy are not included.
+This is not a WAL or business exactly-once. MQTT 5 outbound topic aliases are
+explicitly bounded by local and peer limits. Mapping is connection-local and
+only committed after output admission; reconnect clears it, while retained
+QoS/checkpoint records keep complete topic names. `run_with_reconnect` supplies
+explicit bounded/backoff policy around an existing client. A broker remains
+outside the library.
+
+### Explicit request state and file transfer
+
+HTTP Cookie/cache state is enabled only by `RedirectOptions::state`, including
+zero-redirect calls. Its lifetime and strict scheme/host/port scope belong to
+the caller. Cache entries require explicit freshness and a credential-free
+GET/200 exchange; all request headers select the variant. Clearing state
+invalidates in-flight Cookie and cache writes. This is not browser SameSite/
+public-suffix behavior, heuristic caching or automatic 304 revalidation.
+
+`tcp::Socket::send_file` uses native sendfile/TransmitFile or an explicit bounded
+copy loop, with observable native/copied counts. Cancellation may follow partial
+output; source file contents must stay immutable until the receiver consumes
+them. A lazy shared transfer token survives wrapper close/destruction, and
+competing multi-step transfers are refused. Ordinary write APIs must not be
+mixed into an active transfer. User-buffer kernel zero-copy and Linux pipe
+splice are not implemented; `send_buffer` reports its copy path honestly.
+The 2026-10-26 resident-file loopback sample (32 MiB, five rounds) measured
+1430.53 MiB/s copy and 1883.08 MiB/s native on one macOS host. These are local
+observations, not a platform-independent throughput guarantee.
+
+TCP TLS 1.3 early data is opt-in through the bounded engine/stream API with
+mandatory server ReplayStore admission. The full replay, authentication,
+ticket-rotation, cancellation and resource threat model is in ROADMAP.md.
+Reject-to-1RTT retry is confined to the same connection and explicitly
+replay-safe bytes; it is not business exactly-once or cross-process replay safety.
 
 ### Managed serving and grace shutdown
 
@@ -734,7 +774,21 @@ Linux and macOS protocol jobs also require independent HTTP/3 curl and Retry
 checks. The measurements below are historical development snapshots; they do
 not replace verification of a release candidate.
 
-- Native Windows 2026-10-26 snapshot of this revision (Release, Ninja, Windows
+- 2026-10-26 completion snapshot: C++23 Release on AppleClang 21 and GCC 16
+  each passed 104/104 CTest cases with TLS, WebSocket, H2/H3 and DNSSEC enabled.
+  Installed-SDK consumer/component-isolation checks passed. iOS arm64 Simulator
+  executed 100 cases successfully with three host-side Python harnesses skipped;
+  Android arm64 Emulator executed 99 successfully with the same three harnesses
+  skipped and one filesystem Unix-socket test skipped because the adb-shell
+  security policy denied bind. The skip remains explicit; security enforcement
+  was not changed. These are simulator, not physical-device, results. TLS early
+  data has separate real OpenSSL client/server interoperability on the desktop.
+  File-transfer close/cancellation also passed ASan/UBSan Release verification.
+  Per-test evidence is produced by `scripts/ci/run_mobile_tests.py` under the
+  selected build's `mobile-results/` directory. These local results do not
+  replace subsequent CI on the exact committed revision.
+
+- Native Windows 2026-10-26 snapshot before the new file-transfer APIs (Release, Ninja, Windows
   x64): MSVC VS2026 (cl 19.51, OpenSSL 3.5.9 built from source, static) and
   UCRT64 MinGW GCC 16.2 (OpenSSL 3.6.5; nghttp2, nghttp3 and ngtcp2 from the
   pinned dependency script) each passed the base configuration 58/58.
@@ -905,8 +959,8 @@ work on Mira itself.
 - Resolver caches are opt-in bounded local policy caches, not TTLs supplied by
   getaddrinfo. In-flight callers have independent cancellation. Dedicated
   `dns::query_udp/query_tcp` operations do not create background resolver
-  threads; server selection, automatic fallback and retry remain application
-  policy. UDP supports ASM membership and POSIX packet metadata/source control;
+  threads; server selection and retry remain application policy. The explicit
+  TCP-fallback helper handles truncated UDP responses without resolver threads. UDP supports ASM membership and POSIX packet metadata/source control;
   Windows ancillary data is explicitly unsupported, and the rejection path
   itself has native Windows runtime evidence (2026-10-26 snapshot).
 - QUIC exposes PMTUD/UDP payload and congestion settings, unreliable RFC 9221
@@ -934,7 +988,7 @@ work on Mira itself.
 | Decision | Choice | Why |
 |---|---|---|
 | **I/O model** | **completion-shaped public API** | A common operation contract for IOCP and reactor implementations |
-| Platform scope | Desktop runtime targets, including Windows MSVC independent H3/Retry and MinGW H2/H3 plus native Windows Release local runs (MSVC VS2026, UCRT64 MinGW); iOS host smoke/unsigned cross-build and Android cross-build | Mobile device execution is not yet evidenced; BSD has no dedicated CI evidence |
+| Platform scope | Desktop runtime targets, including Windows MSVC independent H3/Retry and MinGW H2/H3 plus native Windows Release local runs (MSVC VS2026, UCRT64 MinGW); iOS/Android arm64 simulator protocol execution plus cross-builds | Physical-device execution is not claimed; BSD has no dedicated CI evidence |
 | Readiness API | POSIX-only, behind an explicit macro | A platform extension, not part of the portable operation contract |
 | Execution model | Lazy `Task<T>`, single-threaded `TaskScope` spawn/join and independent-worker `LoopGroup` | Bounded root-task admission does not make one loop or its sockets multi-thread-safe; suspended tasks cannot be arbitrarily destroyed |
 | Library form | Compiled library with modular public headers | Keep implementation boundaries explicit; the [release guide](RELEASES.md) defines source compatibility and requires rebuilding consumers |
@@ -1067,8 +1121,9 @@ keys are committed. HTTPS exercises the existing HTTP loop unchanged, with
 trusted/untrusted chains, DNS and IP identity mismatches, short encrypted I/O,
 large payloads, orderly close and truncated TCP. The optional TLS CI matrix is
 separate from the dependency-free build. Mobile base-library cross-compilation
-and iOS host smoke/unsigned app builds are not mobile TLS runtime validation;
-iOS device execution lacks a signing profile and Android has no device evidence.
+and iOS host smoke/unsigned app builds alone are not runtime validation.
+The 2026-10-26 simulator snapshot above adds actual mobile TLS/H2/H3 execution;
+physical-device evidence is still not claimed.
 BSD also has no dedicated CI evidence.
 
 This integration also fixes HTTP EOF before the end of a partial request head
@@ -1128,8 +1183,9 @@ QUIC/HTTP3 have real UDP scheduling, CID-routed multi-client dispatchers,
 closing/draining protection and optional Retry source-address validation.
 Opt-in validated migration, bounded ticket resumption, raw-QUIC early data and
 H2/H3 Extended CONNECT now exist, with the boundaries described above.
-Mobile protocol runtime acceptance, native OS trust-store integration and
-process-wide memory bounds remain incomplete. `LoopGroup` supplies independent
+Physical-device protocol evidence, native OS trust-store integration and
+process-wide memory bounds remain incomplete; simulator protocol acceptance
+is recorded separately above. `LoopGroup` supplies independent
 thread-affine loops, not concurrent pumping of one loop.
 mTLS policy is available on `tls::Context`; protocol queue and payload
 budgets are not hard process-RSS bounds.

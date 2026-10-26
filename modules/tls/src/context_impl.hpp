@@ -11,6 +11,11 @@
 
 namespace Mira::tls {
 
+inline std::uint64_t monotonic_ns() noexcept {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 struct ContextDeleter {
     void operator()(SSL_CTX* handle) const noexcept { SSL_CTX_free(handle); }
 };
@@ -29,6 +34,10 @@ struct ContextSnapshot {
     Context::SniPolicy unknown_sni{Context::SniPolicy::use_default};
     Context::SniPolicy missing_sni{Context::SniPolicy::use_default};
     Context::OcspPolicy ocsp{Context::OcspPolicy::disabled};
+    EarlyDataPolicy early_data{EarlyDataPolicy::disabled};
+    std::shared_ptr<ReplayStore> replay_store;
+    std::chrono::seconds ticket_lifetime{3600};
+    bool client_sessions = false;
 };
 
 struct OcspWireState {

@@ -2,7 +2,9 @@
 
 #include "context_impl.hpp"
 #include "mira/tls/error.hpp"
+#include "mira/tls/engine.hpp"
 
+#include <limits>
 #include <openssl/err.h>
 #include <openssl/ocsp.h>
 #include <openssl/rand.h>
@@ -418,6 +420,50 @@ Result<void> apply_revocation(SSL_CTX* handle, Context::RevocationConfig config)
     return Result<void>{};
 }
 
+int generate_early_ticket(SSL* ssl, void* argument) noexcept {
+    const auto& snapshot = *static_cast<const ContextSnapshot*>(argument);
+    std::array<unsigned char, 40> data{};
+    if (RAND_bytes(data.data(), 32) != 1) return 0;
+    const auto lifetime = static_cast<std::uint64_t>(snapshot.ticket_lifetime.count()) * 1'000'000'000;
+    const auto now = monotonic_ns();
+    if (lifetime > (std::numeric_limits<std::uint64_t>::max)() - now) return 0;
+    const auto expires = now + lifetime;
+    for (unsigned index = 0; index < 8; ++index)
+        data[32 + index] = static_cast<unsigned char>(expires >> ((7 - index) * 8));
+    return SSL_SESSION_set1_ticket_appdata(SSL_get_session(ssl), data.data(), data.size());
+}
+
+int allow_early_ticket(SSL* ssl, void* argument) noexcept {
+    const auto& snapshot = *static_cast<const ContextSnapshot*>(argument);
+    if (snapshot.early_data != EarlyDataPolicy::replay_safe || !snapshot.replay_store) return 0;
+    auto* session = SSL_get_session(ssl);
+    void* raw = nullptr;
+    std::size_t length = 0;
+    if (!session || SSL_SESSION_get0_ticket_appdata(session, &raw, &length) != 1 ||
+        !raw || length != 40) return 0;
+    const auto* data = static_cast<const unsigned char*>(raw);
+    std::uint64_t expires = 0;
+    for (std::size_t index = 32; index < 40; ++index) expires = (expires << 8) | data[index];
+    const auto now = monotonic_ns();
+    const auto lifetime = static_cast<std::uint64_t>(snapshot.ticket_lifetime.count()) * 1'000'000'000;
+    if (expires <= now || expires - now > lifetime) return 0;
+    unsigned int scope_size = 0;
+    const auto* scope = SSL_SESSION_get0_id_context(session, &scope_size);
+    if (!scope || scope_size != 32) return 0;
+    std::array<std::byte, 32> key{};
+    unsigned int size = 0;
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> digest{EVP_MD_CTX_new(), EVP_MD_CTX_free};
+    // 此回调在 PSK binder 验证后执行；同票据换用新的 ClientHello 也不能再认领。
+    static constexpr std::string_view domain = "Mira/TCP/TLS1.3/early-data/v1";
+    if (!digest || EVP_DigestInit_ex(digest.get(), EVP_sha256(), nullptr) != 1 ||
+        EVP_DigestUpdate(digest.get(), domain.data(), domain.size()) != 1 ||
+        EVP_DigestUpdate(digest.get(), scope, scope_size) != 1 ||
+        EVP_DigestUpdate(digest.get(), data, 32) != 1 ||
+        EVP_DigestFinal_ex(digest.get(), reinterpret_cast<unsigned char*>(key.data()), &size) != 1 ||
+        size != key.size()) return 0;
+    return snapshot.replay_store->claim(key, now, expires) ? 1 : 0;
+}
+
 Result<ContextHandle> make_server_handle(Context::ServerConfig config,
                                           std::string_view cert,
                                           std::string_view key,
@@ -454,6 +500,11 @@ Result<ContextHandle> make_server_handle(Context::ServerConfig config,
 }
 
 Result<std::shared_ptr<const ContextSnapshot>> make_server_snapshot(Context::ServerConfig config) {
+    if ((config.early_data != EarlyDataPolicy::disabled && config.early_data != EarlyDataPolicy::replay_safe) ||
+        config.ticket_lifetime.count() <= 0 || config.ticket_lifetime > std::chrono::hours(24 * 7) ||
+        (config.early_data == EarlyDataPolicy::replay_safe &&
+         (!config.replay_store || !config.client_ca_file.empty() || !config.revocation.crl_file.empty())))
+        return fail(Mira::Errc::invalid_argument);
     if ((config.unknown_sni != Context::SniPolicy::reject &&
          config.unknown_sni != Context::SniPolicy::use_default) ||
         (config.missing_sni != Context::SniPolicy::reject &&
@@ -467,6 +518,9 @@ Result<std::shared_ptr<const ContextSnapshot>> make_server_snapshot(Context::Ser
     snapshot->handle = std::move(*handle);
     snapshot->unknown_sni = config.unknown_sni;
     snapshot->missing_sni = config.missing_sni;
+    snapshot->early_data = config.early_data;
+    snapshot->replay_store = std::move(config.replay_store);
+    snapshot->ticket_lifetime = config.ticket_lifetime;
     std::unordered_set<std::string> seen;
     for (const auto& identity : config.identities) {
         if (!valid_hostname(identity.hostname)) return fail(Mira::Errc::invalid_argument);
@@ -487,6 +541,18 @@ Result<std::shared_ptr<const ContextSnapshot>> make_server_snapshot(Context::Ser
         if (RAND_bytes(scope.data(), static_cast<int>(scope.size())) != 1 ||
             SSL_CTX_set_session_id_context(target, scope.data(), static_cast<unsigned int>(scope.size())) != 1)
             return fail(make_error_code(Errc::configuration_error));
+        SSL_CTX_set_timeout(target, static_cast<long>(snapshot->ticket_lifetime.count()));
+        if (snapshot->early_data == EarlyDataPolicy::replay_safe) {
+            // 内置缓存不是共享 ReplayStore；显式使用下方强制原子认领门。
+            SSL_CTX_set_options(target, SSL_OP_NO_ANTI_REPLAY);
+            SSL_CTX_set_session_cache_mode(target, SSL_SESS_CACHE_OFF);
+            if (SSL_CTX_set_num_tickets(target, 1) != 1 ||
+                SSL_CTX_set_max_early_data(target, Engine::max_early_data_bytes) != 1 ||
+                SSL_CTX_set_recv_max_early_data(target, Engine::max_early_data_bytes) != 1 ||
+                SSL_CTX_set_session_ticket_cb(target, generate_early_ticket, nullptr, snapshot.get()) != 1)
+                return fail(make_error_code(Errc::configuration_error));
+            SSL_CTX_set_allow_early_data_cb(target, allow_early_ticket, snapshot.get());
+        }
         SSL_CTX_set_client_hello_cb(target, select_identity, snapshot.get());
         // Avoid OpenSSL 3.0 macros' C-style function-pointer casts under strict GCC warnings.
         if (SSL_CTX_callback_ctrl(target, SSL_CTRL_SET_TLSEXT_SERVERNAME_CB,
@@ -593,6 +659,8 @@ Result<Context> Context::client(ClientConfig config) {
     auto snapshot = std::make_shared<ContextSnapshot>();
     snapshot->handle = std::move(*handle);
     snapshot->ocsp = config.ocsp;
+    snapshot->client_sessions = !config.ca_file.empty() && !has_cert && config.revocation.crl_file.empty() &&
+                                config.ocsp == OcspPolicy::disabled;
     if (config.ocsp != OcspPolicy::disabled) {
         SSL_CTX* target = snapshot->handle.get();
         SSL_CTX_set_options(target, SSL_OP_NO_TICKET);

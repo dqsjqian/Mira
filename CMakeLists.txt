@@ -32,6 +32,7 @@ option(MIRA_BUILD_EXAMPLES "Build Mira examples" ${MIRA_BUILD_EXAMPLES_DEFAULT})
 
 option(MIRA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(MIRA_ENABLE_TLS "Build the optional OpenSSL 3 TLS stream module" OFF)
+option(MIRA_ENABLE_DNSSEC "Build explicit DNSSEC validation (OpenSSL Crypto)" OFF)
 option(MIRA_ENABLE_WEBSOCKET "Build WebSocket (OpenSSL Crypto and zlib for optional compression)" OFF)
 option(MIRA_ENABLE_HTTP2 "Build the optional nghttp2 HTTP/2 module" OFF)
 option(MIRA_ENABLE_HTTP3 "Build the optional QUIC and HTTP/3 modules" OFF)
@@ -94,6 +95,7 @@ function(mira_install_module target)
             "mira_client_http2=miraClientHttp2Targets"
             "mira_client_http3=miraClientHttp3Targets"
             "mira_crypto=miraCryptoTargets"
+            "mira_dnssec=miraDnssecTargets"
             "mira_ws=miraWsTargets"
             "mira_http2=miraHttp2Targets"
             "mira_quic=miraQuicTargets"
@@ -135,6 +137,9 @@ add_subdirectory(modules/http_common)
 add_subdirectory(modules/transport)
 add_subdirectory(modules/http)
 add_subdirectory(modules/socks)
+if(MIRA_ENABLE_WEBSOCKET OR MIRA_ENABLE_DNSSEC)
+    add_subdirectory(modules/crypto)
+endif()
 add_subdirectory(modules/dns)
 add_subdirectory(modules/mqtt)
 
@@ -142,7 +147,6 @@ if(MIRA_ENABLE_TLS)
     add_subdirectory(modules/tls)
 endif()
 if(MIRA_ENABLE_WEBSOCKET)
-    add_subdirectory(modules/crypto)
     add_subdirectory(modules/ws)
 endif()
 if(MIRA_ENABLE_HTTP2)
@@ -381,9 +385,11 @@ if(MIRA_INSTALL)
         DESTINATION ${MIRA_CMAKE_DESTINATION}
     )
 
-    foreach(optional_module IN ITEMS Tls ClientTls ClientHttp2 ClientHttp3 Crypto Ws Http2 Quic Http3)
+    foreach(optional_module IN ITEMS Tls ClientTls ClientHttp2 ClientHttp3 Crypto Dnssec Ws Http2 Quic Http3)
         if(((optional_module STREQUAL "Tls" OR optional_module STREQUAL "ClientTls") AND MIRA_ENABLE_TLS)
-           OR ((optional_module STREQUAL "Crypto" OR optional_module STREQUAL "Ws") AND MIRA_ENABLE_WEBSOCKET)
+           OR (optional_module STREQUAL "Crypto" AND (MIRA_ENABLE_WEBSOCKET OR MIRA_ENABLE_DNSSEC))
+           OR (optional_module STREQUAL "Dnssec" AND MIRA_ENABLE_DNSSEC)
+           OR (optional_module STREQUAL "Ws" AND MIRA_ENABLE_WEBSOCKET)
            OR (optional_module STREQUAL "Http2" AND MIRA_ENABLE_HTTP2)
            OR (optional_module STREQUAL "ClientHttp2" AND MIRA_ENABLE_HTTP2 AND MIRA_ENABLE_TLS)
            OR (optional_module STREQUAL "ClientHttp3" AND MIRA_ENABLE_HTTP3)

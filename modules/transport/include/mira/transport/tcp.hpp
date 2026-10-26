@@ -12,10 +12,12 @@
 #include "mira/core/platform.hpp"
 #include "mira/core/task.hpp"
 #include "mira/transport/endpoint.hpp"
+#include "mira/transport/transfer.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <memory>
 #include <utility>
 
 namespace Mira::transport::tcp {
@@ -68,13 +70,15 @@ public:
 
     Socket(Socket&& other) noexcept
         : loop_(std::exchange(other.loop_, nullptr)),
-          handle_(std::exchange(other.handle_, invalid_handle)) {}
+          handle_(std::exchange(other.handle_, invalid_handle)),
+          transfer_state_(std::move(other.transfer_state_)) {}
 
     Socket& operator=(Socket&& other) noexcept {
         if (this != &other) {
             auto previous = std::move(*this);
             loop_ = std::exchange(other.loop_, nullptr);
             handle_ = std::exchange(other.handle_, invalid_handle);
+            transfer_state_ = std::move(other.transfer_state_);
             return *this;  // Form the result before previous.close() resumes user code.
         }
         return *this;
@@ -109,6 +113,26 @@ public:
     writev_some(std::span<const std::span<const std::byte>> pieces,
                 OperationOptions options = {});
 
+    /// Send exactly count bytes from a regular file at an explicit offset.
+    /// Exclusively borrow the socket's write direction and the file until
+    /// completion. Do not mix with write_some/writev or direct loop writes.
+    /// Closing the socket cancels the transfer; after its first suspension the
+    /// wrapper may be destroyed. File contents stay immutable until consumption.
+    /// Native sendfile/TransmitFile is preferred; unsupported native paths may
+    /// use bounded copy reads. require_native never silently copies. EOF before
+    /// count is an error, and errors/cancellation may follow partial wire I/O:
+    /// close the connection rather than retrying the original region.
+    [[nodiscard]] Task<Result<TransferResult>> send_file(
+        const FileSource& file, std::uint64_t offset, std::size_t count,
+        TransferOptions transfer = {}, OperationOptions options = {});
+
+    /// Send a buffer whose lifetime extends through completion. The portable
+    /// implementation copies; require_native reports not_supported. The result
+    /// reports the actual path, never claiming zero-copy from a write syscall.
+    [[nodiscard]] Task<Result<TransferResult>> send_buffer(
+        std::span<const std::byte> source, TransferOptions transfer = {},
+        OperationOptions options = {});
+
     /// Address of the peer, as reported by the OS.
     [[nodiscard]] Result<Endpoint> peer_endpoint() const;
 
@@ -125,8 +149,12 @@ public:
     void close() noexcept;
 
 private:
+    struct TransferState { bool closed{false}; bool busy{false}; };
     EventLoop* loop_{nullptr};
     NativeHandle handle_{invalid_handle};
+    // Allocated only for the multi-step transfer APIs. A pending operation
+    // retains this token if close resumes code that destroys the wrapper.
+    std::shared_ptr<TransferState> transfer_state_;
 };
 
 /// A listening TCP socket.

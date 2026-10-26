@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <map>
+#include <list>
 #include <deque>
 #include <set>
 #include <utility>
@@ -51,6 +52,14 @@ struct Session::Impl {
     std::map<std::uint16_t, Request> requests;
     std::set<std::uint16_t> releasing;  // Inbound QoS 2 awaiting PUBREL.
     std::map<std::uint16_t, std::string> aliases;
+    struct OutboundAlias {
+        std::uint16_t id;
+        std::string topic;
+    };
+    std::list<OutboundAlias> outbound_aliases;
+    std::size_t outbound_alias_bytes = 0;
+    std::uint16_t server_topic_alias_max = 0;
+    std::uint16_t next_outbound_alias = 1;
     std::uint16_t next_id = 1;
     std::uint64_t order = 0;
     std::uint64_t last_sent = 0;
@@ -147,6 +156,7 @@ struct Session::Impl {
         server_receive_max = p.receive_maximum.value_or(65535);
         server_max_packet = p.maximum_packet_size.value_or(static_cast<std::uint32_t>(max_packet_size));
         server_max_qos = p.maximum_qos.value_or(2);
+        server_topic_alias_max = v5() ? p.topic_alias_maximum.value_or(0) : 0;
         retain_available = p.retain_available.value_or(1) != 0;
         wildcard_available = p.wildcard_subscription_available.value_or(1) != 0;
         identifiers_available = p.subscription_identifiers_available.value_or(1) != 0;
@@ -204,7 +214,7 @@ struct Session::Impl {
             const auto id = pending.front();
             auto it = outgoing.find(id);
             auto& entry = it->second;
-            auto sent = submit(resend_packet(id, entry));
+            auto sent = entry.stage == Stage::pubcomp ? submit(resend_packet(id, entry)) : submit_publish(entry.publish);
             if (!sent && sent.error() == Errc::would_block) break;
             if (!sent) return close_with(sent.error(), reason::implementation_specific_error);
             entry.sent_on_connection = entry.stage != Stage::pubcomp;
@@ -341,6 +351,78 @@ struct Session::Impl {
         return {};
     }
 
+    std::uint16_t outbound_limit() const {
+        return std::min(options.outbound_topic_alias_maximum, server_topic_alias_max);
+    }
+
+    // 先解析连接级引用，再将原 topic 留在 inflight/checkpoint 中。
+    Result<void> resolve_outbound_topic(Publish& message) const {
+        if (const auto alias = message.properties.topic_alias) {
+            if (!v5() || !options.outbound_topic_alias_maximum) return fail(Errc::not_supported);
+            if (!*alias || *alias > outbound_limit()) return fail(MqttError::topic_alias_invalid);
+            if (message.topic.empty()) {
+                const auto found = std::find_if(outbound_aliases.begin(), outbound_aliases.end(),
+                    [alias](const auto& entry) { return entry.id == *alias; });
+                if (found == outbound_aliases.end()) return fail(MqttError::topic_alias_invalid);
+                message.topic = found->topic;
+            }
+            if (message.topic.size() > options.max_outbound_topic_alias_bytes) return fail(Errc::limit_exceeded);
+        }
+        if (!valid_topic_name(message.topic)) return fail(Errc::invalid_argument);
+        return {};
+    }
+
+    Result<void> submit_publish(const Publish& original) {
+        const auto limit = outbound_limit();
+        auto selected = outbound_aliases.end();
+        std::uint16_t alias = original.properties.topic_alias.value_or(0);
+        const bool automatic = !alias;
+        if (alias) {
+            selected = std::find_if(outbound_aliases.begin(), outbound_aliases.end(),
+                [alias](const auto& entry) { return entry.id == alias; });
+        } else if (limit && original.topic.size() <= options.max_outbound_topic_alias_bytes) {
+            selected = std::find_if(outbound_aliases.begin(), outbound_aliases.end(),
+                [&](const auto& entry) { return entry.topic == original.topic; });
+            if (selected != outbound_aliases.end()) alias = selected->id;
+            else if (outbound_aliases.size() == limit) {
+                selected = outbound_aliases.begin();
+                alias = selected->id;
+            } else {
+                alias = next_outbound_alias;
+                while (std::any_of(outbound_aliases.begin(), outbound_aliases.end(),
+                    [alias](const auto& entry) { return entry.id == alias; }))
+                    alias = static_cast<std::uint16_t>(alias == limit ? 1 : alias + 1);
+            }
+        }
+        if (!alias) return submit(original);
+        auto wire = original;
+        wire.properties.topic_alias = alias;
+        if (selected != outbound_aliases.end() && selected->topic == original.topic) wire.topic.clear();
+        auto sent = submit(wire);
+        // 首次建立映射增加少量字节，不能令原本可发送的数据因优化而失败。
+        if (!sent) {
+            if (automatic && (sent.error() == MqttError::packet_too_large || sent.error() == Errc::would_block))
+                return submit(original);
+            return sent;
+        }
+        if (selected != outbound_aliases.end() && selected->topic == original.topic) {
+            outbound_aliases.splice(outbound_aliases.end(), outbound_aliases, selected);
+            return {};
+        }
+        if (selected != outbound_aliases.end()) {
+            outbound_alias_bytes -= selected->topic.size();
+            outbound_aliases.erase(selected);
+        }
+        while (outbound_alias_bytes > options.max_outbound_topic_alias_bytes - original.topic.size()) {
+            outbound_alias_bytes -= outbound_aliases.front().topic.size();
+            outbound_aliases.pop_front();
+        }
+        outbound_aliases.push_back(OutboundAlias{alias, original.topic});
+        outbound_alias_bytes += original.topic.size();
+        next_outbound_alias = static_cast<std::uint16_t>(alias == limit ? 1 : alias + 1);
+        return {};
+    }
+
     // Application packets: bounded by the server's maximum and our output budget.
     Result<void> submit(const Packet& packet) {
         auto bytes = encode(packet, options.version);
@@ -363,7 +445,8 @@ Result<Session> Session::create(ClientOptions options) {
     if ((options.version != Version::v311 && options.version != Version::v5) || !options.receive_maximum ||
         options.maximum_packet_size < 16 || options.maximum_packet_size > max_packet_size ||
         !options.max_events || options.max_output < 1024 || p.receive_maximum || p.maximum_packet_size ||
-        p.topic_alias_maximum || (options.version == Version::v311 && options.topic_alias_maximum))
+        p.topic_alias_maximum || (options.outbound_topic_alias_maximum && !options.max_outbound_topic_alias_bytes) ||
+        (options.version == Version::v311 && (options.topic_alias_maximum || options.outbound_topic_alias_maximum)))
         return fail(Errc::invalid_argument);
     auto impl = std::make_unique<Impl>();
     impl->options = std::move(options);
@@ -510,6 +593,10 @@ Result<void> Session::connect(std::uint64_t now, std::size_t externally_buffered
     s.active_publishes = 0;
     for (auto& [id, entry] : s.outgoing) { static_cast<void>(id); entry.sent_on_connection = false; }
     s.aliases.clear();
+    s.outbound_aliases.clear();
+    s.outbound_alias_bytes = 0;
+    s.server_topic_alias_max = 0;
+    s.next_outbound_alias = 1;
     s.ping_sent.reset();
     s.state = SessionState::idle;
     s.server_max_packet = max_packet_size;
@@ -574,10 +661,10 @@ Result<void> Session::receive(std::span<const std::byte> bytes, std::uint64_t no
 Result<std::uint16_t> Session::publish(Publish message, std::span<const std::uint16_t> retained_ids) {
     auto& s = *impl_;
     if (auto r = s.ready_to_send(); !r) return fail(r.error());
-    if (static_cast<std::uint8_t>(message.qos) > s.server_max_qos || (message.retain && !s.retain_available) ||
-        message.properties.topic_alias)
+    if (static_cast<std::uint8_t>(message.qos) > s.server_max_qos || (message.retain && !s.retain_available))
         return fail(Errc::not_supported);
     if (!message.properties.subscription_identifiers.empty()) return fail(Errc::invalid_argument);
+    if (auto r = s.resolve_outbound_topic(message); !r) return fail(r.error());
     message.dup = false;
     message.packet_id = 0;
     if (message.qos != QoS::at_most_once) {
@@ -585,7 +672,8 @@ Result<std::uint16_t> Session::publish(Publish message, std::span<const std::uin
         message.packet_id = s.allocate(retained_ids);
         if (!message.packet_id) return fail(Errc::would_block);
     }
-    if (auto r = s.submit(message); !r) return fail(r.error());
+    if (auto r = s.submit_publish(message); !r) return fail(r.error());
+    message.properties.topic_alias.reset();
     const auto id = message.packet_id;
     if (id) {
         const auto stage = message.qos == QoS::at_least_once ? Impl::Stage::puback : Impl::Stage::pubrec;

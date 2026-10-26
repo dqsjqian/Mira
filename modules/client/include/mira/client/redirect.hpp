@@ -12,11 +12,10 @@
 // (300, 304, 305, a 3xx without Location, any non-3xx) is terminal and is
 // returned as the final response. Method handling follows the fetch
 // standard: 301/302 convert POST to GET; 303 converts everything except
-// HEAD to GET; 307/308 preserve method and body. A converted request drops
-// its body and every Content-* header; a cross-origin hop additionally
-// drops Authorization and Cookie. Host, Content-Length and
-// Transfer-Encoding are always left to the session/framing layer, never
-// carried across hops.
+// HEAD to GET; 307/308 preserve method and body.
+// 方法转换会移除正文与所有 Content-* 头；跨源跳转另外移除 Authorization、
+// Proxy-Authorization 和 Cookie。Host、Content-Length 和 Transfer-Encoding
+// 总是由会话/分帧层生成，绝不直接跨跳复制。
 //
 // Safety bounds: at most max_redirects follows (default 10); revisiting an
 // absolute URL fails with limit_exceeded instead of looping forever; the
@@ -36,6 +35,7 @@
 #include "mira/core/operation.hpp"
 #include "mira/core/task.hpp"
 #include "mira/http/message.hpp"
+#include "mira/client/request_state.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -328,6 +328,8 @@ struct RedirectMethod {
 
 struct RedirectOptions {
     std::size_t max_redirects = 10;
+    /// 空值保持原有无状态语义；状态在每一跳独立匹配，绝不转发自动 Cookie。
+    std::shared_ptr<RequestState> state{};
 };
 
 struct RedirectResponse {
@@ -369,6 +371,7 @@ inline http::HeaderMap filtered_headers(const http::HeaderMap& in, bool cross_or
         if (drop_body && starts_with_ci(name, "content-")) continue;
         if (cross_origin &&
             (http::HeaderMap::names_equal(name, "Authorization") ||
+             http::HeaderMap::names_equal(name, "Proxy-Authorization") ||
              http::HeaderMap::names_equal(name, "Cookie")))
             continue;
         out.append(name, value);
@@ -401,8 +404,13 @@ template<class Client>
                                                                      OperationOptions io = {}) {
     if (scheme != "http" && scheme != "https") co_return fail(Errc::invalid_argument);
     if (port == 0) co_return fail(Errc::invalid_argument);
-    if (request.target.empty() || request.target.front() != '/') co_return fail(Errc::invalid_argument);
+    if (request.target.empty() || request.target.front() != '/' || !detail::valid_target_chars(request.target))
+        co_return fail(Errc::invalid_argument);
+    if constexpr (requires { Client::scheme(); }) {
+        if (options.state && Client::scheme() != scheme) co_return fail(Errc::invalid_argument);
+    } else if (options.state) co_return fail(Errc::not_supported);
     const auto version = request.version;
+    const auto method_token = request.method_token;
     std::string current_scheme = detail::lower_ascii(scheme);
     std::string current_host = detail::lower_ascii(host);
     std::uint16_t current_port = port;
@@ -419,31 +427,48 @@ template<class Client>
         visited.push_back(current.url());
         http::Request hop;
         hop.method = current_method;
+        if (current_method == http::Method::other) hop.method_token = method_token;
         hop.target = current_target;
         hop.version = version;
         hop.headers = current_headers;
-        auto lease = co_await client.acquire(current_host, current_port, io);
-        if (!lease) co_return fail(lease.error());
-        auto started = co_await lease->start(std::move(hop), current_body);
-        if (!started) co_return fail(started.error());
+        const auto started_at = Clock::now();
+        if (io.stop.stop_requested()) co_return fail(Errc::cancelled);
+        if (io.deadline && started_at >= *io.deadline) co_return fail(Errc::timed_out);
+        const RequestOrigin origin{current_scheme, current_host, current_port};
+        std::optional<CachedResponse> cached;
+        const auto generation = options.state ? options.state->generation() : 0;
+        if (options.state) {
+            options.state->prepare(origin, hop);
+            cached = options.state->lookup(origin, hop, current_body.empty());
+        }
         std::vector<std::byte> response_body;
         http::Response head;
-        bool first = true;
-        for (;;) {
-            auto part = co_await lease->read_body();
-            if (!part) co_return fail(part.error());
-            if (first) {
-                first = false;
-                auto parsed = lease->response();
-                if (!parsed) co_return fail(parsed.error());
-                head = std::move(*parsed);
+        if (cached) {
+            head = std::move(cached->head);
+            response_body = std::move(cached->body);
+        } else {
+            auto lease = co_await client.acquire(current_host, current_port, io);
+            if (!lease) co_return fail(lease.error());
+            auto started = co_await lease->start(hop, current_body);
+            if (!started) co_return fail(started.error());
+            bool first = true;
+            for (;;) {
+                auto part = co_await lease->read_body();
+                if (!part) co_return fail(part.error());
+                if (first) {
+                    first = false;
+                    auto parsed = lease->response();
+                    if (!parsed) co_return fail(parsed.error());
+                    head = std::move(*parsed);
+                }
+                if (part->empty()) break;
+                response_body.insert(response_body.end(), part->begin(), part->end());
             }
-            if (part->empty()) break;
-            response_body.insert(response_body.end(), part->begin(), part->end());
+            // 已排空的连接尽力回池，失败只关闭本连接。
+            static_cast<void>(lease->recycle());
+            if (options.state)
+                options.state->remember(origin, hop, current_body.empty(), head, response_body, generation, started_at);
         }
-        // Best effort: a drained keep-alive session returns to the pool
-        // for the next hop; failure just closes this connection.
-        static_cast<void>(lease->recycle());
         const unsigned status = head.status;
         const bool is_redirect =
             status == 301 || status == 302 || status == 303 || status == 307 || status == 308;

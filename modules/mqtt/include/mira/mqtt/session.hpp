@@ -55,6 +55,11 @@ struct ClientOptions {
     std::size_t max_events = 4096;
     /// Unwritten output bytes.
     std::size_t max_output = 4 * 1024 * 1024;
+    /// 出站自动/显式主题别名的本地上限；0 默认关闭，实际取与对端上限的较小值。
+    /// 每条连接独立分配，满表按 LRU 替换；重连清空，不计入持久化会话。
+    std::uint16_t outbound_topic_alias_maximum = 0;
+    /// 出站别名表中主题字符串的总字节上限（条目开销由上面的数量限制）。
+    std::size_t max_outbound_topic_alias_bytes = 256 * 1024;
 };
 
 struct Message {
@@ -130,6 +135,9 @@ public:
                          std::size_t externally_buffered_events = 0);
 
     /// Assigns the packet identifier (returned; 0 for QoS 0) and clears DUP.
+    /// 启用出站别名后，完整主题自动分配/复用；显式 topic_alias 可建立、替换映射，
+    /// 空主题只可复用当前连接已建立的显式 alias。错误/背压不改变别名表。
+    /// QoS 重发与检查点始终保留完整主题、移除连接级 alias，重连后重新协商。
     Result<std::uint16_t> publish(Publish message, std::span<const std::uint16_t> retained_ids = {});
     Result<std::uint16_t> subscribe(std::vector<Subscription> subscriptions, Properties properties = {},
                                     std::span<const std::uint16_t> retained_ids = {});

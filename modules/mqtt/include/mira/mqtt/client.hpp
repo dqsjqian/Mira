@@ -101,6 +101,7 @@ public:
     /// Returns the packet identifier (0 for QoS 0); completion arrives as a
     /// `published` event. `would_block` means the server's Receive Maximum or
     /// the output budget is full: receive acknowledgements, then retry.
+    /// 出站别名由 ClientOptions 显式启用；重连时清除映射，QoS 恢复使用原始主题。
     [[nodiscard]] Task<Result<std::uint16_t>> publish(std::string topic, Bytes payload,
                                                       QoS qos = QoS::at_most_once, bool retain = false,
                                                       Properties properties = {}, OperationOptions io = {}) {
