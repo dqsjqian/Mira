@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FORGEDEPS_HOME: ${{ runner.temp }}/forgedeps
+  FORGEDEPS_HOME: ${{ github.workspace }}/../forgedeps
 
 jobs:
   # Keep the validated Linux toolchain stable when ubuntu-latest changes its OS.
