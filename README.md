@@ -214,7 +214,7 @@ auto client = Mira::tls::Context::client({
 | Linux | epoll | GCC/Clang 运行测试、GCC ASan/UBSan、独立 HTTP/3 curl 与 Retry 互操作 |
 | Windows | IOCP | MSVC/MinGW 原生基础/TLS/H2/H3 测试；MSVC 独立 HTTP/3 curl 与 Retry 互操作 |
 | iOS | kqueue | arm64 Simulator 基础/TLS/H2/H3/DNSSEC 运行通过；缺少匹配的签名 profile，未完成真机运行 |
-| Android | epoll | arm64 Emulator 基础/TLS/H2/H3/DNSSEC 运行通过，需 **NDK 29+**；无真机运行证据 |
+| Android | epoll | arm64 Emulator 基础/TLS/H2/H3/DNSSEC 运行通过，需 **NDK r30+**；无真机运行证据 |
 
 CI 同时覆盖安装包消费与依赖隔离、协议模糊测试、MQTT/mosquitto 互操作，以及包含压缩的官方 Autobahn 客户端/服务端测试。Linux、macOS 和 Windows MSVC 的协议任务均要求独立 HTTP/3 与 Retry 互操作成功；sanitizer 等缺少独立 HTTP3 curl 的配置将相应用例计为跳过。
 
@@ -247,10 +247,10 @@ CI 同时覆盖安装包消费与依赖隔离、协议模糊测试、MQTT/mosqui
 
 ## 🚀 快速开始
 
-需要 **CMake 3.21+、C++23 编译器**。CI 工具链包括 **GCC 14+ / Clang 19+（Linux）/ AppleClang / MSVC v143**：
+需要 **CMake 3.21+、C++23 编译器**。CI 工具链全部是最新稳定版：**GCC 16+ / Clang 23+（Linux）/ Xcode 27 的 AppleClang / MSVC v145（Visual Studio 2026）**：
 
-- **GCC 14+**：GCC 13 的协程优化器存在已知内部错误（GCC 14 修复）。
-- **Linux 上 Clang 19+**：clang-18 的 `__cpp_concepts` 宏版本过旧，libstdc++ 据此隐藏 `std::expected`。
+- **GCC 16+**：GCC 13 的协程优化器存在已知内部错误（GCC 14 修复）；下限随 CI 实测工具链抬到 16。
+- **Linux 上 Clang 23+**：clang-18 及更早版本的 `__cpp_concepts` 宏版本过旧，libstdc++ 据此隐藏 `std::expected`；下限随 CI 实测工具链抬到 23。
 
 基础 core / transport / HTTP/1 构建零第三方依赖；TLS、WebSocket、HTTP/2、QUIC/HTTP/3 的可选依赖仅在启用对应模块时引入。
 
@@ -316,7 +316,7 @@ target_link_libraries(my_app PRIVATE Mira::transport Mira::http)
 
 拥有式客户端组合使用 `find_package(Mira REQUIRED COMPONENTS client)` / `Mira::client`；HTTPS 使用 `client_tls` / `Mira::client_tls`，构建时需 `MIRA_ENABLE_TLS=ON`。基础 `client` 不引入 OpenSSL；`http` 本身仍不依赖 transport。协议组件 `socks`、`dns`、`mqtt` 对应 `Mira::socks` / `Mira::dns` / `Mira::mqtt`，均不引入 OpenSSL，TLS 由调用方组合。
 
-Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` 门控关闭了；NDK 29（clang 21）在 API 24 上实测可构建。
+Android 需 **NDK r30 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` 门控关闭了；r30 是当前最新 LTS，在 API 24 上实测可构建。
 
 ## 已落地的生产组合能力
 

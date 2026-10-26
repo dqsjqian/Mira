@@ -165,6 +165,11 @@ def main(argv=None) -> int:
     if not args.no_test:
         commands.append(["ctest", "--test-dir", str(build_dir), "-C", build_type,
                          "--output-on-failure", "--parallel", str(args.jobs)])
+    # A fresh clone needs only Python: prepare (once, shared) the pinned
+    # ForgeDeps tooling plus CMake/Ninja when missing, then continue here.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import forgedeps_bootstrap
+    forgedeps_bootstrap.ensure(Path(__file__).resolve().parents[1] / "requirements-build.txt")
     from forgedeps.build_kit.session import run_session
     environment = dict(os.environ)
     if args.offline:

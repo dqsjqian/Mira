@@ -13,17 +13,29 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Toolchain policy: every compiler is the newest stable release.
+#   GCC 16      official gcc:16 image (release tarball build), Python via uv
+#   LLVM 23     apt.llvm.org (the newest release line)
+#   MSVC        Visual Studio 2026 (windows-2025-vs2026)
+#   AppleClang  the newest released Xcode on the xcode-27 image (macOS 27)
+#   Android     NDK r30
+#   MinGW-w64   MSYS2 UCRT64, packages updated at job start (GCC 16)
 env:
   FORGEDEPS_HOME: ${{ github.workspace }}/../forgedeps
+  GCC_VERSION: "16"
+  LLVM_VERSION: "23"
+  PYTHON_VERSION: "3.14"
 
 jobs:
   # Keep the validated Linux toolchain stable when ubuntu-latest changes its OS.
   # Architectural invariants first: cheap, and they fail loudest.
   discipline:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
+        # Container jobs bring their own interpreter (setup-gcc-container.sh).
+        if: env.VIRTUAL_ENV == ''
         with:
           python-version: '3.14'
       - name: Install forgedeps
@@ -55,31 +67,33 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-24.04,  std: 23, backend: epoll }
-          # Linux clang is a separate matrix entry: clang-18's __cpp_concepts
-          # stays at 201907L, which makes libstdc++ hide std::expected behind
-          # its feature-test gate even in C++23 mode. clang-19 is the first
-          # release where the concepts macro matches the language mode, so it
-          # is the oldest clang this library promises on Linux.
-          - { os: ubuntu-24.04,  std: 23, backend: epoll-clang, cc: clang-19, cxx: clang++-19 }
-          - { os: macos-latest,   std: 23, backend: kqueue }
-          - { os: windows-latest, std: 23, backend: iocp }
+          - { os: ubuntu-26.04,  std: 23, backend: epoll, container: gcc:16 }
+          # Linux clang is a separate matrix entry: libstdc++ hides
+          # std::expected behind its feature-test gate unless the compiler's
+          # __cpp_concepts matches the language mode.
+          - { os: ubuntu-26.04,  std: 23, backend: epoll-clang, llvm: "23" }
+          - { os: xcode-27,      std: 23, backend: kqueue }
+          - { os: windows-2025-vs2026, std: 23, backend: iocp }
     name: ${{ matrix.backend }} / c++${{ matrix.std }}
-    env:
-      CC: ${{ matrix.cc }}
-      CXX: ${{ matrix.cxx }}
+    container:
+      image: ${{ matrix.container || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
+        # Container jobs bring their own interpreter (setup-gcc-container.sh).
+        if: env.VIRTUAL_ENV == ''
         with:
           python-version: '3.14'
       - name: Install forgedeps
         run: |
           python -m pip install --break-system-packages -r requirements-build.txt
           python -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
-      - name: Install clang
-        if: matrix.cxx
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.cc }}
+      - name: Set up GCC 16 and Python
+        if: matrix.container
+        run: .github/scripts/setup-gcc-container.sh
+      - name: Set up LLVM 23
+        if: matrix.llvm
+        run: .github/scripts/install-llvm.sh
       - name: Configure
         run: cmake -S . -B build ${{ runner.os == 'Windows' && '-DCMAKE_CONFIGURATION_TYPES=Debug -DMIRA_DEPENDENCY_CONFIGURATION=Debug' || '-DCMAKE_BUILD_TYPE=Debug' }} -DCMAKE_CXX_STANDARD=${{ matrix.std }}
       - name: Build
@@ -97,10 +111,12 @@ jobs:
   # bug is caught by CI instead of by a downstream Windows build.
   windows-release:
     needs: discipline
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
+        # Container jobs bring their own interpreter (setup-gcc-container.sh).
+        if: env.VIRTUAL_ENV == ''
         with:
           python-version: '3.14'
       - name: Install forgedeps
@@ -121,17 +137,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest, windows-latest]
-        std: [23]
+        include:
+          - { os: ubuntu-26.04, std: 23, container: gcc:16 }
+          - { os: xcode-27, std: 23 }
+          - { os: windows-2025-vs2026, std: 23 }
+    container:
+      image: ${{ matrix.container || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
+        # Container jobs bring their own interpreter (setup-gcc-container.sh).
+        if: env.VIRTUAL_ENV == ''
         with:
           python-version: '3.14'
       - name: Install forgedeps
         run: |
           python -m pip install --break-system-packages -r requirements-build.txt
           python -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
+      - name: Set up GCC 16 and Python
+        if: matrix.container
+        run: .github/scripts/setup-gcc-container.sh libssl-dev zlib1g-dev
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
       - name: Install OpenSSL on Linux
@@ -182,20 +207,24 @@ jobs:
   # honest, on exactly the stack the Windows-side verification runs.
   mingw:
     needs: discipline
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
     defaults:
       run:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
+        # Container jobs bring their own interpreter (setup-gcc-container.sh).
+        if: env.VIRTUAL_ENV == ''
         with:
           python-version: '3.14'
       - name: Install the UCRT64 toolchain
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         with:
           msystem: UCRT64
-          update: false
+          # Update the package database so the job builds with the newest
+          # UCRT64 GCC rather than the snapshot baked into the image.
+          update: true
           install: >-
             git
             mingw-w64-ucrt-x86_64-cmake
@@ -209,9 +238,8 @@ jobs:
       # OpenSSL's MinGW build runs its Unix recipes with MSYS make and perl;
       # it deliberately does not mix in mingw32-make or cmd.exe.
       - name: Select the supported Python for the MinGW shell
-        # update: false keeps the MSYS2 package snapshot fixed, so its Python
-        # is not guaranteed to be the supported version. Drive the tooling
-        # with the interpreter installed by setup-python instead.
+        # MSYS2's own Python is not guaranteed to be the supported version.
+        # Drive the tooling with the interpreter installed by setup-python.
         run: echo "MIRA_PYTHON=$(cygpath -u "$pythonLocation")/python.exe" >> "$GITHUB_ENV"
       - name: Install forgedeps into the selected Python
         run: |
@@ -235,24 +263,32 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-24.04, cc: gcc-14, cxx: g++-14 }
-          - { os: macos-latest, cc: clang, cxx: clang++ }
+          - { os: ubuntu-26.04, container: gcc:16 }
+          - { os: xcode-27 }
+    # LeakSanitizer stops threads through ptrace, which a container only
+    # allows with this capability.
+    container:
+      image: ${{ matrix.container || '' }}
+      options: ${{ matrix.container && '--cap-add=SYS_PTRACE' || '' }}
     env:
-      CC: ${{ matrix.cc }}
-      CXX: ${{ matrix.cxx }}
       UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
+        # Container jobs bring their own interpreter (setup-gcc-container.sh).
+        if: env.VIRTUAL_ENV == ''
         with:
           python-version: '3.14'
       - name: Install forgedeps
         run: |
           python3 -m pip install --break-system-packages -r requirements-build.txt
           python3 -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
+      - name: Set up GCC 16 and Python
+        if: matrix.container
+        run: .github/scripts/setup-gcc-container.sh libssl-dev zlib1g-dev
       - name: Install OpenSSL on Linux
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y g++-14 libssl-dev zlib1g-dev
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
       - name: Locate OpenSSL on macOS
         if: runner.os == 'macOS'
         shell: bash
@@ -284,22 +320,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        include:
+          - { os: ubuntu-26.04, llvm: "23" }
+          - { os: xcode-27 }
     env:
       TSAN_OPTIONS: halt_on_error=1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
+        # Container jobs bring their own interpreter (setup-gcc-container.sh).
+        if: env.VIRTUAL_ENV == ''
         with:
           python-version: '3.14'
-      - name: Install compiler on Linux
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang-19
+      - name: Install LLVM 23 on Linux
+        if: matrix.llvm
+        run: .github/scripts/install-llvm.sh runtime
       - name: Configure race detection
         shell: bash
         run: >
           cmake -S . -B build/tsan -DCMAKE_BUILD_TYPE=Debug -DMIRA_BUILD_EXAMPLES=OFF
-          ${{ runner.os == 'Linux' && '-DCMAKE_CXX_COMPILER=clang++-19' || '' }}
+          ${{ runner.os == 'Linux' && '-DCMAKE_CXX_COMPILER=clang++-23' || '' }}
           -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
       - name: Build focused concurrency tests
         run: cmake --build build/tsan --parallel --target mira_core_tests mira_runtime_tests mira_observe_tests mira_task_scope_tests mira_resolver_tests
@@ -312,27 +352,28 @@ jobs:
   # enough to keep in the required path.
   fuzz:
     needs: discipline
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
-      CC: clang-19
-      CXX: clang++-19
+      CC: clang-23
+      CXX: clang++-23
       UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
+        # Container jobs bring their own interpreter (setup-gcc-container.sh).
+        if: env.VIRTUAL_ENV == ''
         with:
           python-version: '3.14'
       - name: Install forgedeps
         run: |
           python3 -m pip install --break-system-packages -r requirements-build.txt
           python3 -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
-      - name: Install clang 19
-        # clang-19 minimum on Linux (see the epoll-clang entry in build). No
-        # -stdlib=libc++: LLVM 19's libc++ still hides std::stop_token behind
-        # _LIBCPP_HAS_NO_EXPERIMENTAL_STOP_TOKEN (CI-proven with both 18 and
-        # 19; the android job describes the same gate), while libstdc++ ships
-        # the complete library — exactly what epoll-clang already validates.
-        run: sudo apt-get update && sudo apt-get install -y clang-19 libssl-dev zlib1g-dev
+      - name: Install LLVM 23 with libFuzzer
+        # No -stdlib=libc++: libstdc++ ships the complete C++23 library, which
+        # is exactly what epoll-clang validates.
+        run: |
+          .github/scripts/install-llvm.sh runtime
+          sudo apt-get install -y libssl-dev zlib1g-dev
       - name: Configure with libFuzzer
         # CFLAGS reach only the C dependencies (Mira has no C sources), which
         # are instrumented on purpose. OpenSSL deliberately calls AES_encrypt
@@ -344,7 +385,7 @@ jobs:
           LDFLAGS: -fsanitize=address,undefined,fuzzer-no-link
         run: >
           python scripts/ci/dependency_session.py -- cmake -S . -B build/fuzz -DCMAKE_BUILD_TYPE=Debug
-          -DCMAKE_CXX_COMPILER=clang++-19
+          -DCMAKE_CXX_COMPILER=clang++-23
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"
           -DMIRA_BUILD_FUZZERS=ON -DMIRA_ENABLE_WEBSOCKET=ON
           -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON
@@ -380,15 +421,21 @@ jobs:
   # Run the official RFC6455 and RFC7692 corpus against both roles.
   websocket-conformance:
     needs: discipline
-    runs-on: ubuntu-24.04
+    # Autobahn runs as a Docker container, so this job stays on the host and
+    # uses the newest stable LLVM rather than the GCC 16 image.
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
+        # Container jobs bring their own interpreter (setup-gcc-container.sh).
+        if: env.VIRTUAL_ENV == ''
         with:
           python-version: '3.14'
-      - name: Install WebSocket build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
+      - name: Install LLVM 23 and WebSocket build dependencies
+        run: |
+          .github/scripts/install-llvm.sh
+          sudo apt-get install -y libssl-dev zlib1g-dev
       - name: Install forgedeps
         run: |
           python -m pip install --break-system-packages -r requirements-build.txt
@@ -421,22 +468,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        include:
+          - { os: ubuntu-26.04, container: gcc:16 }
+          - { os: xcode-27 }
+    container:
+      image: ${{ matrix.container || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
+        # Container jobs bring their own interpreter (setup-gcc-container.sh).
+        if: env.VIRTUAL_ENV == ''
         with:
           python-version: '3.14'
       - name: Install forgedeps
         run: |
           python3 -m pip install --break-system-packages -r requirements-build.txt
           python3 -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
-      - name: Install protocol toolchain on Linux
-        if: runner.os == 'Linux'
+      - name: Set up GCC 16, Python and the protocol toolchain
+        if: matrix.container
         run: |
-          sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev g++-14 mosquitto
-          echo "CC=gcc-14" >> "$GITHUB_ENV"
-          echo "CXX=g++-14" >> "$GITHUB_ENV"
+          .github/scripts/setup-gcc-container.sh libssl-dev zlib1g-dev mosquitto
           # mqtt.interop must reach the third-party broker, not skip it.
           echo "MIRA_REQUIRE_MOSQUITTO=1" >> "$GITHUB_ENV"
       - name: Locate OpenSSL on macOS
@@ -529,10 +580,12 @@ jobs:
   # sandboxed platform — without pretending the tests ran.
   ios:
     needs: discipline
-    runs-on: macos-latest
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
+        # Container jobs bring their own interpreter (setup-gcc-container.sh).
+        if: env.VIRTUAL_ENV == ''
         with:
           python-version: '3.14'
       - name: Configure for iOS
@@ -545,18 +598,18 @@ jobs:
 
   android:
     needs: discipline
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       # Pinned rather than `$ANDROID_NDK_ROOT`, which is whichever NDK the
-      # runner image happens to default to. `std::stop_token` is gated behind
-      # `_LIBCPP_HAS_NO_EXPERIMENTAL_STOP_TOKEN` in the libc++ that NDK 27 and
-      # 28 ship (LLVM 18 and 19); LLVM 20 removed the gate. So the default NDK
-      # cannot build this library at any API level, and the version is a real
-      # requirement rather than an incidental detail.
-      MIRA_NDK_VERSION: 29.0.14206865
+      # runner image happens to default to. r30 is the newest LTS release and
+      # ships an LLVM whose libc++ exposes std::stop_token without the
+      # experimental gate NDK 27 and 28 carried.
+      MIRA_NDK_VERSION: 30.0.16248370
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
+        # Container jobs bring their own interpreter (setup-gcc-container.sh).
+        if: env.VIRTUAL_ENV == ''
         with:
           python-version: '3.14'
       - name: Install the pinned NDK

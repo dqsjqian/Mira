@@ -214,7 +214,7 @@ No 408 is sent: announcing it would require a second budget the caller never gra
 | Linux | epoll | GCC/Clang runtime tests, GCC ASan/UBSan, independent HTTP/3 curl and Retry interoperability |
 | Windows | IOCP | Native MSVC/MinGW base/TLS/H2/H3 tests; MSVC independent HTTP/3 curl and Retry interoperability |
 | iOS | kqueue | arm64 Simulator base/TLS/H2/H3/DNSSEC runtime passed; no physical-device run without a matching signing profile |
-| Android | epoll | arm64 Emulator base/TLS/H2/H3/DNSSEC runtime passed, **NDK 29+**; no physical-device evidence |
+| Android | epoll | arm64 Emulator base/TLS/H2/H3/DNSSEC runtime passed, **NDK r30+**; no physical-device evidence |
 
 CI also covers installed packages and dependency isolation, protocol fuzzing, MQTT/mosquitto interoperability, and official Autobahn client/server tests including compression. The Linux, macOS and Windows MSVC protocol jobs require independent HTTP/3 and Retry interoperability. Configurations without an independent HTTP3 curl, such as the sanitizer jobs, count the corresponding cases as skipped.
 
@@ -254,10 +254,10 @@ hash-verifies 3.5.9.
 
 ## 🚀 Quick start
 
-Requires **CMake 3.21+ and a C++23 compiler**. CI toolchains include **GCC 14+ / Clang 19+ (Linux) / AppleClang / MSVC v143**:
+Requires **CMake 3.21+ and a C++23 compiler**. CI toolchains are the newest stable releases: **GCC 16+ / Clang 23+ (Linux) / AppleClang from Xcode 27 / MSVC v145 (Visual Studio 2026)**:
 
-- **GCC 14+**: GCC 13's coroutine optimizer has a known internal compiler error; fixed in GCC 14.
-- **Clang 19+ on Linux**: clang-18 keeps `__cpp_concepts` outdated, so libstdc++ hides `std::expected` behind its feature-test.
+- **GCC 16+**: GCC 13's coroutine optimizer has a known internal compiler error (fixed in GCC 14); the floor follows the toolchain CI measures.
+- **Clang 23+ on Linux**: clang-18 and older keep `__cpp_concepts` outdated, so libstdc++ hides `std::expected` behind its feature-test; the floor follows the toolchain CI measures.
 
 The base core / transport / HTTP/1 build has zero third-party dependencies. TLS, WebSocket, HTTP/2 and QUIC/HTTP/3 dependencies are introduced only when those optional modules are enabled.
 
@@ -323,7 +323,7 @@ Installed consumers use `find_package(Mira REQUIRED COMPONENTS core transport ht
 
 Owning-client composition uses `find_package(Mira REQUIRED COMPONENTS client)` / `Mira::client`; HTTPS uses `client_tls` / `Mira::client_tls` and requires `MIRA_ENABLE_TLS=ON` when building. The base `client` target does not introduce OpenSSL; `http` itself still does not depend on transport. Protocol components `socks`, `dns` and `mqtt` map to `Mira::socks`, `Mira::dns` and `Mira::mqtt`; none introduces OpenSSL, and TLS is composed by the caller.
 
-Android requires **NDK 29 or newer**: NDK 27/28's libc++ gates `std::stop_token` off; NDK 29 (clang 21) builds on API 24 as tested.
+Android requires **NDK r30 or newer**: NDK 27/28's libc++ gates `std::stop_token` off; r30 is the current LTS and builds on API 24 as tested.
 
 ## Production composition now available
 
