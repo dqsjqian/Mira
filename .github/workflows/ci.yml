@@ -329,8 +329,12 @@ jobs:
         # the complete library — exactly what epoll-clang already validates.
         run: sudo apt-get update && sudo apt-get install -y clang-19 libssl-dev zlib1g-dev
       - name: Configure with libFuzzer
+        # CFLAGS reach only the C dependencies (Mira has no C sources), which
+        # are instrumented on purpose. OpenSSL deliberately calls AES_encrypt
+        # through its generic block128_f pointer type, which clang's
+        # -fsanitize=function reports; every other ASan/UBSan check stays on.
         env:
-          CFLAGS: -fsanitize=address,undefined,fuzzer-no-link -fno-omit-frame-pointer
+          CFLAGS: -fsanitize=address,undefined,fuzzer-no-link -fno-sanitize=function -fno-omit-frame-pointer
           CXXFLAGS: -fsanitize=address,undefined,fuzzer-no-link -fno-omit-frame-pointer
           LDFLAGS: -fsanitize=address,undefined,fuzzer-no-link
         run: >
@@ -380,6 +384,10 @@ jobs:
           python-version: '3.14'
       - name: Install WebSocket build dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
+      - name: Install forgedeps
+        run: |
+          python -m pip install --break-system-packages -r requirements-build.txt
+          python -m forgedeps init "${{ env.FORGEDEPS_HOME }}"
       - name: Configure and build both conformance harnesses
         run: |
           cmake -S . -B build/autobahn -DCMAKE_BUILD_TYPE=Release -DMIRA_ENABLE_WEBSOCKET=ON
