@@ -42,7 +42,7 @@ and remaining acceptance work must be described separately.
 | Transport and composition | Completion-shaped TCP/UDP/local streams; `DatagramTransport` conformance assertions; bounded family-interleaved `tcp::dial`; separately composed HTTP/HTTPS client pools and grace-draining TCP serving | Maintain backend-specific teardown evidence; DNS is bounded system getaddrinfo, not independent asynchronous A/AAAA resolution |
 | Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered and streaming request bodies (`RequestBodyReader`), chunked trailers, connection-loop drain guarantees; request- and response-parser fuzzing in CI; curl interop exercised out-of-process against the example servers — HTTP/1.1 against the file server, real-nghttp2 HTTP/2 (prior knowledge, including concurrent streams) against `examples/h2_prior_knowledge_server`, native-QUIC HTTP/3 (ngtcp2 + nghttp3) against `examples/h3_server`; HTTP/1 `Expect: 100-continue` and duplex early responses; SOCKS5 against curl and independent Python peers; DoH against curl and Python peers; MQTT 3.1.1/5.0 against an independent Python broker and mosquitto | Protocol conformance evidence, slow-consumer backpressure bounds and bounded aggregate memory measurements |
 | Security and robustness | Duplex TLS with terminal cancellation, bounded parsers, shared accounting budgets, HTTP/WS/SOCKS/DNS/MQTT fuzzing, opt-in validated QUIC paths, explicit replay-safe raw-QUIC early data and HTTP/3 0-RTT with SETTINGS-bound ticket domains and automatic 425 for unsafe early requests | No complete anti-replay or process-RSS guarantee; longer exhaustion tests and mobile TLS runtime evidence remain open |
-| Engineering evidence | Desktop CI, compression-inclusive Autobahn reports, sanitizer suites, Windows MSVC independent HTTP/3 curl and Retry checks, MinGW H2/H3 runtime tests; revision-specific results in the [audit record](AUDIT-2026-09-30.md) | iOS lacks signed device evidence; Android devices and multi-host/WAN remain unverified; local soak results apply only to their recorded snapshots; no stable ABI promise |
+| Engineering evidence | Desktop CI, compression-inclusive Autobahn reports, sanitizer suites, Windows MSVC independent HTTP/3 curl and Retry checks, MinGW H2/H3 runtime tests, native Windows Release runs on MSVC VS2026 and UCRT64 MinGW GCC 16 (base and full protocol suites, 2026-10-26); revision-specific results in the [audit record](AUDIT-2026-09-30.md) | iOS lacks signed device evidence; Android devices and multi-host/WAN remain unverified; local soak results apply only to their recorded snapshots; no stable ABI promise |
 
 Rejecting ambiguous or malformed input is part of protocol correctness, not a
 substitute for the other contracts. The HTTP parser rejects conflicting
@@ -734,6 +734,26 @@ Linux and macOS protocol jobs also require independent HTTP/3 curl and Retry
 checks. The measurements below are historical development snapshots; they do
 not replace verification of a release candidate.
 
+- Native Windows 2026-10-26 snapshot of this revision (Release, Ninja, Windows
+  x64): MSVC VS2026 (cl 19.51, OpenSSL 3.5.9 built from source, static) and
+  UCRT64 MinGW GCC 16.2 (OpenSSL 3.6.5; nghttp2, nghttp3 and ngtcp2 from the
+  pinned dependency script) each passed the base configuration 58/58.
+  `mira_local_tests` 2/2 and `mira_udp_tests` 155/155 ran on both toolchains:
+  Unix-domain factories and UDP ancillary metadata/send options return
+  `not_supported` on native Windows rather than silently degrading. The MinGW
+  full TLS/WebSocket/H2/H3 configuration passed 114/114 after four
+  environment-sensitive tests (DoH interop, H2 interop, two death tests) were
+  rerun without the machine's HTTP proxy variables and outside the parallel
+  batch. A standalone program bound a real `fe80::` link-local zone address,
+  dialed it through the system resolver via `HttpClient`, and confirmed the
+  wire `Host` carries no zone on both toolchains. A 30-second H3 fault-harness
+  soak on the native Windows IOCP backend (3 clients, 128 KiB payload, seed
+  20260928) passed 588/588 requests across 49 clean rounds and 441/441
+  overlapping short streams, with 62,591 UDP packets each way under injected
+  loss, duplication and reordering; every final connection, route, tombstone,
+  queued-byte and reserved-byte counter returned to zero, peak RSS 21.8 MB.
+  This is one host, not multi-host/WAN evidence.
+
 - Historical 2026-09-29 phase source (HTTP/3 0-RTT, MQTT, documentation sync): local
   AppleClang Release, GCC 16 and ASan+UBSan each ran 97 tests, 95 passed and
   the 2 external HTTP/3 curl interop tests skipped (no HTTP3 curl locally), 0
@@ -800,7 +820,11 @@ argument for running tests on every platform rather than building on them.
    `ERROR_NOT_FOUND`, accept-socket reclamation, buffer release strictly after
    the drain — are compiled locally through mingw-w64, which catches type and
    lifetime errors cheaply, but mingw is not MSVC and a compile is not a run.
-   Those semantics have no local evidence of any kind.
+   Those semantics had no local evidence at audit time. The 2026-10-26 native
+   Windows Release runs (MSVC VS2026 and UCRT64 MinGW GCC 16, see the
+   verification snapshot below) now execute the IOCP backend end to end on a
+   Windows machine, including the cancellation/deadline suites; the audit
+   record remains the revision-specific reference for its own snapshot.
 
 4. **A toolchain the CI image defaults to is not the toolchain a library
    requires.** `std::stop_token` is gated behind
@@ -883,7 +907,8 @@ work on Mira itself.
   `dns::query_udp/query_tcp` operations do not create background resolver
   threads; server selection, automatic fallback and retry remain application
   policy. UDP supports ASM membership and POSIX packet metadata/source control;
-  Windows ancillary data is explicitly unsupported.
+  Windows ancillary data is explicitly unsupported, and the rejection path
+  itself has native Windows runtime evidence (2026-10-26 snapshot).
 - QUIC exposes PMTUD/UDP payload and congestion settings, unreliable RFC 9221
   DATAGRAM messages, qlog and connection statistics. DATAGRAM receive overflow
   drops messages rather than consuming unbounded memory or blocking reliable
@@ -909,7 +934,7 @@ work on Mira itself.
 | Decision | Choice | Why |
 |---|---|---|
 | **I/O model** | **completion-shaped public API** | A common operation contract for IOCP and reactor implementations |
-| Platform scope | Desktop runtime targets, including Windows MSVC independent H3/Retry and MinGW H2/H3; iOS host smoke/unsigned cross-build and Android cross-build | Mobile device execution is not yet evidenced; BSD has no dedicated CI evidence |
+| Platform scope | Desktop runtime targets, including Windows MSVC independent H3/Retry and MinGW H2/H3 plus native Windows Release local runs (MSVC VS2026, UCRT64 MinGW); iOS host smoke/unsigned cross-build and Android cross-build | Mobile device execution is not yet evidenced; BSD has no dedicated CI evidence |
 | Readiness API | POSIX-only, behind an explicit macro | A platform extension, not part of the portable operation contract |
 | Execution model | Lazy `Task<T>`, single-threaded `TaskScope` spawn/join and independent-worker `LoopGroup` | Bounded root-task admission does not make one loop or its sockets multi-thread-safe; suspended tasks cannot be arbitrarily destroyed |
 | Library form | Compiled library with modular public headers | Keep implementation boundaries explicit; the [release guide](RELEASES.md) defines source compatibility and requires rebuilding consumers |
@@ -976,8 +1001,10 @@ and *runs* tests on all three backends, and cross-compiles for iOS and Android.
 
 The historical local kqueue run recorded 118 checks across C++20, C++23 and
 ASan/UBSan. Desktop epoll/IOCP runtime coverage comes from CI, not that local
-run. Neither the check count nor the existence of a CI job establishes current
-revision health or full backend lifecycle correctness.
+run; native Windows IOCP additionally has local Release runtime evidence from
+the 2026-10-26 snapshot (MSVC VS2026 and UCRT64 MinGW, see the verification
+snapshots). Neither the check count nor the existence of a CI job establishes
+current revision health or full backend lifecycle correctness.
 
 **Stage 3 — the parser.** Incremental, strict HTTP/1.1 request parsing:
 `message.hpp` (HTTP message types, subject to review for future protocol reuse),
@@ -1087,7 +1114,9 @@ recoveries: the loop cannot make either safe by itself, so it says so loudly
 instead of continuing into a use-after-free.
 
 Cancellation now reaches every layer, but two limits are worth stating plainly.
-The Windows half has no local runtime evidence, only CI. And a cancelled read
+The Windows half has native Release runtime evidence from the 2026-10-26 local
+runs (MSVC VS2026 and UCRT64 MinGW, including the cancellation suites and an
+H3 loopback soak); before that snapshot it had CI only. A cancelled read
 or write on IOCP can discard bytes the kernel had already moved, so that
 connection is finished — a caller that reuses it reads a stream with a hole in
 it. This foundation is neither production-readiness nor a complete
