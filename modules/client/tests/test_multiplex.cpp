@@ -266,6 +266,7 @@ Task<void> abandoned(EventLoop& loop, const char* cert) {
     TaskScope pending;
     Error error;
     pending.spawn(cancelled_query(*pool, port(listener), {}, error));
+    require(co_await loop.sleep_for(2ms));
     check(pool->active() == 1, "death contract lacked a real pending request");
     pool.reset();
     co_await pending.join();
