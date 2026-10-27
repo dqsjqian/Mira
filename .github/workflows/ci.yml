@@ -320,7 +320,9 @@ jobs:
           -DMIRA_ENABLE_HTTP2=ON -DMIRA_ENABLE_HTTP3=ON
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
       - name: Build
-        run: python scripts/ci/dependency_session.py -- cmake --build build/asan --parallel
+        # Sanitizer instrumentation for all optional protocols uses much more
+        # memory per compile than the normal matrix; cap parallelism in the container.
+        run: python scripts/ci/dependency_session.py -- cmake --build build/asan --parallel 2
       - name: Test
         run: python scripts/ci/dependency_session.py -- ctest --no-tests=error --test-dir build/asan --output-on-failure
 
