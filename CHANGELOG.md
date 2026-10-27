@@ -4,13 +4,18 @@ Version source, compatibility policy and consumption instructions are maintained
 in the [release guide](docs/RELEASES.md). Version headings below are historical
 records; they are not additional definitions of the current build version.
 
-## Unreleased
+## [1.2.1] - 2026-10-27
 
 - Build optional protocol dependencies through the shared ForgeDeps artifact
   store and external ForgeRecipes, including locked OpenSSL and installed SDKs.
 - Hold dependency generations across builds, tests and independent HTTP/3 curl
   interoperability. Keep application source and dependency artifacts separate.
 - Support OpenSSL 4 certificate APIs while retaining OpenSSL 3.5 QUIC support.
+- Start the HTTP/3 abandon probe before asserting connection-pool death, so the
+  multiplex regression observes an actually pending request (a MinGW timeout).
+- Read pinned license texts from the recipe package, cap sanitizer build
+  parallelism in containers, and run the whole matrix on the newest stable
+  toolchains (GCC 16, Clang 23, VS 2026, Xcode 27, NDK r30, Python 3.14).
 
 ## [1.2.0] - 2026-10-26
 
