@@ -353,19 +353,31 @@ if(MIRA_BUILD_EXAMPLES)
                         $<TARGET_FILE:mira_h3_server> $<TARGET_FILE:mira_h3_client>
                         ${MIRA_QUIC_TEST_CERT} ${MIRA_QUIC_TEST_KEY})
                 set_tests_properties(mira_h3_pair PROPERTIES TIMEOUT 120)
-                add_test(NAME mira_h3_interop
-                    COMMAND ${Python3_EXECUTABLE}
-                        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_h3_interop.py
-                        $<TARGET_FILE:mira_h3_server>
-                        --openssl ${MIRA_QUIC_OPENSSL_TOOL}
-                )
-                set_tests_properties(mira_h3_interop PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
-                add_test(NAME mira_h3_retry_interop
-                    COMMAND ${Python3_EXECUTABLE}
-                        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_h3_interop.py
-                        $<TARGET_FILE:mira_h3_multi_server> --multi-retry
-                        --openssl ${MIRA_QUIC_OPENSSL_TOOL})
-                set_tests_properties(mira_h3_retry_interop PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+                # The interop check drives a real HTTP/3 client, and which
+                # client decides the result: a distribution curl is built
+                # against whatever QUIC stack that distribution ships, and
+                # Ubuntu 26.04's stalls against this server while the locked
+                # 8.22 artifact completes. CI therefore runs the check
+                # explicitly against build/interop-curl with --strict; the
+                # suite registers it only when a client is named, so a
+                # developer can point MIRA_QUIC_CURL_TOOL at their own.
+                if(MIRA_QUIC_CURL_TOOL)
+                    add_test(NAME mira_h3_interop
+                        COMMAND ${Python3_EXECUTABLE}
+                            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_h3_interop.py
+                            $<TARGET_FILE:mira_h3_server>
+                            --openssl ${MIRA_QUIC_OPENSSL_TOOL}
+                            --curl ${MIRA_QUIC_CURL_TOOL}
+                    )
+                    set_tests_properties(mira_h3_interop PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+                    add_test(NAME mira_h3_retry_interop
+                        COMMAND ${Python3_EXECUTABLE}
+                            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/check_h3_interop.py
+                            $<TARGET_FILE:mira_h3_multi_server> --multi-retry
+                            --openssl ${MIRA_QUIC_OPENSSL_TOOL}
+                            --curl ${MIRA_QUIC_CURL_TOOL})
+                    set_tests_properties(mira_h3_retry_interop PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+                endif()
             endif()
         endif()
     endif()

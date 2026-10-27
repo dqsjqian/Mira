@@ -124,7 +124,13 @@ static_assert(std::string_view{{MIRA_VERSION_STRING}} == "{version}");
                           ('CMAKE_GENERATOR_TOOLSET', '-T')]:
             if cache.get(key):
                 common.extend([flag, cache[key]])
-        receipt = build / 'forgedeps-environment.json'
+        # A configure that names its environment keeps it wherever the caller
+        # put it (build/protocols/deps/prefix/environment.json in CI), so read
+        # the receipt from the cache before assuming the default location. The
+        # consumer must see the same pinned dependencies the SDK was built
+        # against: without them CMake falls back to a system OpenSSL, and the
+        # static quic archive then fails to link SSL_set1_dnsname.
+        receipt = Path(cache.get('FORGEDEPS_ENVIRONMENT') or build / 'forgedeps-environment.json')
         shared = read_environment(receipt).prefixes if receipt.is_file() else ()
         prefixes = ';'.join([str(prefix), *map(str, shared), cache.get('CMAKE_PREFIX_PATH', '')])
         common.extend(['-DCMAKE_PREFIX_PATH=' + prefixes,
@@ -145,9 +151,12 @@ static_assert(std::string_view{{MIRA_VERSION_STRING}} == "{version}");
                 hidden_packages.add('NGHTTP2')
             settings = ''.join(f'set(CMAKE_DISABLE_FIND_PACKAGE_{package} TRUE)\n'
                                for package in sorted(hidden_packages))
-            if cache.get('OPENSSL_ROOT_DIR') and not hidden:
-                openssl_root = Path(cache['OPENSSL_ROOT_DIR']).as_posix()
-                settings += f'set(OPENSSL_ROOT_DIR [==[{openssl_root}]==])\n'
+            openssl_root = cache.get('OPENSSL_ROOT_DIR')
+            if not openssl_root:
+                openssl_root = next((str(item) for item in shared
+                                     if (item / 'include/openssl/opensslv.h').is_file()), None)
+            if openssl_root and not hidden:
+                settings += f'set(OPENSSL_ROOT_DIR [==[{Path(openssl_root).as_posix()}]==])\n'
             text = ('cmake_minimum_required(VERSION 3.21)\n'
                     'project(consumer LANGUAGES CXX)\n' + prelude + settings +
                     f'find_package(Mira {requested_version} REQUIRED {find})\n' + checks + '\n')
