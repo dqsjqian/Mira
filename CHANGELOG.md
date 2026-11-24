@@ -4,6 +4,40 @@ Version source, compatibility policy and consumption instructions are maintained
 in the [release guide](docs/RELEASES.md). Version headings below are historical
 records; they are not additional definitions of the current build version.
 
+## [Unreleased]
+
+### Fixed
+
+- A buffered HTTP/1 server no longer reserves the request body from the
+  declared Content-Length beyond 1 MiB. With a large or unbounded
+  `max_body_size`, one header could allocate gigabytes before any body byte
+  arrived, and the resulting `std::length_error`/`std::bad_alloc` escaped
+  `serve_connection` and stopped `tcp::serve`. Allocation failures while
+  buffering a body now answer 413/500 and close the connection.
+- `request_with_redirects` bounds a chain by `max_redirects` only, like curl
+  and browsers. Revisiting a URL is no longer rejected, so POST -> 303 -> GET
+  of the same URL (Post/Redirect/Get) and cookie-setting re-authentication
+  hops complete; loops still end with `limit_exceeded`.
+- `MultiplexClient` retires a connection that can no longer open streams
+  (peer GOAWAY, transport failure, stopped after an application exception)
+  and dials a fresh one on the next request, instead of failing every later
+  request to that origin. Retired connections are joined after their last
+  request; `Http2Connection` and `Http3Connection` expose `usable()`.
+- WebSocket: an application `send()` issued while the reader's automatic Pong
+  or Close reply is blocked by back-pressure now waits for that frame instead
+  of failing with `invalid_argument`. Its stop token and deadline are checked
+  before it waits and after the reply completes; two concurrent application
+  writers are still rejected.
+- Configure fails when nghttp2 does not come from the ForgeDeps recipe graph.
+
+### Performance
+
+- Work submitted from the event loop's own thread (post, yield/sleep timers,
+  deadlines, cancellation) no longer writes the self-pipe wake-up, and on Apple
+  platforms zero-timeout polls use `kevent64` with `KEVENT_FLAG_IMMEDIATE`
+  (a zero timespec costs 12-20 us there). Same-thread `yield()` and
+  post-to-resume are about 2.5x faster on macOS (about 1.4 us to 0.55 us).
+
 ## [1.2.1] - 2026-10-27
 
 - Build optional protocol dependencies through the shared ForgeDeps artifact
