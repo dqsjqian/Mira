@@ -6,6 +6,7 @@
 #include "mira/transport/resolver.hpp"
 
 #include <algorithm>
+#include <concepts>
 #include <map>
 #include <vector>
 #include <memory>
@@ -23,7 +24,11 @@ struct MultiplexOptions {
 };
 
 // One owned multiplexed connection per origin. No queueing, no automatic
-// retries, no cross-origin connection sharing. Quotas also cover origins that
+// retries, no cross-origin connection sharing. A connection that can no longer
+// open streams (peer GOAWAY, transport failure, stopped after an application
+// exception) is retired on the next request to its origin and replaced by a
+// fresh dial; the retired one is joined once its last request finishes. A
+// Connection type reports this through an optional `bool usable() const`. Quotas also cover origins that
 // are currently dialing; cancelling one request never cancels a dial or session
 // shared with other callers. After the first request the pool must be shut down
 // with stop()+co_await join() or co_await close(), including exceptional exits.
@@ -51,10 +56,14 @@ class MultiplexClient {
         MultiplexOptions options;
         const std::thread::id thread = std::this_thread::get_id();
         TaskScope dialing;
+        TaskScope reaping;  // joins retired connections
         Task<void> joining_task;
         std::stop_source stop;
         std::stop_source drained;
         std::map<Key, std::shared_ptr<Entry>> entries;
+        // Unusable connections removed from `entries`; still referenced by
+        // in-flight requests until reaped.
+        std::vector<std::shared_ptr<Entry>> retiring;
         std::size_t active = 0;
         bool used = false, closing = false, joining = false, joined = false;
     };
@@ -209,7 +218,14 @@ private:
         Key key{std::move(*canonical), port};
         if (auto valid = bind_authority(headers, key); !valid) co_return fail(valid.error());
         if (state->active >= state->options.max_active) co_return fail(Errc::would_block);
+        reap(*state);
         auto found = state->entries.find(key);
+        if (found != state->entries.end() && found->second->done && !usable(*found->second)) {
+            // Requests already on it finish (or fail) on their own; new
+            // ones get a fresh connection, and the origin slot is reused.
+            retire(*state, found);
+            found = state->entries.end();
+        }
         if (found == state->entries.end() && state->entries.size() >= state->options.max_origins)
             co_return fail(Errc::would_block);
         Active active{*state};
@@ -246,6 +262,37 @@ private:
             throw;
         }
     }
+    static bool usable(const Entry& entry) noexcept {
+        if (!entry.connection) return false;
+        if constexpr (requires(const Connection& connection) {
+                          { connection.usable() } -> std::convertible_to<bool>;
+                      }) {
+            return static_cast<bool>(entry.connection->usable());
+        } else {
+            return true;
+        }
+    }
+    static void retire(State& state, typename std::map<Key, std::shared_ptr<Entry>>::iterator found) {
+        state.retiring.push_back(found->second);
+        state.entries.erase(found);
+        state.retiring.back()->connection->stop();
+    }
+    static Task<void> join_retired(std::shared_ptr<Entry> entry) {
+        co_await entry->connection->join();
+    }
+    // Join retired connections no request holds any more. Single-threaded:
+    // the use count is exact, and each request keeps its entry while it runs.
+    static void reap(State& state) {
+        for (auto it = state.retiring.begin(); it != state.retiring.end();) {
+            if (it->use_count() != 1) {
+                ++it;
+                continue;
+            }
+            auto join = join_retired(*it);  // a failed spawn keeps the entry listed
+            state.reaping.spawn(std::move(join));
+            it = state.retiring.erase(it);
+        }
+    }
     static Task<void> finish(State* state) {
         co_await state->dialing.join();
         if (state->active) {
@@ -254,6 +301,15 @@ private:
                                                                {.stop = state->drained.get_token()}));
         }
         std::exception_ptr exception;
+        // Nothing is in flight now, so every retired connection is reapable.
+        try { reap(*state); } catch (...) { if (!exception) exception = std::current_exception(); }
+        try { co_await state->reaping.join(); }
+        catch (...) { if (!exception) exception = std::current_exception(); }
+        for (auto& entry : state->retiring) {
+            try { co_await entry->connection->join(); }
+            catch (...) { if (!exception) exception = std::current_exception(); }
+        }
+        state->retiring.clear();
         for (auto& [key, entry] : state->entries) {
             static_cast<void>(key);
             try { co_await entry->connection->join(); }

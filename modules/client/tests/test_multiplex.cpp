@@ -13,6 +13,7 @@
 #include <map>
 #include <source_location>
 #include <string_view>
+#include <vector>
 
 using namespace Mira;
 using namespace std::chrono_literals;
@@ -259,6 +260,53 @@ Task<void> exceptions(EventLoop& loop) {
     auto cancelled = co_await std::move(late);
     check(!cancelled && cancelled.error() == Errc::cancelled, "unstarted request dialed after pool destruction");
 }
+struct RetiringConnection {
+    unsigned& destroyed;
+    bool healthy = true;  // cleared to model a peer GOAWAY
+    bool stopped = false;
+    bool joined = false;
+    explicit RetiringConnection(unsigned& count) : destroyed(count) {}
+    ~RetiringConnection() { if (!joined) std::terminate(); ++destroyed; }
+    Task<Result<int>> request(http::Headers, std::vector<std::byte>, OperationOptions) { co_return 7; }
+    void stop() noexcept { stopped = true; }
+    Task<void> join() { joined = true; co_return; }
+    [[nodiscard]] bool usable() const noexcept { return healthy && !stopped; }
+};
+struct RetiringFactory {
+    using Connection = RetiringConnection;
+    using Response = int;
+    unsigned& connects;
+    unsigned& destroyed;
+    std::vector<Connection*>& made;
+    Task<Result<std::unique_ptr<Connection>>> connect(EventLoop& loop, transport::Resolver&,
+        const std::string&, std::uint16_t, std::size_t, OperationOptions) {
+        co_await loop.yield();
+        ++connects;
+        auto connection = std::make_unique<Connection>(destroyed);
+        made.push_back(connection.get());
+        co_return connection;
+    }
+};
+Task<void> retirement(EventLoop& loop) {
+    unsigned connects = 0, destroyed = 0;
+    std::vector<RetiringConnection*> made;
+    client::MultiplexOptions options;
+    options.max_origins = 1;
+    auto pool = require(client::MultiplexClient<RetiringFactory>::create(loop, {connects, destroyed, made}, options));
+    check(require(co_await pool.request("localhost", 443, headers())) == 7, "first request failed");
+    check(require(co_await pool.request("localhost", 443, headers())) == 7 && connects == 1,
+          "a usable connection was not reused");
+    made.back()->healthy = false;  // the peer sent GOAWAY
+    check(require(co_await pool.request("localhost", 443, headers())) == 7,
+          "the origin stayed unusable after its connection went away");
+    check(connects == 2 && pool.origins() == 1, "the unusable connection was not replaced within max_origins");
+    made.back()->stopped = true;  // e.g. stopped after an application exception
+    check(require(co_await pool.request("localhost", 443, headers())) == 7 && connects == 3,
+          "a stopped connection was reused");
+    check(destroyed == 1, "an idle retired connection was not joined and released");
+    co_await pool.close();
+    check(destroyed == 3 && pool.origins() == 0, "close did not join retired connections");
+}
 Task<void> abandoned(EventLoop& loop, const char* cert) {
     auto listener = require(bind(loop));
     std::atomic<unsigned> resolutions{0};
@@ -279,6 +327,7 @@ Task<void> all(EventLoop& loop, const char* cert, const char* key, const char* o
 #endif
     co_await close_dial(loop, cert);
     co_await exceptions(loop);
+    co_await retirement(loop);
 }
 } // namespace
 int main(int argc, char** argv) {

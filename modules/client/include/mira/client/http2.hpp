@@ -18,8 +18,16 @@ public:
     Task<Result<http2::Response>> request(http::Headers headers, std::vector<std::byte> body, OperationOptions io) {
         co_return co_await session_->request(std::move(headers), std::move(body), io);
     }
-    void stop() noexcept { if (session_) session_->stop(); }
+    void stop() noexcept {
+        stopped_ = true;
+        if (session_) session_->stop();
+    }
     Task<void> join() { if (session_) co_await session_->join(); }
+    /// False once no new stream can succeed: stopped, the driver failed, or
+    /// the session left `open` (peer GOAWAY, local shutdown, closed).
+    [[nodiscard]] bool usable() const noexcept {
+        return !stopped_ && session_ && !session_->error() && engine_.state() == http2::State::open;
+    }
 private:
     friend class Http2Factory;
     transport::tcp::Socket socket_;
@@ -27,6 +35,7 @@ private:
     http2::Session engine_;
     std::optional<Stream> tls_;
     std::optional<http2::ClientSession<Stream>> session_;
+    bool stopped_ = false;
 };
 
 // Fixed trust configuration, strict h2 negotiation; no cleartext prior-knowledge and no HTTP/1 downgrade.

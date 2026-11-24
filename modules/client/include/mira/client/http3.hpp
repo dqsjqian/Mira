@@ -17,8 +17,16 @@ public:
     Task<Result<http3::Response>> request(http::Headers headers, std::vector<std::byte> body, OperationOptions io) {
         co_return co_await session_.request(std::move(headers), std::move(body), io);
     }
-    void stop() noexcept { session_.stop(); }
+    void stop() noexcept {
+        stopped_ = true;
+        session_.stop();
+    }
     Task<void> join() { co_await session_.join(); }
+    /// False once no new request can succeed: stopped, the driver failed, the
+    /// peer sent GOAWAY, or the connection closed.
+    [[nodiscard]] bool usable() const noexcept {
+        return !stopped_ && !session_.error() && !engine_.peer_goaway() && !engine_.closed();
+    }
     Task<Result<void>> handshake(OperationOptions io) {
         while (!engine_.ready()) {
             auto result = co_await session_.progress(io);
@@ -30,6 +38,7 @@ private:
     transport::udp::Socket socket_;
     http3::Engine engine_;
     http3::ClientSession<transport::udp::Socket> session_;
+    bool stopped_ = false;
 };
 
 struct Http3Options {
