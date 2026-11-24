@@ -90,6 +90,9 @@ public:
         co_return Result<void>{};
     }
     void close() { static_cast<void>(stop(make_error_code(Errc::cancelled))); }
+    [[nodiscard]] auto event_loop() const requires requires(Driver& driver) { driver.event_loop(); } {
+        return driver_->event_loop();
+    }
 
 private:
     static constexpr bool multiplexed = [] {

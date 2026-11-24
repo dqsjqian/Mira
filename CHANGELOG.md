@@ -21,12 +21,16 @@ records; they are not additional definitions of the current build version.
 - `MultiplexClient` retires a connection that can no longer open streams
   (peer GOAWAY, transport failure, stopped after an application exception)
   and dials a fresh one on the next request, instead of failing every later
-  request to that origin. Retired connections are joined after their last
-  request; `Http2Connection` and `Http3Connection` expose `usable()`.
+  request to that origin. A dead origin no longer blocks a different origin
+  at quota. Streams accepted before GOAWAY finish on their original session;
+  shutdown still stops and joins all sessions. `Http2Connection` and
+  `Http3Connection` expose `usable()`.
 - WebSocket: an application `send()` issued while the reader's automatic Pong
   or Close reply is blocked by back-pressure now waits for that frame instead
-  of failing with `invalid_argument`. Its stop token and deadline are checked
-  before it waits and after the reply completes; two concurrent application
+  of failing with `invalid_argument`. A queued send can time out or be
+  cancelled on the loop thread while the Pong is still blocked, without
+  interrupting that reply. Custom streams without `event_loop()` can supply
+  their loop to `ws::Connection` for bounded waits. Two concurrent application
   writers are still rejected.
 - Configure fails when nghttp2 does not come from the ForgeDeps recipe graph.
 

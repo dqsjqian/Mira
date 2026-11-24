@@ -7,12 +7,14 @@
 
 #include <algorithm>
 #include <concepts>
+#include <coroutine>
 #include <map>
-#include <vector>
 #include <memory>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace Mira::client {
 
@@ -26,11 +28,12 @@ struct MultiplexOptions {
 // One owned multiplexed connection per origin. No queueing, no automatic
 // retries, no cross-origin connection sharing. A connection that can no longer
 // open streams (peer GOAWAY, transport failure, stopped after an application
-// exception) is retired on the next request to its origin and replaced by a
-// fresh dial; the retired one is joined once its last request finishes. A
-// Connection type reports this through an optional `bool usable() const`. Quotas also cover origins that
-// are currently dialing; cancelling one request never cancels a dial or session
-// shared with other callers. After the first request the pool must be shut down
+// exception) is retired on reuse or when a new origin needs its quota slot.
+// Existing streams drain before the retired connection is stopped and joined;
+// pool shutdown still stops every connection. Transports may additionally
+// report peer/transport failure with `bool usable() const noexcept`. Quotas
+// also cover origins currently dialing; cancelling one request never cancels
+// a dial or session shared with other callers. After the first request the pool must be shut down
 // with stop()+co_await join() or co_await close(), including exceptional exits.
 // join stops and awaits dials, application requests and session drivers before
 // destroying the owned sockets/SSL/protocol engines. Object methods are for the
@@ -44,7 +47,9 @@ class MultiplexClient {
         Error error;
         std::exception_ptr exception;
         std::stop_source ready;
-        bool done = false;
+        std::size_t users = 0;
+        std::coroutine_handle<> idle{};
+        bool done = false, stopped = false;
     };
     struct State {
         State(EventLoop& executor, transport::Resolver dns, Factory connector, MultiplexOptions settings)
@@ -61,9 +66,6 @@ class MultiplexClient {
         std::stop_source stop;
         std::stop_source drained;
         std::map<Key, std::shared_ptr<Entry>> entries;
-        // Unusable connections removed from `entries`; still referenced by
-        // in-flight requests until reaped.
-        std::vector<std::shared_ptr<Entry>> retiring;
         std::size_t active = 0;
         bool used = false, closing = false, joining = false, joined = false;
     };
@@ -178,12 +180,31 @@ private:
         }
         return {};
     }
+    // Each request owns its entry even if it is removed from the origin map.
+    // Exactly one retired-session job may wait for its last user to leave.
+    struct EntryUse {
+        Entry& entry;
+        explicit EntryUse(Entry& e) : entry(e) { ++entry.users; }
+        ~EntryUse() {
+            if (--entry.users != 0) return;
+            if (auto waiter = std::exchange(entry.idle, {})) waiter.resume();
+        }
+    };
+    struct WhenIdle {
+        Entry& entry;
+        bool await_ready() const noexcept { return entry.users == 0; }
+        void await_suspend(std::coroutine_handle<> h) noexcept { entry.idle = h; }
+        void await_resume() const noexcept {}
+    };
+    static void stop_entry(Entry& entry) noexcept {
+        if (entry.connection && !std::exchange(entry.stopped, true)) entry.connection->stop();
+    }
     static void stop_state(State& state) noexcept {
         require_thread(state);
         state.closing = true;
         for (auto& [key, entry] : state.entries) {
             static_cast<void>(key);
-            if (entry->connection) entry->connection->stop();
+            stop_entry(*entry);
         }
         auto stop = state.stop;
         stop.request_stop();
@@ -203,7 +224,7 @@ private:
         }
         entry->done = true;
         if (!entry->connection) state->entries.erase(key);
-        else if (state->closing) entry->connection->stop();
+        else if (state->closing) stop_entry(*entry);
         entry->ready.request_stop();
     }
     static Task<Result<Response>> request_impl(std::shared_ptr<State> state, std::string host,
@@ -218,13 +239,21 @@ private:
         Key key{std::move(*canonical), port};
         if (auto valid = bind_authority(headers, key); !valid) co_return fail(valid.error());
         if (state->active >= state->options.max_active) co_return fail(Errc::would_block);
-        reap(*state);
         auto found = state->entries.find(key);
-        if (found != state->entries.end() && found->second->done && !usable(*found->second)) {
-            // Requests already on it finish (or fail) on their own; new
-            // ones get a fresh connection, and the origin slot is reused.
-            retire(*state, found);
-            found = state->entries.end();
+        auto stale = state->entries.end();
+        if (found != state->entries.end()) {
+            if (found->second->done && !usable(*found->second)) stale = found;
+        } else if (state->entries.size() >= state->options.max_origins) {
+            // Don't evict a healthy session, but a dead one must not reserve
+            // the last slot indefinitely just because its own origin is idle.
+            stale = std::find_if(state->entries.begin(), state->entries.end(), [](const auto& item) {
+                return item.second->done && !usable(*item.second);
+            });
+        }
+        if (stale != state->entries.end()) {
+            retire(*state, stale);
+            if (state->closing) co_return fail(Errc::cancelled);
+            found = state->entries.find(key);
         }
         if (found == state->entries.end() && state->entries.size() >= state->options.max_origins)
             co_return fail(Errc::would_block);
@@ -241,6 +270,7 @@ private:
             try { state->dialing.spawn(connect_one(state.get(), key, entry)); }
             catch (...) { state->entries.erase(key); throw; }
         }
+        EntryUse use{*entry};
         if (!entry->done) {
             std::stop_source wake;
             std::stop_callback complete(entry->ready.get_token(), Forward{wake});
@@ -258,12 +288,12 @@ private:
         } catch (...) {
             // A session is not assumed reusable after an application-level exception;
             // close/join still releases the owned resources.
-            entry->connection->stop();
+            stop_entry(*entry);
             throw;
         }
     }
-    static bool usable(const Entry& entry) noexcept {
-        if (!entry.connection) return false;
+    static bool usable(const Entry& entry) {
+        if (entry.stopped || !entry.connection) return false;
         if constexpr (requires(const Connection& connection) {
                           { connection.usable() } -> std::convertible_to<bool>;
                       }) {
@@ -273,25 +303,22 @@ private:
         }
     }
     static void retire(State& state, typename std::map<Key, std::shared_ptr<Entry>>::iterator found) {
-        state.retiring.push_back(found->second);
-        state.entries.erase(found);
-        state.retiring.back()->connection->stop();
+        // Publish the free slot before stop/join can resume user code. If
+        // allocating the job fails, restore its still-owned map node.
+        auto node = state.entries.extract(found);
+        try { state.reaping.spawn(join_retired(node.mapped(), state.stop.get_token())); }
+        catch (...) { state.entries.insert(std::move(node)); throw; }
     }
-    static Task<void> join_retired(std::shared_ptr<Entry> entry) {
+    static Task<void> join_retired(std::shared_ptr<Entry> entry, std::stop_token shutdown) {
+        // GOAWAY is graceful: let accepted requests finish. Explicit pool
+        // shutdown, unlike retirement, also aborts a still-draining session.
+        std::stop_callback on_shutdown(shutdown, [entry]() noexcept {
+            auto keep_alive = entry;
+            stop_entry(*keep_alive);
+        });
+        co_await WhenIdle{*entry};
+        stop_entry(*entry);
         co_await entry->connection->join();
-    }
-    // Join retired connections no request holds any more. Single-threaded:
-    // the use count is exact, and each request keeps its entry while it runs.
-    static void reap(State& state) {
-        for (auto it = state.retiring.begin(); it != state.retiring.end();) {
-            if (it->use_count() != 1) {
-                ++it;
-                continue;
-            }
-            auto join = join_retired(*it);  // a failed spawn keeps the entry listed
-            state.reaping.spawn(std::move(join));
-            it = state.retiring.erase(it);
-        }
     }
     static Task<void> finish(State* state) {
         co_await state->dialing.join();
@@ -301,15 +328,8 @@ private:
                                                                {.stop = state->drained.get_token()}));
         }
         std::exception_ptr exception;
-        // Nothing is in flight now, so every retired connection is reapable.
-        try { reap(*state); } catch (...) { if (!exception) exception = std::current_exception(); }
         try { co_await state->reaping.join(); }
-        catch (...) { if (!exception) exception = std::current_exception(); }
-        for (auto& entry : state->retiring) {
-            try { co_await entry->connection->join(); }
-            catch (...) { if (!exception) exception = std::current_exception(); }
-        }
-        state->retiring.clear();
+        catch (...) { exception = std::current_exception(); }
         for (auto& [key, entry] : state->entries) {
             static_cast<void>(key);
             try { co_await entry->connection->join(); }

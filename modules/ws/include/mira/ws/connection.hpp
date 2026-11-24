@@ -1,15 +1,18 @@
 #pragma once
 
+#include "mira/core/event_loop.hpp"
 #include "mira/core/stream.hpp"
 #include "mira/crypto/crypto.hpp"
 #include "mira/ws/handshake.hpp"
 
 #include <algorithm>
 #include <array>
+#include <concepts>
 #include <coroutine>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <stop_token>
 #include <utility>
 
 namespace Mira::ws {
@@ -20,9 +23,10 @@ namespace Mira::ws {
 // Automatic pong/close replies are serialized behind an active writer, with
 // at most one pending pong and one pending close. No unbounded output queue.
 // A send() that finds the reader writing such a reply waits for that frame
-// instead of failing. Its stop token and deadline are checked before it waits
-// and again once the reply has left; the reply itself is shared I/O bounded by
-// the reader's options and is never cut short on behalf of the queued send.
+// instead of failing. A bounded send can leave that wait on cancellation or
+// deadline without interrupting the shared reply. Native transports expose
+// their event_loop(); for a custom stream without one, use the overload taking
+// EventLoop& to enable bounded queue waits (otherwise they return not_supported).
 // Messages are bounded; negotiated compression and subprotocols are opt-in.
 // HTTP/2 and HTTP/3 Extended CONNECT are separate protocols, not handled here.
 // Complete TLS handshake first. Do not mix read_frame/read_message mid-fragment.
@@ -33,11 +37,19 @@ public:
     Connection(Transport& transport, Role role, Limits limits = {}, HandshakeOptions handshake_options = {})
         : transport_(&transport), role_(role), limits_(limits),
           handshake_options_(std::move(handshake_options)), incoming_(role, limits),
-          outgoing_(role == Role::client ? Role::server : Role::client, limits) {}
+          outgoing_(role == Role::client ? Role::server : Role::client, limits) {
+        if constexpr (requires { { transport.event_loop() } -> std::same_as<EventLoop*>; })
+            loop_ = transport.event_loop();
+    }
+    /// For streams that do not expose a scheduler. The loop must outlive this
+    /// connection and deliver completions on the same thread as the transport.
+    Connection(EventLoop& loop, Transport& transport, Role role, Limits limits = {},
+               HandshakeOptions handshake_options = {})
+        : Connection(transport, role, limits, std::move(handshake_options)) { loop_ = &loop; }
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
     ~Connection() {
-        if (busy_ || reading_ || writing_) {
+        if (busy_ || reading_ || writing_ || bounded_waiter_) {
             std::fputs("Mira::ws::Connection destroyed with pending operation\n", stderr);
             std::abort();
         }
@@ -121,15 +133,31 @@ public:
     }
 
     Task<Result<void>> send(Frame frame, OperationOptions options = {}) {
-        if (busy_ || (writing_ && !replying_) || write_waiter_)
+        if (busy_ || (writing_ && !replying_) || write_waiter_ || bounded_waiter_)
             co_return fail(Mira::Errc::invalid_argument);
         if (writing_) {
-            // The direction is held by the reader's automatic reply, which the
-            // application neither started nor can see; a conflict error here
-            // would make every Ping a race against the application's writer.
-            auto checked = check_options(options);
-            if (!checked) co_return checked;
-            co_await ReplyDrained{*this};
+            if (auto checked = check_options(options); !checked) co_return checked;
+            if (!options.stop.stop_possible() && !options.deadline) {
+                co_await ReplyDrained{*this}; // allocation-free direct hand-off
+            } else {
+                if (!loop_) co_return fail(Mira::Errc::not_supported);
+                // Only the waiter is cancelled. Interrupting the transport's
+                // shared Pong write could leave a partial frame on the wire.
+                while (writing_) {
+                    BoundedWait waiting{*this};
+                    std::stop_callback forward(options.stop, [wake = waiting.wake]() noexcept {
+                        auto retained = wake;
+                        retained.request_stop();
+                    });
+                    auto slept = co_await loop_->sleep_until(options.deadline.value_or(Clock::time_point::max()),
+                                                            {.stop = waiting.wake.get_token()});
+                    if (auto checked = check_options(options); !checked) co_return checked;
+                    if (!slept && (slept.error() != Mira::Errc::cancelled || !waiting.wake.stop_requested()))
+                        co_return slept;
+                    // Another automatic reply can start before the loop next
+                    // dispatches us. Re-arm rather than interleave frames.
+                }
+            }
         }
         DirectionGuard guard{*this, writing_};
         auto sent = co_await send_locked(frame, options);
@@ -168,7 +196,7 @@ public:
 
     // Send close and await the peer close; callers should supply a deadline.
     Task<Result<void>> close(std::uint16_t code = 1000, OperationOptions options = {}) {
-        if (busy_ || reading_ || writing_) co_return fail(Mira::Errc::invalid_argument);
+        if (busy_ || reading_ || writing_ || bounded_waiter_) co_return fail(Mira::Errc::invalid_argument);
         Guard guard{*this};
         if (failed_) co_return fail(make_error_code(Errc::closed));
         if (!close_sent_) {
@@ -205,10 +233,8 @@ private:
             if (std::uncaught_exceptions() > exceptions) owner.fail_exception();
         }
     };
-    // Holds the write direction for an automatic reply. Release hands it
-    // straight to a send() queued meanwhile: resuming that writer here, before
-    // any other code can run on this single loop thread, keeps the hand-off
-    // atomic without a lock, so a second reply cannot slip in between.
+    // No-options sends take over inline. Bounded sends wake via the loop's
+    // timer, where both external cancellation and deadlines are delivered.
     struct ReplyGuard {
         Connection& owner;
         int exceptions = std::uncaught_exceptions();
@@ -216,8 +242,17 @@ private:
         ~ReplyGuard() {
             owner.writing_ = owner.replying_ = false;
             if (std::uncaught_exceptions() > exceptions) owner.fail_exception();
-            if (auto waiter = std::exchange(owner.write_waiter_, {})) waiter.resume();
+            if (owner.bounded_waiter_) owner.bounded_waiter_->request_stop();
+            else if (auto waiter = std::exchange(owner.write_waiter_, {})) waiter.resume();
         }
+    };
+    // Borrows a stop source in the send frame only until its timer resolves.
+    // Other threads can request stop but never touch Connection or resume it.
+    struct BoundedWait {
+        Connection& owner;
+        std::stop_source wake;
+        explicit BoundedWait(Connection& value) : owner(value) { owner.bounded_waiter_ = &wake; }
+        ~BoundedWait() { owner.bounded_waiter_ = nullptr; }
     };
     struct ReplyDrained {
         Connection& owner;
@@ -429,6 +464,8 @@ private:
     std::optional<Frame> pending_pong_, pending_close_;
     // At most one: a second application writer is rejected, not queued.
     std::coroutine_handle<> write_waiter_{};
+    EventLoop* loop_ = nullptr;
+    std::stop_source* bounded_waiter_ = nullptr;
     bool reading_ = false, writing_ = false, replying_ = false;
     bool busy_ = false, ready_ = false, failed_ = false;
     bool close_sent_ = false, close_received_ = false;

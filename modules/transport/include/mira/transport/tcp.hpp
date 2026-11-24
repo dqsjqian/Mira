@@ -94,6 +94,8 @@ public:
     [[nodiscard]] bool valid() const noexcept { return handle_ != invalid_handle; }
     [[nodiscard]] explicit operator bool() const noexcept { return valid(); }
     [[nodiscard]] NativeHandle native_handle() const noexcept { return handle_; }
+    /// The socket's borrowed scheduler; null for an empty or closed socket.
+    [[nodiscard]] EventLoop* event_loop() const noexcept { return loop_; }
 
     /// Read once; short reads are normal. `Errc::eof` on a clean close.
     ///

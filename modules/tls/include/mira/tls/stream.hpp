@@ -77,6 +77,8 @@ public:
     Stream& operator=(const Stream&) = delete;
     ~Stream() { require_idle(state_); }
 
+    [[nodiscard]] EventLoop* event_loop() const noexcept { return state_ ? state_->loop : nullptr; }
+
     [[nodiscard]] Task<Result<void>> handshake(OperationOptions options = {}) {
         return run_void(state_, Operation::handshake, std::move(options));
     }

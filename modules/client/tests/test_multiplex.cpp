@@ -7,6 +7,7 @@
 
 #include <array>
 #include <atomic>
+#include <coroutine>
 #include <cstdlib>
 #include <cstdio>
 #include <iostream>
@@ -249,9 +250,13 @@ Task<void> exceptions(EventLoop& loop) {
     const bool rollback = pool.origins() == 0 && pool.active() == 0;
     try { static_cast<void>(co_await pool.request("localhost", 443, headers())); }
     catch (const std::runtime_error&) { request_threw = true; }
+    // This factory has no usable() hook: the pool itself knows it stopped
+    // the previous connection and must not send another request to it.
+    try { static_cast<void>(co_await pool.request("localhost", 443, headers())); }
+    catch (const std::runtime_error&) {}
     co_await pool.close();
-    check(dial_threw && request_threw && rollback && connects == 2 && destroyed == 1,
-          "factory/request exception did not roll back and join owned objects");
+    check(dial_threw && request_threw && rollback && connects == 3 && destroyed == 2,
+          "a connection stopped after a request exception was reused or not joined");
     Task<Result<int>> late;
     {
         auto idle = require(client::MultiplexClient<FakeFactory>::create(loop, {connects, destroyed}));
@@ -265,10 +270,23 @@ struct RetiringConnection {
     bool healthy = true;  // cleared to model a peer GOAWAY
     bool stopped = false;
     bool joined = false;
+    bool hold = false;
+    std::coroutine_handle<> pending{};
     explicit RetiringConnection(unsigned& count) : destroyed(count) {}
     ~RetiringConnection() { if (!joined) std::terminate(); ++destroyed; }
-    Task<Result<int>> request(http::Headers, std::vector<std::byte>, OperationOptions) { co_return 7; }
-    void stop() noexcept { stopped = true; }
+    struct Hold {
+        RetiringConnection& self;
+        bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> caller) noexcept { self.pending = caller; }
+        void await_resume() const noexcept {}
+    };
+    void release() { if (auto caller = std::exchange(pending, {})) caller.resume(); }
+    Task<Result<int>> request(http::Headers, std::vector<std::byte>, OperationOptions) {
+        if (std::exchange(hold, false)) co_await Hold{*this};
+        if (stopped) co_return fail(Errc::cancelled);
+        co_return 7;
+    }
+    void stop() noexcept { stopped = true; release(); }
     Task<void> join() { joined = true; co_return; }
     [[nodiscard]] bool usable() const noexcept { return healthy && !stopped; }
 };
@@ -296,16 +314,47 @@ Task<void> retirement(EventLoop& loop) {
     check(require(co_await pool.request("localhost", 443, headers())) == 7, "first request failed");
     check(require(co_await pool.request("localhost", 443, headers())) == 7 && connects == 1,
           "a usable connection was not reused");
-    made.back()->healthy = false;  // the peer sent GOAWAY
-    check(require(co_await pool.request("localhost", 443, headers())) == 7,
-          "the origin stayed unusable after its connection went away");
-    check(connects == 2 && pool.origins() == 1, "the unusable connection was not replaced within max_origins");
-    made.back()->stopped = true;  // e.g. stopped after an application exception
-    check(require(co_await pool.request("localhost", 443, headers())) == 7 && connects == 3,
-          "a stopped connection was reused");
-    check(destroyed == 1, "an idle retired connection was not joined and released");
+    auto* first = made.back();
+    first->hold = true;
+    Result<int> outstanding = fail(Errc::internal);
+    TaskScope requests;
+    auto accepted = [&]() -> Task<void> { outstanding = co_await pool.request("localhost", 443, headers()); };
+    requests.spawn(accepted());
+    first->healthy = false;  // peer GOAWAY still permits the accepted stream to finish
+    const auto next = co_await pool.request("localhost", 443, headers());
+    const bool drained_naturally = requests.pending() == 1 && destroyed == 0;
+    if (requests.pending() != 0) first->release();
+    co_await requests.join();
+    const bool replaced = next && *next == 7 && connects == 2 && pool.origins() == 1;
+    made.back()->healthy = false;
+    const auto another = co_await pool.request("other.test", 443, headers());
+    const bool reused_quota = another && *another == 7 && connects == 3 && pool.origins() == 1;
     co_await pool.close();
+    check(drained_naturally && outstanding && *outstanding == 7, "retiring a session cancelled an accepted stream");
+    check(replaced, "an unusable connection was not replaced within max_origins");
+    check(reused_quota, "a dead entry blocked a different origin at max_origins");
     check(destroyed == 3 && pool.origins() == 0, "close did not join retired connections");
+}
+Task<void> shutdown_draining_session(EventLoop& loop) {
+    unsigned connects = 0, destroyed = 0;
+    std::vector<RetiringConnection*> made;
+    auto pool = require(client::MultiplexClient<RetiringFactory>::create(loop, {connects, destroyed, made}));
+    require(co_await pool.request("localhost", 443, headers()));
+    auto* old = made.back();
+    old->hold = true;
+    TaskScope requests;
+    Result<int> result = fail(Errc::internal);
+    auto request = [&]() -> Task<void> { result = co_await pool.request("localhost", 443, headers()); };
+    requests.spawn(request());
+    old->healthy = false;
+    const auto replacement = co_await pool.request("localhost", 443, headers());
+    pool.stop();
+    const bool stopped = requests.pending() == 0;
+    if (!stopped) old->release();
+    co_await requests.join();
+    co_await pool.join();
+    check(replacement && stopped && !result && result.error() == Errc::cancelled && destroyed == 2,
+          "explicit shutdown failed to stop and join a retired session");
 }
 Task<void> abandoned(EventLoop& loop, const char* cert) {
     auto listener = require(bind(loop));
@@ -328,6 +377,7 @@ Task<void> all(EventLoop& loop, const char* cert, const char* key, const char* o
     co_await close_dial(loop, cert);
     co_await exceptions(loop);
     co_await retirement(loop);
+    co_await shutdown_draining_session(loop);
 }
 } // namespace
 int main(int argc, char** argv) {

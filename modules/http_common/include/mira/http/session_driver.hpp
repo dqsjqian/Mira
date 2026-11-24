@@ -39,6 +39,7 @@ public:
     }
 
     [[nodiscard]] Error error() const noexcept { return error_; }
+    [[nodiscard]] EventLoop* event_loop() const noexcept { return &loop_; }
 
     // Notifies synchronously submitted data, window updates generated after
     // consumption, or per-stream RESETs; never re-enters the Wire.

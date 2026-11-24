@@ -26,6 +26,7 @@ public:
     void close() noexcept { stream_.close(); }
     bool valid() const noexcept { return stream_.valid(); }
     NativeHandle native_handle() const noexcept { return stream_.native_handle(); }
+    [[nodiscard]] EventLoop* event_loop() const noexcept { return stream_.event_loop(); }
 private:
     tcp::Socket stream_;
 };
