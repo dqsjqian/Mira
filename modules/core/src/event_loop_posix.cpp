@@ -21,6 +21,7 @@
     #include <cerrno>
     #include <fcntl.h>
     #include <mutex>
+    #include <thread>
     #include <sys/socket.h>
     #include <sys/uio.h>
     #include <sys/stat.h>
@@ -291,7 +292,7 @@ public:
             return fail(armed.error());
         }
         if (options.deadline) {
-            wake();  // a nearer deadline may shorten the current wait
+            wake_from_submit();  // a nearer deadline may shorten the current wait
         }
         return id;
     }
@@ -329,7 +330,7 @@ public:
                 throw;
             }
         }
-        wake();  // a nearer deadline may shorten the current wait
+        wake_from_submit();  // a nearer deadline may shorten the current wait
         return id;
     }
 
@@ -350,7 +351,7 @@ public:
             operation->second.cancel_pending = true;
             ++pending_cancels_;
         }
-        wake();
+        wake_from_submit();
     }
 
     Result<void> post(move_only_function<void()> work) {
@@ -359,7 +360,7 @@ public:
             if (shutting_down()) return fail(Errc::cancelled);
             posted_.push(std::move(work));
         }
-        wake();
+        wake_from_submit();
         return {};
     }
 
@@ -391,6 +392,7 @@ public:
             detail::report_dispatch_violation("run_once re-entered from a resumed coroutine");
         }
         const detail::DispatchScope dispatching{dispatch_depth_};
+        const detail::RunningThreadScope running{running_thread_};
 
         std::array<detail::ReadyEvent, kEventBatch> events{};
 
@@ -687,6 +689,16 @@ private:
         } while (written < 0 && errno == EINTR);
     }
 
+    /// `wake` for submissions. On the thread inside `run_once` the write is
+    /// pure overhead: that thread is dispatching rather than blocked, and its
+    /// next pass sees the new work when it computes the poll timeout. Skipping
+    /// it also spares the extra poll return, pipe drain and one-shot re-arm.
+    /// `stop` keeps the unconditional form; it is rare and not a hot path.
+    void wake_from_submit() noexcept {
+        if (detail::RunningThreadScope::is_current(running_thread_)) return;
+        wake();
+    }
+
     void drain_wakeup() noexcept {
         std::array<unsigned char, 64> scratch{};
         for (;;) {
@@ -723,6 +735,8 @@ private:
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> wake_pending_{false};
     std::atomic<bool> shutting_down_{false};
+    /// Set for the duration of `run_once`; see `RunningThreadScope`.
+    std::atomic<std::thread::id> running_thread_{};
 };
 
 // ── EventLoop surface ────────────────────────────────────────────────────────

@@ -38,6 +38,7 @@
     #include <mswsock.h>
     #include <mutex>
     #include <optional>
+    #include <thread>
     #include <unordered_map>
     #include <utility>
     #include <vector>
@@ -659,7 +660,7 @@ public:
         }
         const Acquired acquired = acquire_operation(Kind::timer, coroutine, wake_at, options);
         acquired.operation->void_result = result;
-        wake();
+        wake_from_submit();
         return acquired.id;
     }
 
@@ -686,7 +687,7 @@ public:
                     ++pending_cancels_;
                 }
             }
-            wake();
+            wake_from_submit();
         }
     }
 
@@ -698,7 +699,7 @@ public:
             }
             posted_.push(std::move(work));
         }
-        wake();
+        wake_from_submit();
         return Result<void>{};
     }
 
@@ -728,6 +729,7 @@ public:
             detail::report_dispatch_violation("run_once re-entered from a resumed coroutine");
         }
         const detail::DispatchScope dispatching{dispatch_depth_};
+        const detail::RunningThreadScope running{running_thread_};
 
         std::array<OVERLAPPED_ENTRY, kEventBatch> entries{};
 
@@ -1102,6 +1104,15 @@ private:
         ::PostQueuedCompletionStatus(port_, 0, kWakeupKey, nullptr);
     }
 
+    /// `wake` for submissions. The thread inside `run_once` is dispatching, not
+    /// blocked, and its next pass sees the new work when it computes the wait
+    /// timeout, so a wake-up packet would only cost an extra dequeue. I/O
+    /// deadlines already rely on this: `acquire_operation` never wakes.
+    void wake_from_submit() noexcept {
+        if (detail::RunningThreadScope::is_current(running_thread_)) return;
+        wake();
+    }
+
     HANDLE port_{nullptr};
 
     mutable std::mutex mutex_;
@@ -1124,6 +1135,8 @@ private:
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> wake_pending_{false};
     std::atomic<bool> shutting_down_{false};
+    /// Set for the duration of `run_once`; see `RunningThreadScope`.
+    std::atomic<std::thread::id> running_thread_{};
 };
 
 // ── EventLoop surface ────────────────────────────────────────────────────────

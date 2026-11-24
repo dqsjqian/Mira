@@ -1161,6 +1161,62 @@ void test_socket_writes_do_not_raise_sigpipe() {
         CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
 }
+void test_peer_close_resolves_parked_reader_and_writer() {
+    test::section("peer close resolves a parked reader and a parked writer, polled with and without a timeout");
+    // Exercises the readiness translation for both filters and the EOF flag
+    // on each poll form: zero-timeout passes take a different kernel call
+    // than blocking ones on some backends.
+    for (const bool immediate : {true, false}) {
+        HandlePair pair;
+        if (!pair.valid()) return;
+        Result<EventLoop> created = EventLoop::create();
+        CHECK(created.has_value());
+        if (!created) return;
+        EventLoop& loop = created.value();
+        CHECK(loop.attach(pair.first()).has_value());
+
+        // Fill the send buffer so the loop's write has to park on writability.
+        const std::array<char, 4096> filler{};
+        while (::write(pair.first(), filler.data(), filler.size()) > 0) {}
+
+        std::atomic<int> resolved{0};
+        Result<std::size_t> read_outcome = std::size_t{999};
+        Result<std::size_t> write_outcome = std::size_t{999};
+        std::array<std::byte, 16> scratch{};
+        struct Read {
+            static DetachedTask go(EventLoop& target, NativeHandle handle, std::span<std::byte> into,
+                                   Result<std::size_t>& slot, std::atomic<int>& counter) {
+                slot = co_await target.read(handle, into);
+                counter.fetch_add(1, std::memory_order_release);
+            }
+        };
+        struct Write {
+            static DetachedTask go(EventLoop& target, NativeHandle handle,
+                                   Result<std::size_t>& slot, std::atomic<int>& counter) {
+                slot = co_await target.write(handle, bytes_of("parked"));
+                counter.fetch_add(1, std::memory_order_release);
+            }
+        };
+        Read::go(loop, pair.first(), scratch, read_outcome, resolved);
+        Write::go(loop, pair.first(), write_outcome, resolved);
+        CHECK(loop.run_once(0ms).has_value());
+        CHECK(resolved.load(std::memory_order_acquire) == 0);
+
+        pair.peer_close();
+        for (int i = 0; i < 400 && resolved.load(std::memory_order_acquire) != 2; ++i) {
+            if (immediate) {
+                CHECK(loop.run_once(0ms).has_value());
+                std::this_thread::sleep_for(1ms);
+            } else {
+                CHECK(loop.run_once(50ms).has_value());
+            }
+        }
+        CHECK(resolved.load(std::memory_order_acquire) == 2);
+        CHECK(!read_outcome.has_value());   // eof or reset, never a zero-byte success
+        CHECK(!write_outcome.has_value());  // EPIPE or reset from the retried write
+        CHECK(loop.outstanding() == 0);
+    }
+}
 #endif  // MIRA_HAS_READINESS_API
 
 void test_deadline_on_a_suspended_read() {
@@ -1507,6 +1563,104 @@ void test_stop_from_another_thread() {
     CHECK(finished.load(std::memory_order_acquire));
     CHECK(!outcome.has_value());
     CHECK(outcome.error() == Errc::cancelled);
+    CHECK(loop.outstanding() == 0);
+}
+
+void test_same_thread_submissions_are_prompt() {
+    test::section("work submitted from inside the running loop does not wait for an unrelated timer");
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    EventLoop& loop = created.value();
+
+    // The only kernel wake-up the loop could otherwise sleep until. If a
+    // submission from the loop thread were neither woken nor seen by the
+    // next timeout computation, every step below would take two seconds.
+    std::stop_source unrelated;
+    std::atomic<bool> unrelated_done{false};
+    Result<void> unrelated_result{};
+    struct Sleeper {
+        static DetachedTask go(EventLoop& target, std::stop_token token, Result<void>& slot,
+                               std::atomic<bool>& flag) {
+            slot = co_await target.sleep_for(2s, {.stop = token});
+            flag.store(true, std::memory_order_release);
+        }
+    };
+    Sleeper::go(loop, unrelated.get_token(), unrelated_result, unrelated_done);
+
+    std::atomic<int> stage{0};
+    struct Chain {
+        static DetachedTask go(EventLoop& target, std::atomic<int>& progress) {
+            co_await target.yield();
+            progress.store(1, std::memory_order_release);
+            // A posted callable, then a timer nearer than the pending 2 s one.
+            target.post([&progress] { progress.store(2, std::memory_order_release); });
+            static_cast<void>(co_await target.sleep_for(10ms));
+            progress.store(3, std::memory_order_release);
+        }
+    };
+    // Started from a dispatched callback, so every submission above is made
+    // by the loop's own thread while it is running.
+    loop.post([&loop, &stage] { Chain::go(loop, stage); });
+
+    const auto started = Clock::now();
+    for (int i = 0; i < 100 && stage.load(std::memory_order_acquire) != 3; ++i) {
+        CHECK(loop.run_once(EventLoop::Duration::min()).has_value());
+    }
+    const auto elapsed = Clock::now() - started;
+    CHECK(stage.load(std::memory_order_acquire) == 3);
+    CHECK(elapsed < 1s);
+    CHECK(!unrelated_done.load(std::memory_order_acquire));
+
+    unrelated.request_stop();
+    for (int i = 0; i < 10 && !unrelated_done.load(std::memory_order_acquire); ++i) {
+        CHECK(loop.run_once(EventLoop::Duration::min()).has_value());
+    }
+    CHECK(unrelated_done.load(std::memory_order_acquire));
+    CHECK(!unrelated_result && unrelated_result.error() == Errc::cancelled);
+    CHECK(loop.outstanding() == 0);
+}
+
+void test_foreign_post_wakes_blocked_loop() {
+    test::section("a post from another thread wakes a loop blocked with no timers");
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    EventLoop& loop = created.value();
+
+    // This thread runs the loop first, so a stale record of it would make the
+    // post below look like a same-thread submission and skip the wake-up.
+    loop.post([] {});
+    CHECK(loop.run_once(0ms).has_value());
+
+    std::atomic<bool> ran{false};
+    std::atomic<bool> runner_failed{false};
+    std::thread runner{[&] {
+        // Nothing queued and no timers: each iteration blocks indefinitely.
+        while (!ran.load(std::memory_order_acquire)) {
+            if (!loop.run_once(EventLoop::Duration::min())) runner_failed = true;
+        }
+    }};
+    // Give the runner time to block in poll; if it has not yet, the post is
+    // simply seen as queued work and the test is merely less sharp.
+    std::this_thread::sleep_for(100ms);
+    const auto posted = Clock::now();
+    loop.post([&ran] { ran.store(true, std::memory_order_release); });
+    while (!ran.load(std::memory_order_acquire) && Clock::now() - posted < 2s) {
+        std::this_thread::sleep_for(1ms);
+    }
+    CHECK(ran.load(std::memory_order_acquire));
+    if (!ran.load(std::memory_order_acquire)) {
+        loop.stop();  // release the runner so a failure reports instead of hanging
+    }
+    runner.join();
+    CHECK(!runner_failed.load());
+
+    // Back on this thread, with nobody running the loop, posting still works.
+    int calls = 0;
+    loop.post([&calls] { ++calls; });
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(calls == 1);
     CHECK(loop.outstanding() == 0);
 }
 
@@ -1866,6 +2020,7 @@ int main(int argc, char** argv) {
     test_ready_batch_both_directions_detach();
     test_ready_accept_batch_detach_and_reuse();
     test_socket_writes_do_not_raise_sigpipe();
+    test_peer_close_resolves_parked_reader_and_writer();
 #endif
     test_deadline_on_a_suspended_read();
     test_deadline_is_absolute_across_retries();
@@ -1873,6 +2028,8 @@ int main(int argc, char** argv) {
     test_completion_beats_deadline_in_one_batch();
     test_shutdown_cancels_deadlines_too();
     test_stop_from_another_thread();
+    test_same_thread_submissions_are_prompt();
+    test_foreign_post_wakes_blocked_loop();
     test_moved_from_loop_operations_fail_cleanly();
     test_stop_token_outlives_its_scope();
     test_run_until_complete();

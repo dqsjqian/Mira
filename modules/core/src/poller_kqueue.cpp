@@ -28,6 +28,54 @@ namespace {
 
 constexpr std::size_t kMaxChanges = 2;
 
+#if MIRA_PLATFORM_APPLE
+// Darwin treats a zero timespec as a timed wait that expires at once, which
+// costs 12-20 us even with nothing to report; KEVENT_FLAG_IMMEDIATE is a plain
+// scan of about 0.2 us. The loop polls with a zero timeout whenever work is
+// already queued, so that is its hot path. The flag exists only on kevent64,
+// and Darwin binds a kqueue to the first flavour used on it (mixing fails
+// with EINVAL), so every call in this file uses kevent64 there.
+using KernelEvent = struct kevent64_s;
+
+int kernel_event(int queue, const KernelEvent* changes, int change_count, KernelEvent* events,
+                 int event_count, int timeout_ms) noexcept {
+    if (timeout_ms == 0) {
+        return ::kevent64(queue, changes, change_count, events, event_count,
+                          KEVENT_FLAG_IMMEDIATE, nullptr);
+    }
+    struct timespec timeout{};
+    if (timeout_ms > 0) {
+        timeout.tv_sec = timeout_ms / 1000;
+        timeout.tv_nsec = static_cast<long>(timeout_ms % 1000) * 1'000'000L;
+    }
+    return ::kevent64(queue, changes, change_count, events, event_count, 0,
+                      timeout_ms < 0 ? nullptr : &timeout);
+}
+#else
+using KernelEvent = struct kevent;
+
+int kernel_event(int queue, const KernelEvent* changes, int change_count, KernelEvent* events,
+                 int event_count, int timeout_ms) noexcept {
+    struct timespec timeout{};
+    if (timeout_ms > 0) {
+        timeout.tv_sec = timeout_ms / 1000;
+        timeout.tv_nsec = static_cast<long>(timeout_ms % 1000) * 1'000'000L;
+    }
+    return ::kevent(queue, changes, change_count, events, event_count,
+                    timeout_ms < 0 ? nullptr : &timeout);
+}
+#endif
+
+/// One change-list entry; every other field stays zero.
+[[nodiscard]] KernelEvent change(int fd, decltype(KernelEvent::filter) filter,
+                                 decltype(KernelEvent::flags) flags) noexcept {
+    KernelEvent event{};
+    event.ident = static_cast<decltype(event.ident)>(fd);
+    event.filter = filter;
+    event.flags = flags;
+    return event;
+}
+
 }  // namespace
 
 Result<Poller> Poller::create() noexcept {
@@ -46,47 +94,34 @@ void Poller::close() noexcept {
 }
 
 Result<void> Poller::arm(int fd, Interest interest) noexcept {
-    std::array<struct kevent, kMaxChanges> changes{};
+    std::array<KernelEvent, kMaxChanges> changes{};
     std::size_t count = 0;
 
     // EV_ONESHOT: the filter is removed as soon as it fires, which is exactly
     // the lifetime a suspended coroutine wants.
     if (contains(interest, Interest::read)) {
-        EV_SET(&changes[count++],
-               static_cast<uintptr_t>(fd),
-               EVFILT_READ,
-               EV_ADD | EV_ONESHOT,
-               0,
-               0,
-               nullptr);
+        changes[count++] = change(fd, EVFILT_READ, EV_ADD | EV_ONESHOT);
     }
     if (contains(interest, Interest::write)) {
-        EV_SET(&changes[count++],
-               static_cast<uintptr_t>(fd),
-               EVFILT_WRITE,
-               EV_ADD | EV_ONESHOT,
-               0,
-               0,
-               nullptr);
+        changes[count++] = change(fd, EVFILT_WRITE, EV_ADD | EV_ONESHOT);
     }
     if (count == 0) {
         return fail(Errc::invalid_argument);
     }
 
-    if (::kevent(handle_, changes.data(), static_cast<int>(count), nullptr, 0, nullptr) < 0) {
+    if (kernel_event(handle_, changes.data(), static_cast<int>(count), nullptr, 0, -1) < 0) {
         return fail(last_os_error());
     }
     return Result<void>{};
 }
 
 Result<void> Poller::disarm(int fd) noexcept {
-    std::array<struct kevent, kMaxChanges> changes{};
-    EV_SET(&changes[0], static_cast<uintptr_t>(fd), EVFILT_READ, EV_DELETE, 0, 0, nullptr);
-    EV_SET(&changes[1], static_cast<uintptr_t>(fd), EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+    const std::array<KernelEvent, kMaxChanges> changes{change(fd, EVFILT_READ, EV_DELETE),
+                                                       change(fd, EVFILT_WRITE, EV_DELETE)};
 
     // ENOENT means the filter already fired (one-shot) or was never armed —
     // both are ordinary races for a cancelling waiter, not failures.
-    if (::kevent(handle_, changes.data(), static_cast<int>(changes.size()), nullptr, 0, nullptr) <
+    if (kernel_event(handle_, changes.data(), static_cast<int>(changes.size()), nullptr, 0, -1) <
             0 &&
         errno != ENOENT) {
         return fail(last_os_error());
@@ -99,19 +134,11 @@ Result<std::size_t> Poller::poll(std::span<ReadyEvent> out, int timeout_ms) noex
         return fail(Errc::invalid_argument);
     }
 
-    std::array<struct kevent, 64> events{};
+    std::array<KernelEvent, 64> events{};
     const std::size_t capacity = out.size() < events.size() ? out.size() : events.size();
 
-    struct timespec timeout{};
-    const struct timespec* timeout_ptr = nullptr;
-    if (timeout_ms >= 0) {
-        timeout.tv_sec = timeout_ms / 1000;
-        timeout.tv_nsec = static_cast<long>(timeout_ms % 1000) * 1'000'000L;
-        timeout_ptr = &timeout;
-    }
-
     const int count =
-        ::kevent(handle_, nullptr, 0, events.data(), static_cast<int>(capacity), timeout_ptr);
+        kernel_event(handle_, nullptr, 0, events.data(), static_cast<int>(capacity), timeout_ms);
     if (count < 0) {
         // A signal during the wait is not a failure; report "nothing ready"
         // and let the caller loop.
@@ -122,7 +149,7 @@ Result<std::size_t> Poller::poll(std::span<ReadyEvent> out, int timeout_ms) noex
     }
 
     for (int i = 0; i < count; ++i) {
-        const struct kevent& source = events[static_cast<std::size_t>(i)];
+        const KernelEvent& source = events[static_cast<std::size_t>(i)];
         ReadyEvent& target = out[static_cast<std::size_t>(i)];
         target.fd = static_cast<int>(source.ident);
         target.readable = source.filter == EVFILT_READ;

@@ -12,6 +12,7 @@
 #include "mira/core/operation.hpp"
 #include "mira/core/resource_budget.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <algorithm>
 #include <coroutine>
@@ -25,6 +26,7 @@
 #include <optional>
 #include <span>
 #include <stop_token>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -271,6 +273,39 @@ public:
 
 private:
     std::atomic<int>& depth_;
+};
+
+/// Records which thread is inside `run_once`, so submissions made by that
+/// thread can skip the wake-up. Such a thread is by definition not blocked in
+/// the kernel wait, and the next `run_once` recomputes posted work, pending
+/// cancellations and the earliest timer under the lock before it blocks.
+///
+/// Each thread only ever stores its own id or clears it, and coherence orders
+/// a thread's own stores, so a relaxed load returns the caller's id only while
+/// the caller really is running the loop. Any other answer costs at most a
+/// redundant wake-up. Set on every entry, so a loop that later moves to
+/// another thread is tracked there.
+class RunningThreadScope {
+public:
+    explicit RunningThreadScope(std::atomic<std::thread::id>& running) noexcept
+        : running_(running) {
+        running_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+    }
+
+    ~RunningThreadScope() { running_.store(std::thread::id{}, std::memory_order_relaxed); }
+
+    RunningThreadScope(const RunningThreadScope&) = delete;
+    RunningThreadScope& operator=(const RunningThreadScope&) = delete;
+    RunningThreadScope(RunningThreadScope&&) = delete;
+    RunningThreadScope& operator=(RunningThreadScope&&) = delete;
+
+    /// True when the caller is the thread currently inside `run_once`.
+    [[nodiscard]] static bool is_current(const std::atomic<std::thread::id>& running) noexcept {
+        return running.load(std::memory_order_relaxed) == std::this_thread::get_id();
+    }
+
+private:
+    std::atomic<std::thread::id>& running_;
 };
 
 /// Awaiter that parks the caller until a backend resolves its operation.

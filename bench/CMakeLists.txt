@@ -15,6 +15,7 @@
 #   * bench_h1_churn     — full connection lifetime (accept/serve/close)
 #   * bench_h1_cancel    — deadline and stop-token cancellation overhead
 #   * bench_h1_overload  — backpressure: 4 KiB bodies through a 512 B window
+#   * bench_loop_wake    — same-thread yield() and post()->resume round trips
 
 if(NOT MIRA_BUILD_BENCH)
     return()
@@ -38,6 +39,10 @@ if(MIRA_ENABLE_HTTP3)
     target_link_libraries(bench_h3_soak PRIVATE Mira::http3 Mira::warnings)
     target_compile_features(bench_h3_soak PRIVATE cxx_std_23)
 endif()
+
+add_executable(bench_loop_wake loop_wake.cpp)
+target_link_libraries(bench_loop_wake PRIVATE Mira::core Mira::warnings)
+target_compile_features(bench_loop_wake PRIVATE cxx_std_23)
 
 add_executable(bench_file_transfer file_transfer.cpp)
 target_link_libraries(bench_file_transfer PRIVATE Mira::transport Mira::warnings)
