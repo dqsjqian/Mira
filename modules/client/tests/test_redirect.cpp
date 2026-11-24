@@ -227,6 +227,11 @@ struct Server {
             else if (target == "/got") ok("got-it");
             else if (target == "/keep") redirect(307, "/kept");
             else if (target == "/kept") ok("kept-it");
+            else if (target == "/items") {
+                // Post/Redirect/Get onto the same URL.
+                if (record.method == "POST") redirect(303, "/items");
+                else ok("items:" + record.method);
+            }
             else if (target == "/loop-a") redirect(302, "/loop-b");
             else if (target == "/loop-b") redirect(302, "/loop-a");
             else if (target == "/to-https") redirect(302, "https://other.test/secure");
@@ -351,6 +356,21 @@ Task<void> loop_checks(EventLoop& loop, Server& server) {
         if (kept) {
             CHECK(kept->method == "POST");
             CHECK(kept->body == "keepme");
+        }
+    }
+    test::section("POST -> 303 -> GET of the same URL is followed, not a loop");
+    {
+        http::Request request;
+        request.method = http::Method::post;
+        request.target = "/items";
+        auto result = co_await request_with_redirects(*client, "http", "a.test", server_port,
+                                                     std::move(request), vec("new-item"));
+        CHECK_VALUE(result);
+        if (result) {
+            CHECK(result->status == 200);
+            CHECK(body_text(result->body) == "items:GET");
+            CHECK(result->redirects_followed == 1);
+            CHECK(result->final_target == "/items");
         }
     }
     test::section("a redirect loop fails instead of spinning");

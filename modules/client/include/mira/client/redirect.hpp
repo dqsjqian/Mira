@@ -17,8 +17,11 @@
 // Proxy-Authorization 和 Cookie。Host、Content-Length 和 Transfer-Encoding
 // 总是由会话/分帧层生成，绝不直接跨跳复制。
 //
-// Safety bounds: at most max_redirects follows (default 10); revisiting an
-// absolute URL fails with limit_exceeded instead of looping forever; the
+// Safety bounds: at most max_redirects follows (default 10), after which the
+// chain fails with limit_exceeded — a loop therefore ends there too. Revisiting
+// a URL is not itself an error: POST -> 303 -> GET of the same URL (the
+// Post/Redirect/Get pattern) and cookie-setting re-authentication hops are
+// legitimate, which is why curl and browsers bound chains by count only. The
 // collected body stays bounded by the connection's own limits. A redirect
 // to another scheme stops the chain and reports the absolute target in
 // unfollowed_location — the caller re-drives it with a client of that
@@ -128,7 +131,7 @@ struct RedirectTarget {
     std::uint16_t port = 0;
     std::string target;
     /// Canonical absolute URL, port always present, host bracketed when it
-    /// holds a colon. Used for loop detection and unfollowed_location.
+    /// holds a colon. Used for unfollowed_location.
     [[nodiscard]] std::string url() const {
         std::string result = scheme + "://";
         if (host.find(':') != std::string::npos) result += "[" + host + "]";
@@ -144,8 +147,8 @@ struct RedirectTarget {
 /// references are all handled, dot segments removed, fragments stripped.
 /// Anything else fails: another scheme is not_supported (only http/https
 /// are representable here), malformed authorities, ports or targets are
-/// invalid_argument. An empty Location resolves to the current URL, which
-/// the caller's loop detection then rejects as a loop.
+/// invalid_argument. An empty Location resolves to the current URL, which is
+/// followed like any other target and bounded by max_redirects.
 [[nodiscard]] inline Result<RedirectTarget> resolve_redirect_location(std::string_view scheme,
                                                                       std::string_view host,
                                                                       std::uint16_t port,
@@ -418,13 +421,8 @@ template<class Client>
     http::Method current_method = request.method;
     http::HeaderMap current_headers = detail::filtered_headers(request.headers, false, false);
     std::vector<std::byte> current_body = std::move(body);
-    std::vector<std::string> visited;
     std::size_t redirects = 0;
     for (;;) {
-        RedirectTarget current{current_scheme, current_host, current_port, current_target};
-        if (std::find(visited.begin(), visited.end(), current.url()) != visited.end())
-            co_return fail(Errc::limit_exceeded);
-        visited.push_back(current.url());
         http::Request hop;
         hop.method = current_method;
         if (current_method == http::Method::other) hop.method_token = method_token;
