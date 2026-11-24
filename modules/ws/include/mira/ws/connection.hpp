@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <array>
+#include <coroutine>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <utility>
 
 namespace Mira::ws {
 
@@ -17,6 +19,10 @@ namespace Mira::ws {
 // adapter may impose a stricter contract. Handshake and close are exclusive.
 // Automatic pong/close replies are serialized behind an active writer, with
 // at most one pending pong and one pending close. No unbounded output queue.
+// A send() that finds the reader writing such a reply waits for that frame
+// instead of failing. Its stop token and deadline are checked before it waits
+// and again once the reply has left; the reply itself is shared I/O bounded by
+// the reader's options and is never cut short on behalf of the queued send.
 // Messages are bounded; negotiated compression and subprotocols are opt-in.
 // HTTP/2 and HTTP/3 Extended CONNECT are separate protocols, not handled here.
 // Complete TLS handshake first. Do not mix read_frame/read_message mid-fragment.
@@ -115,7 +121,16 @@ public:
     }
 
     Task<Result<void>> send(Frame frame, OperationOptions options = {}) {
-        if (busy_ || writing_) co_return fail(Mira::Errc::invalid_argument);
+        if (busy_ || (writing_ && !replying_) || write_waiter_)
+            co_return fail(Mira::Errc::invalid_argument);
+        if (writing_) {
+            // The direction is held by the reader's automatic reply, which the
+            // application neither started nor can see; a conflict error here
+            // would make every Ping a race against the application's writer.
+            auto checked = check_options(options);
+            if (!checked) co_return checked;
+            co_await ReplyDrained{*this};
+        }
         DirectionGuard guard{*this, writing_};
         auto sent = co_await send_locked(frame, options);
         if (!sent) co_return sent;
@@ -190,6 +205,26 @@ private:
             if (std::uncaught_exceptions() > exceptions) owner.fail_exception();
         }
     };
+    // Holds the write direction for an automatic reply. Release hands it
+    // straight to a send() queued meanwhile: resuming that writer here, before
+    // any other code can run on this single loop thread, keeps the hand-off
+    // atomic without a lock, so a second reply cannot slip in between.
+    struct ReplyGuard {
+        Connection& owner;
+        int exceptions = std::uncaught_exceptions();
+        explicit ReplyGuard(Connection& value) : owner(value) { owner.writing_ = owner.replying_ = true; }
+        ~ReplyGuard() {
+            owner.writing_ = owner.replying_ = false;
+            if (std::uncaught_exceptions() > exceptions) owner.fail_exception();
+            if (auto waiter = std::exchange(owner.write_waiter_, {})) waiter.resume();
+        }
+    };
+    struct ReplyDrained {
+        Connection& owner;
+        bool await_ready() const noexcept { return !owner.writing_; }
+        void await_suspend(std::coroutine_handle<> waiter) noexcept { owner.write_waiter_ = waiter; }
+        void await_resume() const noexcept {}
+    };
     Task<Result<void>> flush_control(OperationOptions options) {
         while (pending_pong_) {
             auto frame = std::move(*pending_pong_);
@@ -210,7 +245,7 @@ private:
             else pending_close_ = std::move(frame);
             co_return Result<void>{};
         }
-        DirectionGuard guard{*this, writing_};
+        ReplyGuard guard{*this};
         auto sent = co_await send_locked(frame, options, true);
         if (!sent) co_return sent;
         co_return co_await flush_control(options);
@@ -343,9 +378,13 @@ private:
                     auto payload = close_payload(code);
                     Frame close_frame{Opcode::close, true, std::move(*payload)};
                     if (!writing_) {
-                        DirectionGuard writer{*this, writing_};
+                        ReplyGuard writer{*this};
                         auto sent = co_await send_locked(close_frame, options);
                         (void)sent;
+                        // Fail before the guard hands the direction to a
+                        // queued send(), which must then observe the closure.
+                        static_cast<void>(terminate(error));
+                        co_return fail(error);
                     }
                 }
                 static_cast<void>(terminate(error));
@@ -388,7 +427,9 @@ private:
     std::array<std::byte, 4096> buffer_{};
     std::size_t begin_ = 0, end_ = 0;
     std::optional<Frame> pending_pong_, pending_close_;
-    bool reading_ = false, writing_ = false;
+    // At most one: a second application writer is rejected, not queued.
+    std::coroutine_handle<> write_waiter_{};
+    bool reading_ = false, writing_ = false, replying_ = false;
     bool busy_ = false, ready_ = false, failed_ = false;
     bool close_sent_ = false, close_received_ = false;
 };

@@ -256,9 +256,116 @@ Task<void> writer_exception_discards_late_read() {
     CHECK(connection.closed());
 }
 
+std::vector<std::byte> client_frames(std::initializer_list<ws::Frame> frames) {
+    std::vector<std::byte> wire;
+    const auto mask = std::array<std::byte, 4>{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    for (const auto& frame : frames) {
+        auto encoded = ws::serialize(frame, ws::Role::client, mask);
+        CHECK(encoded.has_value());
+        if (encoded) wire.insert(wire.end(), encoded->begin(), encoded->end());
+    }
+    return wire;
+}
+
+std::vector<ws::Frame> server_output(std::span<const std::byte> output) {
+    ws::FrameParser parser(ws::Role::client);
+    std::vector<ws::Frame> frames;
+    std::size_t position = 0;
+    while (position < output.size()) {
+        auto parsed = parser.feed(output.subspan(position));
+        CHECK(parsed.has_value());
+        if (!parsed || parsed->consumed == 0) break;
+        position += parsed->consumed;
+        if (parsed->frame) frames.push_back(std::move(*parsed->frame));
+    }
+    CHECK(position == output.size());
+    return frames;
+}
+
+Task<void> send_waits_behind_automatic_pong() {
+    test::section("application send waits for a back-pressured automatic Pong");
+    PausedWriter stream;
+    stream.paused_writes = 1; // Only the reader's Pong is held by the transport.
+    stream.write_limit = 3;   // Short writes: a mangled interleave would show.
+    stream.input = client_frames({ws::Frame{ws::Opcode::ping, true, bytes("beat")},
+                                  ws::Frame{ws::Opcode::text, true, bytes("bye")}});
+    ws::Connection connection(stream, ws::Role::server);
+    CHECK(connection.adopt_extended_connect("websocket", 200).has_value());
+    const auto payload = bytes("application payload spanning many short writes");
+    Result<ws::Frame> received = fail(Errc::internal);
+    Result<void> sent = fail(Errc::internal);
+    bool sent_done = false;
+    TaskScope scope;
+    auto reader = [&]() -> Task<void> { received = co_await connection.read_message(); };
+    auto writer = [&]() -> Task<void> {
+        sent = co_await connection.send(ws::Frame{ws::Opcode::binary, true, payload});
+        sent_done = true;
+    };
+    scope.spawn(reader()); // Ping read; its Pong is parked mid-frame in the transport.
+    CHECK(stream.writes == 1);
+    scope.spawn(writer());
+    CHECK(!sent_done); // Queued behind the Pong instead of rejected.
+    auto rival = co_await connection.send(ws::Frame{ws::Opcode::text, true, bytes("rival")});
+    CHECK(!rival && rival.error() == Errc::invalid_argument); // Two user writers stay an error.
+    CHECK(stream.writes == 1);
+    stream.gate.release();
+    co_await scope.join();
+    CHECK(sent_done && sent.has_value());
+    CHECK(received && received->opcode == ws::Opcode::text && received->payload == bytes("bye"));
+    CHECK(!connection.closed());
+    auto frames = server_output(stream.output);
+    CHECK(frames.size() == 2);
+    if (frames.size() == 2) {
+        CHECK(frames[0].opcode == ws::Opcode::pong && frames[0].payload == bytes("beat"));
+        CHECK(frames[1].opcode == ws::Opcode::binary && frames[1].final && frames[1].payload == payload);
+    }
+}
+
+Task<void> queued_send_honours_options(EventLoop& loop) {
+    test::section("send queued behind an automatic Pong honours its stop token and deadline");
+    for (const bool use_deadline : {false, true}) {
+        PausedWriter stream;
+        stream.paused_writes = 1;
+        stream.input = client_frames({ws::Frame{ws::Opcode::ping, true, bytes("beat")},
+                                      ws::Frame{ws::Opcode::text, true, bytes("bye")}});
+        ws::Connection connection(stream, ws::Role::server);
+        CHECK(connection.adopt_extended_connect("websocket", 200).has_value());
+        std::stop_source stop;
+        OperationOptions options;
+        if (use_deadline) options.deadline = Clock::now() + 1ms;
+        else options.stop = stop.get_token();
+        Result<ws::Frame> received = fail(Errc::internal);
+        Result<void> sent;
+        TaskScope scope;
+        auto reader = [&]() -> Task<void> { received = co_await connection.read_message(); };
+        auto writer = [&]() -> Task<void> {
+            sent = co_await connection.send(ws::Frame{ws::Opcode::text, true, bytes("abandoned")}, options);
+        };
+        scope.spawn(reader());
+        scope.spawn(writer());
+        if (use_deadline) static_cast<void>(co_await loop.sleep_for(5ms));
+        else stop.request_stop();
+        stream.gate.release();
+        co_await scope.join();
+        CHECK(!sent && sent.error() == (use_deadline ? Errc::timed_out : Errc::cancelled));
+        CHECK(received && received->payload == bytes("bye"));
+        // Nothing of the abandoned frame reached the wire, so the session survives.
+        CHECK(!connection.closed());
+        CHECK((co_await connection.send(ws::Frame{ws::Opcode::text, true, bytes("after")})).has_value());
+        auto frames = server_output(stream.output);
+        CHECK(frames.size() == 2);
+        if (frames.size() == 2) {
+            CHECK(frames[0].opcode == ws::Opcode::pong && frames[0].payload == bytes("beat"));
+            CHECK(frames[1].opcode == ws::Opcode::text && frames[1].payload == bytes("after"));
+        }
+    }
+}
+
 Task<void> run(EventLoop& loop) {
     co_await queued_pong_during_pong_write();
     co_await close_completes_with_queued_pong();
+    co_await send_waits_behind_automatic_pong();
+    co_await queued_send_honours_options(loop);
     co_await reader_exception_releases_writer();
     co_await writer_exception_discards_late_read();
     auto listener = tcp::Listener::bind(loop, transport::Endpoint::loopback(0));
