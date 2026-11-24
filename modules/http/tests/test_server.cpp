@@ -25,7 +25,9 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -980,6 +982,51 @@ void test_request_budget_is_per_request() {
 
 }  // namespace
 
+void test_hostile_content_length_is_not_reserved() {
+    test::section("declared Content-Length is not reserved beyond the cap");
+    // A large configured limit ("unbounded" is documented as SIZE_MAX) must
+    // not let one header allocate the declared size before any body byte
+    // arrives. Previously the reservation threw out of serve_connection.
+    auto handler = [](const Request&, auto& writer, std::span<const std::byte>) -> Task<Result<void>> {
+        Response response;
+        co_return co_await writer.send(response);
+    };
+    for (const std::string_view declared : {std::string_view{"18446744073709551615"},
+                                            std::string_view{"70368744177664"}}) {
+        ServerOptions unbounded;
+        unbounded.limits.max_body_size = std::numeric_limits<std::uint64_t>::max();
+        ScriptedStream stream{"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: " + std::string{declared} +
+                              "\r\n\r\n"};
+        bool escaped = false;
+        Result<void> result{};
+        try {
+            result = serve_connection(stream, handler, unbounded).sync_get();
+        } catch (...) {
+            escaped = true;
+        }
+        CHECK(!escaped);
+        CHECK(!result && result.error() == Errc::eof);  // truncated body, not an exception
+    }
+
+    test::section("bodies beyond the reservation cap still arrive whole");
+    ServerOptions large;
+    large.limits.max_body_size = 8 * 1024 * 1024;
+    const std::string payload(3 * 1024 * 1024 + 17, 'z');
+    std::size_t received = 0;
+    bool intact = false;
+    auto collect = [&](const Request&, auto& writer, std::span<const std::byte> body) -> Task<Result<void>> {
+        received = body.size();
+        intact = text_of(body) == payload;
+        Response response;
+        co_return co_await writer.send(response);
+    };
+    ScriptedStream upload{"POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: " +
+                          std::to_string(payload.size()) + "\r\n\r\n" + payload, 64 * 1024};
+    CHECK(serve_connection(upload, collect, large).sync_get().has_value());
+    CHECK(received == payload.size());
+    CHECK(intact);
+}
+
 int main() {
     test_response_head();
     test_bodyless_statuses();
@@ -1008,6 +1055,7 @@ int main() {
     test_truncated_head_and_zero_read_policy();
     test_timeout_windows();
     test_request_budget_is_per_request();
+    test_hostile_content_length_is_not_reserved();
 
     return test::summary();
 }

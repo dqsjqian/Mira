@@ -49,6 +49,7 @@
 #include <optional>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -587,6 +588,26 @@ inline RequestExpectation request_expectation(const Request& request) {
 ///
 /// Deliberately bare: a parse failure means the request is untrustworthy, so
 /// the reply says as little as possible and the connection closes.
+/// Upper bound for reserving a buffered request body from its declared
+/// Content-Length. Covers the default body limit (1 MiB) in one allocation;
+/// larger bodies grow with the bytes actually received.
+inline constexpr std::uint64_t kBufferedBodyReserveCap = 1024 * 1024;
+
+/// Run one growth step of a buffered request body. Returns 0 on success, or
+/// the status to answer: 413 when the size cannot be represented, 500 when
+/// memory runs out.
+template<typename Grow>
+unsigned grow_buffered_body(Grow&& grow) noexcept {
+    try {
+        std::forward<Grow>(grow)();
+        return 0;
+    } catch (const std::length_error&) {
+        return 413;
+    } catch (...) {
+        return 500;
+    }
+}
+
 template<BoundedStream Stream>
 Task<Result<void>> send_error(Stream& stream, unsigned status, OperationOptions io) {
     Response response;
@@ -667,6 +688,7 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         bool body_drained = false;
         bool continue_pending = false;
         Buffer body;  // accumulated only up to the configured limit
+        unsigned body_failure = 0;  // status to answer when `body` cannot grow
 
         // Whichever window applies right now. Recomputed when the first byte
         // arrives, so that a connection's hundredth request gets the same
@@ -732,9 +754,19 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
                         // on a hostile Content-Length would be a pre-read
                         // amplification. The streaming path skips this — the
                         // handler owns buffering, not the loop.
+                        //
+                        // The reservation is also capped: the declared size is
+                        // the peer's claim, not data. With a large configured
+                        // limit (or SIZE_MAX, "unbounded"), reserving the claim
+                        // lets one header allocate gigabytes — or throw — before
+                        // a single body byte arrives. Beyond the cap the buffer
+                        // grows with the bytes actually received.
                         const std::uint64_t declared = parser.request().content_length;
                         if (declared <= options.limits.max_body_size) {
-                            body.reserve(static_cast<std::size_t>(declared));
+                            const std::uint64_t hint =
+                                std::min<std::uint64_t>(declared, detail::kBufferedBodyReserveCap);
+                            body_failure = detail::grow_buffered_body(
+                                [&] { body.reserve(static_cast<std::size_t>(hint)); });
                         }
                     }
                 }
@@ -742,7 +774,7 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
 
             case ParseStep::body:
                 if constexpr (buffered_mode) {
-                    body.append(parser.body());
+                    body_failure = detail::grow_buffered_body([&] { body.append(parser.body()); });
                 }
                 break;
 
@@ -787,6 +819,13 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
                     }
                 }
                 break;
+            }
+            if (body_failure != 0) {
+                // The body cannot be held. Answer and close, as for any other
+                // request the loop cannot complete; never let the allocation
+                // failure escape (see the handler contract below).
+                static_cast<void>(co_await detail::send_error(stream, body_failure, io));
+                co_return fail(body_failure == 413 ? Errc::limit_exceeded : Errc::internal);
             }
         }
 
