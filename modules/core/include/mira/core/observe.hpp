@@ -46,14 +46,17 @@ Task<Result<T>> observe(Task<Result<T>> operation, std::shared_ptr<OperationObse
     event.name = name;
     event.started = Clock::now();
     observer->notify(event);
+    // `returned` marks this operation's own normal exit. Comparing
+    // std::uncaught_exceptions() would misreport a normal return resumed
+    // inside unrelated stack unwinding as an exception.
     struct Complete {
         OperationObserver& observer;
         OperationEvent& event;
-        int exceptions = std::uncaught_exceptions();
+        bool returned = false;
         ~Complete() {
             event.phase = OperationPhase::completed;
             event.elapsed = Clock::now() - event.started;
-            if (std::uncaught_exceptions() > exceptions) {
+            if (!returned) {
                 event.exception = true;
                 event.error = make_error_code(Errc::internal);
             }
@@ -65,6 +68,7 @@ Task<Result<T>> observe(Task<Result<T>> operation, std::shared_ptr<OperationObse
     if constexpr (std::same_as<T, std::size_t>) {
         if (result && count_bytes) event.bytes = *result;
     } else static_cast<void>(count_bytes);
+    complete.returned = true;
     co_return result;
 }
 

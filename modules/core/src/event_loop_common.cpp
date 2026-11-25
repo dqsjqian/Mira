@@ -78,13 +78,27 @@ RootTask run_root(Task<void> task) {
     co_await std::move(task);
 }
 
-[[noreturn]] void unresolvable(const char* reason) {
+/// Describes a posted callback failure held back until the root finished,
+/// so a terminating diagnostic does not silently drop it.
+void report_deferred_post_failure(const std::exception_ptr& failure) noexcept {
+    if (!failure) return;
+    try {
+        std::rethrow_exception(failure);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "An earlier posted callback had thrown: %s\n", error.what());
+    } catch (...) {
+        std::fprintf(stderr, "An earlier posted callback had thrown a non-std exception.\n");
+    }
+}
+
+[[noreturn]] void unresolvable(const char* reason, const std::exception_ptr& post_failure) {
     std::fprintf(stderr,
                  "Mira::EventLoop::run_until_complete: %s.\n"
                  "The root coroutine is started and unfinished, so its frame cannot be\n"
                  "destroyed: the loop may still hold its handle, its result slot, and\n"
                  "buffers it borrowed. Terminating rather than corrupting memory.\n",
                  reason);
+    report_deferred_post_failure(post_failure);
     std::fflush(stderr);
     std::terminate();
 }
@@ -107,7 +121,7 @@ Result<void> EventLoop::run_until_complete(Task<void> task) {
         // while its work is still pending, so there is no case where this is
         // wrong and `run()` is right.
         if (outstanding() == 0) {
-            unresolvable("nothing is outstanding, so nothing can resume it");
+            unresolvable("nothing is outstanding, so nothing can resume it", post_failure);
         }
 
         // A failure here may still have delivered the completion that finished
@@ -119,7 +133,7 @@ Result<void> EventLoop::run_until_complete(Task<void> task) {
             return pumped;
         }
         if (!pumped) {
-            unresolvable("the loop could not be pumped");
+            unresolvable("the loop could not be pumped", post_failure);
         }
     }
 

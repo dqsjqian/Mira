@@ -46,6 +46,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <optional>
 #include <limits>
 #include <span>
@@ -823,8 +824,15 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
             if (body_failure != 0) {
                 // The body cannot be held. Answer and close, as for any other
                 // request the loop cannot complete; never let the allocation
-                // failure escape (see the handler contract below).
-                static_cast<void>(co_await detail::send_error(stream, body_failure, io));
+                // failure escape (see the handler contract below). Release the
+                // partial body first so the reply has memory to work with, and
+                // if even that reply cannot be allocated, just close.
+                body = Buffer{};
+                try {
+                    static_cast<void>(co_await detail::send_error(stream, body_failure, io));
+                } catch (const std::bad_alloc&) {
+                    // Nothing more can be said to this peer; closing is the answer.
+                }
                 co_return fail(body_failure == 413 ? Errc::limit_exceeded : Errc::internal);
             }
         }

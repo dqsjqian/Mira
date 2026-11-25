@@ -314,6 +314,9 @@ Task<void> send_waits_behind_automatic_pong(EventLoop& loop, bool bounded) {
     CHECK(!rival && rival.error() == Errc::invalid_argument); // Two user writers stay an error.
     CHECK(stream.writes == 1);
     stream.gate.release();
+    // The send continues from the loop, not nested inside the reader's
+    // read_message() that released the direction.
+    CHECK(!sent_done);
     co_await scope.join();
     CHECK(sent_done && sent.has_value());
     CHECK(received && received->opcode == ws::Opcode::text && received->payload == bytes("bye"));
@@ -378,22 +381,36 @@ Task<void> queued_send_honours_options(EventLoop& loop) {
 }
 
 Task<void> custom_stream_without_scheduler() {
-    test::section("bounded queue waits require a scheduler, not cancellation of shared I/O");
+    test::section("without a scheduler a bounded send waits for the reply, then applies its deadline");
     PausedWriter stream;
     stream.paused_writes = 1;
     stream.input = client_frames({ws::Frame{ws::Opcode::ping, true, bytes("beat")}});
     ws::Connection connection(stream, ws::Role::server);
     CHECK(connection.adopt_extended_connect("websocket", 200).has_value());
-    TaskScope readers;
+    TaskScope tasks;
+    Result<void> sent = fail(Errc::internal);
+    bool finished = false;
     auto read = [&]() -> Task<void> { CHECK((co_await connection.read_frame()).has_value()); };
-    readers.spawn(read());
-    auto result = co_await connection.send(ws::Frame{ws::Opcode::text, true, bytes("bounded")},
-                                           {.deadline = Clock::now() + 3s});
-    CHECK(!result && result.error() == Errc::not_supported);
+    auto write = [&]() -> Task<void> {
+        sent = co_await connection.send(ws::Frame{ws::Opcode::text, true, bytes("bounded")},
+                                        {.deadline = Clock::now() + 3s});
+        finished = true;
+    };
+    tasks.spawn(read());
+    tasks.spawn(write());
+    // Previously not_supported, depending only on whether a Pong was in flight.
+    CHECK(!finished);
     CHECK(stream.writes == 1 && stream.gate.waiter);
     stream.gate.release();
-    co_await readers.join();
+    co_await tasks.join();
+    CHECK(finished && sent.has_value());
     CHECK(!connection.closed());
+    auto frames = server_output(stream.output);
+    CHECK(frames.size() == 2);
+    if (frames.size() == 2) {
+        CHECK(frames[0].opcode == ws::Opcode::pong && frames[0].payload == bytes("beat"));
+        CHECK(frames[1].opcode == ws::Opcode::text && frames[1].payload == bytes("bounded"));
+    }
 }
 Task<void> resume_during_unrelated_unwind() {
     PausedWriter stream;

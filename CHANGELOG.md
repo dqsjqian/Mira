@@ -10,6 +10,22 @@ records; they are not additional definitions of the current build version.
 
 ### Fixed
 
+- MQTT `Client`, `ws::ByteStream` and `observe()` no longer decide that an
+  operation threw by comparing `std::uncaught_exceptions()`. A normal return
+  resumed inside unrelated stack unwinding was recorded as an exception
+  (MQTT/ByteStream then failed the connection). Each operation now records its
+  own normal exit or catches and rethrows its own exception.
+- WebSocket: after a back-pressured automatic reply, a waiting `send()`
+  continues from the event loop instead of inside the reader's
+  `read_frame()`, so the caller's code after `send()` no longer runs with
+  the read direction still held. Without an event loop, a bounded `send()`
+  that meets an automatic reply waits for it and then applies its stop token
+  and deadline, instead of failing with `not_supported` depending on timing.
+- A buffered HTTP/1 server that runs out of memory for a request body frees
+  the partial body before answering, and closes without a reply if even that
+  reply cannot be allocated, instead of letting `std::bad_alloc` escape.
+- `run_until_complete`'s termination diagnostic includes a posted callback
+  failure that was being held back until the root finished.
 - Only committed bytes of `Buffer` are readable. Consuming the readable prefix
   no longer invalidates an outstanding writable span; repeated reads reuse storage.
 - The HTTP server accepts one leading CRLF before a request line. Response
@@ -47,6 +63,12 @@ records; they are not additional definitions of the current build version.
   their loop to `ws::Connection` for bounded waits. Two concurrent application
   writers are still rejected.
 - Configure fails when nghttp2 does not come from the ForgeDeps recipe graph.
+
+### Changed
+
+- `schedule_on(EventLoop&)` is documented as throwing `std::system_error`
+  (`Errc::cancelled`) when the loop is torn down while the hop is queued.
+  Code awaiting such a hop during shutdown should expect that exception.
 
 ### Performance
 

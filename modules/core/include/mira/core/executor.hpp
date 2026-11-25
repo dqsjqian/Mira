@@ -78,6 +78,14 @@ static_assert(Executor<InlineExecutor>);
 ///
 ///     co_await schedule_on(ui_executor);
 ///     // ... now on the UI thread
+///
+/// For an `EventLoop` the hop also observes teardown: if the loop is shut
+/// down (or already shutting down) while the hop is queued, the coroutine
+/// resumes on the shutting-down thread and the `co_await` throws
+/// `std::system_error` with `Errc::cancelled`, instead of leaving its frame
+/// suspended forever. This is the one place the scheduling layer reports
+/// through an exception: a hop has no Result to carry the outcome. Other
+/// executors keep the plain post, whose abandonment is executor-defined.
 template<Executor E>
 [[nodiscard]] auto schedule_on(E& executor) noexcept {
     class Awaiter {
