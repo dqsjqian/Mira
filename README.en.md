@@ -90,7 +90,7 @@ flowchart TB
     App -.-> Client[client · pooled HTTP/1 / SOCKS5 dial composition]
     App -.-> ClientTLS[client_tls · HTTPS composition]
     App -.-> SOCKS[socks · SOCKS5]
-    App -.-> DNS[dns · DNS messages / DoH]
+    App -.-> DNS[dns · DNS messages / DoH / optional DNSSEC]
     App -.-> MQTT[mqtt · MQTT 3.1.1 / 5.0]
     Client --> HTTP
     Client --> SOCKS
@@ -118,15 +118,15 @@ Solid arrows are dependency directions; dashed arrows are application-level comp
 | Module | Responsibility |
 |---|---|
 | `Mira::core` | Coroutines/scopes, stream/executor contracts, bounded posting, independent-thread `LoopGroup`, shared resource budgets |
-| `Mira::transport` | TCP/UDP, local streams, bounded system resolver, interleaved-candidate `tcp::dial`, managed serving |
+| `Mira::transport` | TCP/UDP, local streams, bounded system resolver, interleaved-candidate `tcp::dial`, file sending, managed serving |
 | `Mira::tls` | Same-loop duplex TLS streams, per-request deadlines, certificate/hostname verification, mTLS and ALPN |
 | `Mira::ws` / `Mira::crypto` | WebSocket/WSS, subprotocols, bounded RFC7692 compression, secure nonce/masking, Extended CONNECT field negotiation |
 | `Mira::http` | HTTP/1 parsing, serialization, per-connection serving, streaming requests/responses, duplex `Expect: 100-continue` exchange; depends only on stream contracts |
-| `Mira::client` / `Mira::client_tls` | HTTP/1 / HTTPS pools and SOCKS5 composition; optional `client_http2` / `client_http3` own multiplexed connections with explicit close/join |
+| `Mira::client` / `Mira::client_tls` | HTTP/1 / HTTPS pools, redirect following, explicit cookie/cache state and SOCKS5 composition; optional `client_http2` / `client_http3` own multiplexed connections with explicit close/join |
 | `Mira::http2` | Optional nghttp2 session, multi-stream, Extended CONNECT and `ConnectStream` |
 | `Mira::quic` / `Mira::http3` | QUIC v1, explicit migration/resumption, nghttp3/QPACK, Extended CONNECT, HTTP/3 0-RTT (SETTINGS-bound ticket domains) |
 | `Mira::socks` | SOCKS5 (RFC 1928/1929) client and proxy handshakes with exact-length reads over any bounded stream |
-| `Mira::dns` | DNS message codec (RFC 1035/6891, EDNS(0)) and DoH mapping (RFC 8484) |
+| `Mira::dns` / `Mira::dnssec` | DNS message codec (RFC 1035/6891, EDNS(0)) and DoH mapping (RFC 8484); optional local DNSSEC validation |
 | `Mira::mqtt` | MQTT 3.1.1/5.0 codec for every packet, socket-free client `Session`, duplex `Client<Stream>` |
 
 Layering is enforced by `scripts/ci/check_layering.py`: no reverse dependencies, no host-framework headers, platform detection centralized in `platform.hpp`, and no OS headers inside protocol modules.
@@ -226,31 +226,31 @@ Each [Release](https://github.com/dqsjqian/Mira/releases) links CI evidence and 
 |---|---|
 | Execution & lifecycle | Lazy `Task`, `TaskScope` join, reliable continuation posting, bounded application posting, independent-thread `LoopGroup` |
 | Cancellation & deadlines | `OperationOptions` flows through `EventLoop` → TCP → TLS → HTTP |
-| TCP | IPv4/IPv6, interleaved-candidate `dial`, short I/O, exclusive bind, grace drain / cancel / join |
+| TCP | IPv4/IPv6, interleaved-candidate `dial`, short I/O, exclusive bind, `send_file` (sendfile/TransmitFile with a bounded copy fallback), grace drain / cancel / join |
 | UDP | IPv4/IPv6, whole-datagram semantics, cancellation/deadlines, ASM multicast; POSIX packet metadata and per-packet source selection, explicit rejection of unsupported options |
-| DNS | Bounded system resolution, policy caches and in-flight coalescing, independent cancellation; asynchronous UDP/TCP wire queries and DoH GET/POST/multiplexed mapping |
-| TLS | OpenSSL 3, chain/DNS/IP verification, combined mTLS/multi-ALPN, SNI identity routing and atomic configuration reload, local CRL, close_notify |
+| DNS | Bounded system resolution, policy caches and in-flight coalescing, independent cancellation; asynchronous UDP/TCP wire queries and DoH GET/POST/multiplexed mapping; optional local DNSSEC validation |
+| TLS | OpenSSL 3.0+ (including 4.x), chain/DNS/IP verification, combined mTLS/multi-ALPN, SNI identity routing and atomic configuration reload, local CRL, opt-in TLS 1.3 early data, close_notify |
 | WebSocket/WSS | Subprotocols, fragmented/control frames, UTF-8, optional permessage-deflate, same-loop TCP/TLS duplex |
 | Local transport / SSE | POSIX Unix-domain sockets; HTTP/1 chunked SSE and Last-Event-ID example |
-| HTTP/1 | Incremental parsing, keep-alive, HEAD, chunked, streaming uploads/responses, `Expect: 100-continue` and duplex early responses, separate HTTP/HTTPS pool composition |
+| HTTP/1 | Incremental parsing, keep-alive, HEAD, chunked, streaming uploads/responses, `Expect: 100-continue` and duplex early responses, separate HTTP/HTTPS pool composition, count-bounded redirect following, optional cookies/response cache |
 | HTTP/2 | nghttp2, HPACK, multi-stream, consumption-driven windows, explicit Extended CONNECT |
 | QUIC/H3 | ngtcp2 + nghttp3 + OpenSSL ossl; validated migration, QUIC resumption/explicit 0-RTT, HTTP/3 0-RTT (0.5-RTT answers, same-stream-ID resubmission after rejection, automatic 425 for unsafe methods), QPACK, Extended CONNECT, two-phase GOAWAY |
 | SOCKS5 | CONNECT, two-reply BIND, UDP ASSOCIATE and bounded unfragmented UDP framing; username/password, exact handshake reads, no local resolution of target domains |
-| MQTT | 3.1.1 / 5.0, QoS 0/1/2 in both directions, CONNACK limits, topic aliases, keep-alive supervision, enhanced authentication, resumption resend |
-| Safety & resources | Protocol limits, bounded TLS BIO, cross-loop budgets, optional early-data replay store, operation observation/metrics and QUIC qlog; not a process-RSS cap |
+| MQTT | 3.1.1 / 5.0, QoS 0/1/2 in both directions, CONNACK limits, inbound/outbound topic aliases, keep-alive supervision, enhanced authentication, resumption resend |
+| Safety & resources | Protocol limits, buffered HTTP bodies that grow with received bytes, bounded TLS BIO, cross-loop budgets, optional early-data replay store, operation observation/metrics and QUIC qlog; not a process-RSS cap |
 
 `stop()` only asks `run()` to return; per-operation cancellation is `OperationOptions`' job — every layer owns exactly one responsibility.
 
 The [audit record](docs/AUDIT-2026-09-30.md) covers protocol resource budgets,
 cancellation, task-lifetime repairs and their validation boundaries.
 
-Use security-patched OpenSSL packages in production. As of 2026-09-30, the 3.5
-LTS patch is **3.5.9** and the 3.6 patch is **3.6.5**; vendor packages with the
-corresponding backported fixes are also suitable. Meeting the API minimum alone
-does not establish patch status. In particular,
+Use security-patched OpenSSL in production. The TLS module requires OpenSSL
+3.0+ and QUIC/HTTP/3 requires 3.5+; meeting the API minimum alone does not
+establish patch status. For example,
 [CVE-2026-35189](https://openssl-library.org/news/vulnerabilities/#CVE-2026-35189)
-can be reached through peer TLS certificates. Source-built CI now pins and
-hash-verifies 3.5.9.
+can be reached through peer TLS certificates; it is fixed in 3.5.9, 3.6.5 and
+later patches on those branches, or in vendor packages with the backported fix.
+CI builds and verifies the locked OpenSSL 4.0.3 from the dependency graph.
 
 ## 🚀 Quick start
 
@@ -259,7 +259,7 @@ Requires **CMake 3.21+ and a C++23 compiler**. CI toolchains are the newest stab
 - **GCC 16+**: GCC 13's coroutine optimizer has a known internal compiler error (fixed in GCC 14); the floor follows the toolchain CI measures.
 - **Clang 23+ on Linux**: clang-18 and older keep `__cpp_concepts` outdated, so libstdc++ hides `std::expected` behind its feature-test; the floor follows the toolchain CI measures.
 
-The base core / transport / HTTP/1 build has zero third-party dependencies. TLS, WebSocket, HTTP/2 and QUIC/HTTP/3 dependencies are introduced only when those optional modules are enabled.
+The base core / transport / HTTP/1 build has zero third-party dependencies and uses CMake directly:
 
 ```bash
 git clone https://github.com/dqsjqian/Mira.git
@@ -269,14 +269,13 @@ cmake --build build/debug -j
 ctest --test-dir build/debug --output-on-failure
 ```
 
-With TLS (needs OpenSSL 3):
+Optional modules (TLS, DNSSEC, WebSocket, HTTP/2, QUIC/HTTP/3) bring in dependencies only when enabled. [ForgeDeps](https://github.com/dqsjqian/ForgeDeps) fetches and builds OpenSSL, zlib, nghttp2, nghttp3 and ngtcp2 at the versions, source revisions and SHA256 hashes locked in `scripts/protocol-dependencies.json`; a host OpenSSL installation does not replace the locked one. `scripts/build.py` configures, builds and tests in one step:
 
 ```bash
-cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON
-cmake --build build/tls -j && ctest --test-dir build/tls --output-on-failure
+python3 scripts/build.py debug --build-dir build/tls --tls
 ```
 
-Optional higher protocols: `MIRA_ENABLE_HTTP2=ON` / `MIRA_ENABLE_HTTP3=ON` (off by default, never auto-downloads; dependency versions and SHA256 are pinned in `tools/protocol-dependencies.json`). The explicit dependency builder requires Python 3.14+; install the released build tool from `requirements-build.txt` into that same Python environment first.
+The build entry point requires Python 3.14+. On first use it prepares a tool environment with the exact `requirements-build.txt` pins in the ForgeDeps workspace (`FORGEDEPS_HOME`, the registered workspace, or the default `~/.forgedeps`), adding CMake/Ninja when they are missing; install the compiler and platform SDKs yourself. Enable other modules with `--websocket` / `--http2` / `--http3`, and DNSSEC with `--cmake-arg -DMIRA_ENABLE_DNSSEC=ON`; `--offline` uses only already verified local sources. See [protocol dependency maintenance](docs/PROTOCOL-DEPENDENCIES.md).
 
 ### Minimal client / server pairs
 
@@ -292,15 +291,11 @@ Start each server in terminal A, then its client in terminal B. All examples use
 
 Pass `""` to the UDP client for a zero-byte datagram. H1 makes two keep-alive requests; H2/H3 submit two distinct streams. H2 uses cleartext prior knowledge, not TLS/ALPN. H3 serves multiple requests on one connection: it is not a multi-client CID-routing listener. Callers own production certificates and private keys.
 
-Build H2/H3 after installing OpenSSL 3.5+ and setting `OPENSSL_ROOT_DIR`:
+Build H2/H3 and create a demonstration certificate (the `openssl` command line only generates the certificate; it is not linked):
 
 ```bash
-python3 -m pip install -r requirements-build.txt
-python3 -m forgedeps init /path/to/shared-workspace
 python3 scripts/build.py --build-dir build/protocols --tls --http2 --http3
-cmake --build build/protocols -j
-ctest --test-dir build/protocols --output-on-failure
-"$OPENSSL_ROOT_DIR/bin/openssl" req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 2 -subj /CN=localhost -addext subjectAltName=DNS:localhost
+openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 2 -subj /CN=localhost -addext subjectAltName=DNS:localhost
 ```
 
 The final command creates a local demonstration certificate only. The client verifies that CA and `localhost`; verification is never disabled. H3 can be enabled independently of H2/nghttp2. All pairs have out-of-process smoke tests; independent curl interoperability is tracked separately from Mira-to-Mira testing.
@@ -319,9 +314,11 @@ target_link_libraries(my_app PRIVATE Mira::transport Mira::http)
 # TLS: also set(MIRA_ENABLE_TLS ON) and link Mira::tls
 ```
 
+Source builds with any optional module fetch dependencies through ForgeDeps as well: the Python 3.14+ interpreter that CMake finds must have `requirements-build.txt` installed, or set `FORGEDEPS_PYTHON_EXECUTABLE` to one that does.
+
 Installed consumers use `find_package(Mira REQUIRED COMPONENTS core transport http)`; add the `tls` component for TLS. Keep the exact dependency version in the consuming application's lock file, as described in the shared guide.
 
-Owning-client composition uses `find_package(Mira REQUIRED COMPONENTS client)` / `Mira::client`; HTTPS uses `client_tls` / `Mira::client_tls` and requires `MIRA_ENABLE_TLS=ON` when building. The base `client` target does not introduce OpenSSL; `http` itself still does not depend on transport. Protocol components `socks`, `dns` and `mqtt` map to `Mira::socks`, `Mira::dns` and `Mira::mqtt`; none introduces OpenSSL, and TLS is composed by the caller.
+Owning-client composition uses `find_package(Mira REQUIRED COMPONENTS client)` / `Mira::client`; HTTPS uses `client_tls` / `Mira::client_tls` and requires `MIRA_ENABLE_TLS=ON` when building. The base `client` target does not introduce OpenSSL; `http` itself still does not depend on transport. Protocol components `socks`, `dns` and `mqtt` map to `Mira::socks`, `Mira::dns` and `Mira::mqtt`; none introduces OpenSSL, and TLS is composed by the caller. The `dnssec` component maps to `Mira::dnssec` and requires `MIRA_ENABLE_DNSSEC=ON`.
 
 Android requires **NDK r30 or newer**: NDK 27/28's libc++ gates `std::stop_token` off; r30 is the current LTS and builds on API 24 as tested.
 
@@ -331,17 +328,19 @@ Android requires **NDK r30 or newer**: NDK 27/28's libc++ gates `std::stop_token
 - **QUIC Retry / source-address validation**: pass `RetryOptions{.policy = RetryPolicy::required}` to `http3::make_server` / `quic::Listener::create`. No connection or admission budget is allocated before token verification. Tokens use ngtcp2's AEAD, binding peer address/port, version, Retry CID, service scope and local endpoint. Expired, future, tampered or changed-source tokens are dropped silently. Keys default to instance-random and can be rotated with one previous key retained. Send or discard `ingest().reply` immediately; there is no internal Retry queue. The default limit is 128 replies per listener per fixed one-second window; adjacent windows can permit a burst of 256. This is not a sliding-second bound, full DDoS protection or one-time/replay protection. The policy defaults to disabled; public endpoints must explicitly select required. Shared keys require matching scope, local endpoint, ALPN and monotonic clock epoch.
 - **Streaming H2/H3 output**: `request_stream` / `respond_stream` → `write_body` → `finish_body`. Exhaustion returns `would_block` without failing the connection. H3 chunks survive until ACK; QUIC bidirectional streams rotate to prevent starvation.
 - **Connection lifecycle**: `client::HttpClient` / `HttpsClient` compose resolution, `tcp::dial` and bounded per-origin pools; client instances and fixed TLS configurations remain isolated. `Session::recycle()` requires a fully drained reusable response and no retained session tasks, otherwise it fails. Destruction discards by default; business requests are never replayed automatically, and `tcp::connect_with_retry` retries establishment only. `tcp::serve(loop, ...)` stops admission and closes the listener, allows a `grace_period` drain, then cooperatively cancels and joins. Grace bounds when cancellation is requested, not when an uncooperative handler returns.
-- **WebSocket/WSS**: `MIRA_ENABLE_WEBSOCKET=ON` builds `Mira::ws` with OpenSSL Crypto-backed nonce/masking/RFC6455 handshake support and zlib. Fragmentation, incremental UTF-8, ping/pong/close, limits and independent peers are tested. TCP and TLS/WSS support one concurrent read and write on the same event loop; handshake/shutdown remain exclusive. Each TLS request owns its deadline timer. Cancellation/timeouts permanently invalidate the session and wake its companion, never replay ciphertext after cancellation. `Stream::create` takes the event loop explicitly; `close()` stops the wrapper without owning the transport. Optional subprotocol negotiation and permessage-deflate also compose over explicitly negotiated H2/H3 Extended CONNECT. Tunnel adapters have a different concurrency contract from TCP/TLS duplex, detailed below.
+- **WebSocket/WSS**: `MIRA_ENABLE_WEBSOCKET=ON` builds `Mira::ws` with OpenSSL Crypto-backed nonce/masking/RFC6455 handshake support and zlib. Fragmentation, incremental UTF-8, ping/pong/close, limits and independent peers are tested. TCP and TLS/WSS support one concurrent read and write on the same event loop; handshake/shutdown remain exclusive. Each TLS request owns its deadline timer. Cancellation/timeouts permanently invalidate the session and wake its companion, never replay ciphertext after cancellation. `Stream::create` takes the event loop explicitly; `close()` stops the wrapper without owning the transport. Optional subprotocol negotiation and permessage-deflate also compose over explicitly negotiated H2/H3 Extended CONNECT. Tunnel adapters have a different concurrency contract from TCP/TLS duplex, detailed below. When the reader's automatic Pong/Close is blocked by back-pressure, an application `send()` waits for it; the waiting send can be cancelled or time out without interrupting that reply. Two concurrent application writers are still rejected.
 - **SSE / local streams**: `mira_sse_server` demonstrates chunked SSE, IDs and Last-Event-ID resume. `transport::local` provides POSIX filesystem Unix-domain streams; Windows explicitly returns `not_supported`. Caller-owned paths are never automatically removed.
-- **HTTP/3 0-RTT**: both ends opt in with `EarlyDataPolicy::replay_safe`. A client holding a ticket is `early_ready()` at creation and sends GET/HEAD/OPTIONS whole-body requests in 0-RTT; a server that accepts answers in 0.5-RTT before the handshake completes, measured as one round trip. When the server rejects, TLS guarantees it processed no early data, and the engine resubmits the safe requests in order on the same stream IDs, so callers see one normal response. Early requests are flagged `early_data` on their event; unsafe methods are answered `425 Too Early` by the engine and never surfaced. `early_data_context` binds each ticket domain to the server's SETTINGS, and a server with different SETTINGS cannot be created. There is no anti-replay store; see below.
+- **HTTP/3 0-RTT**: both ends opt in with `EarlyDataPolicy::replay_safe`. A client holding a ticket is `early_ready()` at creation and sends GET/HEAD/OPTIONS whole-body requests in 0-RTT; a server that accepts answers in 0.5-RTT before the handshake completes, measured as one round trip. When the server rejects, TLS guarantees it processed no early data, and the engine resubmits the safe requests in order on the same stream IDs, so callers see one normal response. Early requests are flagged `early_data` on their event; unsafe methods are answered `425 Too Early` by the engine and never surfaced. `early_data_context` binds each ticket domain to the server's SETTINGS, and a server with different SETTINGS cannot be created. A bounded `MemoryReplayStore` or an injected atomic claim store can be shared explicitly; by default the application must still be replay-safe, detailed below.
 - **HTTP/1 `Expect: 100-continue` and duplex uploads**: `ClientConnection::exchange` uploads while reading 1xx/final responses. It waits for 100, a final response or `continue_timeout`; a >= 300 or closing response mid-upload withholds the rest of the body, while an early 2xx that keeps the connection lets the upload finish. An in-flight write is never cancelled for an early response (on TLS that would destroy the session). The server answers 100 eagerly for buffered handlers and on first read for streaming ones, closes instead of draining a refused body, and answers unknown expectations with 417.
 - **SOCKS5 / DoH**: `Mira::socks` gives CONNECT clients and proxies RFC 1929 authentication and strict address handling, and `client::dial_via_socks5` spans dial and handshake with one deadline. `Mira::dns` decodes DNS messages treating every byte as hostile, maps DoH GET/POST in both directions, and `doh::query` runs over HTTP/1 on TLS. The examples interoperate with curl and independent Python peers.
-- **MQTT 3.1.1 / 5.0**: the codec covers all fifteen packet types in both roles and never emits bytes its own decoder would reject. The socket-free `Session` implements QoS 1/2 in both directions, CONNACK limits, inbound topic aliases, PINGRESP supervision, enhanced authentication and ordered resumption resend. `Client<Stream>` borrows the caller's stream, runs one reader beside serialized writers, and makes `keep_alive(loop)` a timer-driven writer instead of relying on read timeouts that would destroy a TLS session. `mira_mqtt_client` interoperates with an independent Python broker and mosquitto; CI requires the mosquitto cases and fuzzes the codec.
+- **File sending**: `tcp::Socket::send_file` prefers Linux/macOS `sendfile` and Windows `TransmitFile`, falling back to bounded copies of `chunk_size`; `TransferMode::require_native` never copies silently. `TransferResult` reports native and copied bytes separately; that records which API ran, not that the kernel avoided every copy. Files over 4 GiB, cancellation and deadlines are covered. An error or cancellation may follow partial wire output, so close the connection instead of resending the region.
+- **TLS 1.3 early data over TCP**: off by default. A server that sets `early_data = EarlyDataPolicy::replay_safe` must supply a `replay_store` and cannot combine it with mTLS or CRLs. A client holding a resumable session ticket submits up to 16 KiB with `handshake_early_data`; `early_data_status()` reports acceptance or rejection, and a payload that was not accepted is sent as ordinary data once the handshake completes. TLS does not parse the application protocol: the application guarantees that the payload may run twice.
+- **HTTP client redirects and state**: `request_with_redirects` drives `HttpClient` / `HttpsClient` through 301/302/303/307/308 with fetch-standard method rewriting, bounding the chain by `max_redirects` only. Cross-origin hops drop credentials and cookies; a change of scheme stops and reports the target. `RedirectOptions::state` attaches a `RequestState` with bounded cookies and a response cache, matched per hop; the default is stateless.
+- **DNSSEC**: `MIRA_ENABLE_DNSSEC=ON` builds `Mira::dnssec` for optional, locally validated DNSSEC queries (OpenSSL Crypto); evidence TTLs age while keys and proofs are fetched asynchronously.
+- **MQTT 3.1.1 / 5.0**: the codec covers all fifteen packet types in both roles and never emits bytes its own decoder would reject. The socket-free `Session` implements QoS 1/2 in both directions, CONNACK limits, inbound and outbound topic aliases, PINGRESP supervision, enhanced authentication and ordered resumption resend. `Client<Stream>` borrows the caller's stream, runs one reader beside serialized writers, and makes `keep_alive(loop)` a timer-driven writer instead of relying on read timeouts that would destroy a TLS session. `mira_mqtt_client` interoperates with an independent Python broker and mosquitto; CI requires the mosquitto cases and fuzzes the codec.
 
 ```bash
-cmake -S . -B build/ws -DMIRA_ENABLE_WEBSOCKET=ON -DMIRA_ENABLE_TLS=ON
-cmake --build build/ws -j
-ctest --test-dir build/ws --output-on-failure
+python3 scripts/build.py --build-dir build/ws --tls --websocket
 # Two terminals: mira_ws_server 8080 / mira_ws_client 8080
 # SSE: mira_sse_server 8081; client GET /events
 # Multi-client H3 + Retry: mira_h3_multi_server cert.pem key.pem 8443 --retry
@@ -352,9 +351,9 @@ ctest --test-dir build/ws --output-on-failure
 
 Real network benchmark: `python3 scripts/bench/network_bench.py --server build/release/mira_managed_echo_server --clients 8 --requests 1000 --slow-clients 4` emits throughput, p50/p99, sampled peak RSS and environment JSON. The independent Python socket load generator uses loopback; these are neither cross-library rankings nor WAN measurements.
 
-### Additional production composition (main, not separately released)
+### Additional production composition
 
-- **Concurrent H2/H3**: `SessionDriver` owns independent read/write tasks and QUIC expiry processing; `ClientSession` provides bounded concurrent requests. Owning per-origin `client::Http2Client` / `Http3Client` pools are consumed through `Mira::client_http2` / `client_http3`; H2 strictly requires ALPN=h2 and H3 uses fixed-peer 1-RTT setup. They never automatically replay a business request. `client::Http2Client` / `Http3Client` own per-origin transport/security/session objects, coalesce connection establishment and enforce `max_origins` / `max_active`; link `Mira::client_http2` / `Mira::client_http3`. No implicit protocol downgrade or business-request replay. Per-stream cancellation does not cancel shared TLS reads. `ConnectStream` with this driver allows one read and one write concurrently; legacy custom drivers retain exclusive operation semantics. Finish business tasks, then stop/join before destruction.
+- **Concurrent H2/H3**: `SessionDriver` owns independent read/write tasks and QUIC expiry processing; `ClientSession` provides bounded concurrent requests. Owning per-origin `client::Http2Client` / `Http3Client` pools own their transport/security/session objects, coalesce connection establishment and enforce `max_origins` / `max_active`; link `Mira::client_http2` / `Mira::client_http3`. H2 strictly requires ALPN=h2 and H3 uses fixed-peer 1-RTT setup, with no implicit protocol downgrade or business-request replay. A connection that can no longer open streams (peer GOAWAY, transport failure or an application exception) is retired and the next request dials a fresh one; streams accepted before GOAWAY finish on their original session, and a dead origin no longer holds quota from other origins. Per-stream cancellation does not cancel shared TLS reads. `ConnectStream` with this driver allows one read and one write concurrently; legacy custom drivers retain exclusive operation semantics. Finish business tasks, then stop/join before destruction.
 - **TLS**: exact SNI identity routing, mTLS plus multi-ALPN configuration, and atomic `reload_server` snapshots. Ticket scopes are isolated per identity and configuration generation. Local CRLs, OCSP stapling and explicit client validation require no online fetching. OpenSSL default trust is not native Keychain/Windows policy.
 - **DNS/UDP**: bounded resolver policy caching and in-flight coalescing; `dns::query_udp/query_tcp` perform explicit, thread-free dedicated-connection queries. TCP fallback remains caller composition. UDP adds ASM multicast and POSIX ancillary/source selection; nonempty Windows ancillary options fail explicitly.
 - **QUIC**: configurable PMTUD, UDP ceiling and Cubic/Reno/BBR; RFC 9221 DATAGRAMs (not H3 DATAGRAM/WebTransport), bounded lossy receive queues, qlog and statistics. Optional atomic `ReplayStore` admission has an in-process bounded implementation that never evicts live entries; all ticket-domain users must share it. It is not a distributed or restart-persistent store.
@@ -363,7 +362,7 @@ Real network benchmark: `python3 scripts/bench/network_bench.py --server build/r
 
 Independent aioquic-client to Mira-server loopback checks cover authenticated H3, accepted/rejected early data and WebSocket Extended CONNECT. Reproduce with `scripts/ci/check_h3_aioquic.py`. A 30-minute, 16-client fault-soak snapshot completed 116,480/116,480 requests, 87,360 short streams during slow-response overlap, and zero final resource counters. This evidence is configuration-specific, not WAN certification or a universal performance ranking.
 
-### Main-branch API boundaries
+### API boundaries
 
 - **QUIC paths and early data**: validated mode requires path-aware `receive` plus `poll_datagram` / `close_datagram`. Clients call `initiate_migration()`; applications retain both paths during validation and send on the returned path. A CID match is not address validation. The bounded in-memory `SessionCache` limits entries, bytes, ticket size and lifetime; `ServerContext` explicitly shares the server ticket domain. Ordinary `open_stream` / `write` never send early data. Only `EarlyDataPolicy::replay_safe` plus `open_early_stream` / `write_early` attempt raw QUIC 0-RTT. Callers must make operations replay-safe. Default early data has no anti-replay guarantee; explicit shared `ReplayStore` scope is described below. The raw QUIC layer never replays rejected data automatically. HTTP/3 0-RTT has its own contract, described below.
 - **Dialing and uploads**: `tcp::dial` deduplicates resolved endpoints, interleaves IPv4/IPv6 and staggers bounded concurrent attempts within one deadline; losers are cancelled and joined before return. System `getaddrinfo` still runs in bounded workers, not independent asynchronous A/AAAA queries. HTTP/1 `begin` → `send_body` → `finish` supports content-length/chunked uploads, per-chunk backpressure and one budget covering upload, producer pauses and response. That trio is **send-first**; for `Expect: 100-continue` or reading an early response during the upload use the duplex `exchange`, which needs a stream allowing one read and one write in flight (Mira TCP/TLS/local streams do). A peer that neither reads nor closes is still bounded by the deadline or stop.
@@ -425,7 +424,7 @@ auto events = co_await client->receive();                 // messages, publish c
 // keep_alive(loop) is a timer-driven writer: run it beside receive on the same loop, safe over TLS
 ```
 
-The caller owns the stream and destroys it after the client; the client never closes it. Exceeding the server's Receive Maximum, running out of packet identifiers or filling the output budget returns `would_block`; nothing is queued invisibly. Peer violations close the session with a 5.0 DISCONNECT carrying the reason. Received QoS 1 messages are acknowledged when surfaced. After a transport loss, `reconnect` on a new stream: with `clean_start = false` and a session the server still holds, unacknowledged PUBLISH (DUP) and PUBREL are resent in original order; otherwise they are reported as `discarded` events. `ws::ByteStream` adapts an already-negotiated binary WebSocket (`mqtt` subprotocol) into a bounded stream for `mqtt::Client`. Session and Client `checkpoint/restore` preserve QoS 1/2 in-flight state and incoming QoS 2 release identifiers, bound to caller-declared broker/tenant scope, client ID and protocol version. Client snapshots refuse undelivered events or pending I/O. Atomic storage, confidentiality and elapsed time belong to the caller; snapshots are not a write-ahead log or business exactly-once. A broker, outbound topic aliases and automatic reconnect policy remain out of scope.
+The caller owns the stream and destroys it after the client; the client never closes it. Exceeding the server's Receive Maximum, running out of packet identifiers or filling the output budget returns `would_block`; nothing is queued invisibly. Peer violations close the session with a 5.0 DISCONNECT carrying the reason. Received QoS 1 messages are acknowledged when surfaced. After a transport loss, `reconnect` on a new stream: with `clean_start = false` and a session the server still holds, unacknowledged PUBLISH (DUP) and PUBREL are resent in original order; otherwise they are reported as `discarded` events. `ws::ByteStream` adapts an already-negotiated binary WebSocket (`mqtt` subprotocol) into a bounded stream for `mqtt::Client`. Session and Client `checkpoint/restore` preserve QoS 1/2 in-flight state and incoming QoS 2 release identifiers, bound to caller-declared broker/tenant scope, client ID and protocol version. Client snapshots refuse undelivered events or pending I/O. Atomic storage, confidentiality and elapsed time belong to the caller; snapshots are not a write-ahead log or business exactly-once. Outbound topic aliases are off by default; `outbound_topic_alias_maximum` enables per-connection LRU assignment that resets on reconnect. A broker and automatic reconnect policy remain out of scope.
 
 ### Real UDP Retry fault validation
 
