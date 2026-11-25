@@ -6,6 +6,8 @@ records; they are not additional definitions of the current build version.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-25
+
 ### Fixed
 
 - Only committed bytes of `Buffer` are readable. Consuming the readable prefix
