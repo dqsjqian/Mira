@@ -135,6 +135,7 @@ public:
 private:
     enum class State {
         start_line,
+        after_leading_crlf,
         headers,
         body_length,
         body_chunk_header,

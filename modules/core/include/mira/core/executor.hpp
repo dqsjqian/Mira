@@ -25,6 +25,8 @@
 
 namespace Mira {
 
+class EventLoop;
+
 namespace detail {
 
 /// The exact callable `schedule_on` posts: a coroutine handle wrapped in a
@@ -98,7 +100,11 @@ template<Executor E>
         E& target_;
     };
 
-    return Awaiter{executor};
+    if constexpr (std::same_as<E, EventLoop>) {
+        return typename E::Hop{executor}; // shutdown reports cancellation, never strands a frame
+    } else {
+        return Awaiter{executor};
+    }
 }
 
 }  // namespace Mira

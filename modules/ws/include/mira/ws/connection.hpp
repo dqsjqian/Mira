@@ -81,16 +81,22 @@ public:
             return fail(make_error_code(Errc::invalid_handshake));
         Guard guard{*this};
         auto configured = configure_extensions(negotiated);
-        if (!configured) return terminate(configured.error());
+        if (!configured) return guard.finish(terminate(configured.error()));
         negotiated_ = std::move(negotiated);
         ready_ = true;
-        return {};
+        return guard.finish(Result<void>{});
     }
 
     Task<Result<void>> handshake(std::string host = {}, std::string target = "/",
                                   OperationOptions options = {}) {
         if (busy_ || ready_ || failed_) co_return fail(Mira::Errc::invalid_argument);
         Guard guard{*this};
+        co_return guard.finish(co_await handshake_locked(host, target, options));
+    }
+
+private:
+    Task<Result<void>> handshake_locked(const std::string& host, const std::string& target,
+                                        OperationOptions options) {
         auto checked = check_options(options);
         if (!checked) co_return checked;
         std::string key;
@@ -108,10 +114,16 @@ public:
         std::string head;
         while (!head.ends_with("\r\n\r\n")) {
             if (head.size() == limits_.max_handshake) co_return terminate(make_error_code(Mira::Errc::limit_exceeded));
-            std::array<std::byte, 1> byte{};
-            auto n = co_await read_bytes(byte, options);
+            auto n = co_await read_bytes(buffer_, options);
             if (!n) co_return fail(n.error());
-            head.push_back(static_cast<char>(std::to_integer<unsigned char>(byte[0])));
+            end_ = *n;
+            begin_ = 0;
+            // Scan each received byte once. Retain read-ahead in buffer_ for
+            // the first frame, including when the delimiter straddles reads.
+            while (begin_ < end_ && head.size() < limits_.max_handshake) {
+                head.push_back(static_cast<char>(std::to_integer<unsigned char>(buffer_[begin_++])));
+                if (head.ends_with("\r\n\r\n")) break;
+            }
         }
         if (role_ == Role::server) {
             auto response = negotiate_server_handshake(head, handshake_options_, limits_);
@@ -132,6 +144,7 @@ public:
         co_return Result<void>{};
     }
 
+public:
     Task<Result<void>> send(Frame frame, OperationOptions options = {}) {
         if (busy_ || (writing_ && !replying_) || write_waiter_ || bounded_waiter_)
             co_return fail(Mira::Errc::invalid_argument);
@@ -161,14 +174,14 @@ public:
         }
         DirectionGuard guard{*this, writing_};
         auto sent = co_await send_locked(frame, options);
-        if (!sent) co_return sent;
-        co_return co_await flush_control(options);
+        if (!sent) co_return guard.finish(sent);
+        co_return guard.finish(co_await flush_control(options));
     }
 
     Task<Result<Frame>> read_frame(OperationOptions options = {}) {
         if (busy_ || reading_) co_return fail(Mira::Errc::invalid_argument);
         DirectionGuard guard{*this, reading_};
-        co_return co_await read_locked(options);
+        co_return guard.finish(co_await read_locked(options));
     }
 
     Task<Result<Frame>> read_message(OperationOptions options = {}) {
@@ -180,17 +193,17 @@ public:
             auto frame = co_await read_locked(options);
             if (!frame) {
                 if (started) static_cast<void>(terminate(frame.error()));
-                co_return fail(frame.error());
+                co_return guard.finish(fail(frame.error()));
             }
-            if (frame->opcode == Opcode::close) co_return std::move(*frame);
+            if (frame->opcode == Opcode::close) co_return guard.finish(std::move(*frame));
             if (frame->opcode == Opcode::ping || frame->opcode == Opcode::pong) continue;
             if (!started) { message.opcode = frame->opcode; started = true; }
             if (frame->payload.size() > limits_.max_message - message.payload.size()) {
                 static_cast<void>(terminate(make_error_code(Mira::Errc::limit_exceeded)));
-                co_return fail(Mira::Errc::limit_exceeded);
+                co_return guard.finish(fail(Mira::Errc::limit_exceeded));
             }
             message.payload.insert(message.payload.end(), frame->payload.begin(), frame->payload.end());
-            if (frame->final) co_return message;
+            if (frame->final) co_return guard.finish(std::move(message));
         }
     }
 
@@ -198,50 +211,53 @@ public:
     Task<Result<void>> close(std::uint16_t code = 1000, OperationOptions options = {}) {
         if (busy_ || reading_ || writing_ || bounded_waiter_) co_return fail(Mira::Errc::invalid_argument);
         Guard guard{*this};
-        if (failed_) co_return fail(make_error_code(Errc::closed));
+        if (failed_) co_return guard.finish(fail(make_error_code(Errc::closed)));
         if (!close_sent_) {
             auto payload = close_payload(code);
-            if (!payload) co_return fail(payload.error());
+            if (!payload) co_return guard.finish(fail(payload.error()));
             Frame frame{Opcode::close, true, std::move(*payload)};
             auto sent = co_await send_locked(frame, options);
-            if (!sent) co_return sent;
+            if (!sent) co_return guard.finish(sent);
         }
         while (!close_received_) {
             auto frame = co_await read_locked(options);
-            if (!frame) co_return fail(frame.error());
+            if (!frame) co_return guard.finish(fail(frame.error()));
         }
-        co_return Result<void>{};
+        co_return guard.finish(Result<void>{});
     }
 
 private:
-    struct Guard {
+    // A resumption can occur inside another stack's exception unwinding.
+    // Only a return from this operation can tell the guard it did not throw.
+    struct OperationExit {
+        bool returned = false;
+        template<class T> T finish(T result) { returned = true; return result; }
+    };
+    struct Guard : OperationExit {
         Connection& owner;
-        int exceptions = std::uncaught_exceptions();
         explicit Guard(Connection& value) : owner(value) { owner.busy_ = true; }
         ~Guard() {
             owner.busy_ = false;
-            if (std::uncaught_exceptions() > exceptions) owner.fail_exception();
+            if (!this->returned) owner.fail_exception();
         }
     };
-    struct DirectionGuard {
+    struct DirectionGuard : OperationExit {
         Connection& owner;
         bool& flag;
-        int exceptions = std::uncaught_exceptions();
         DirectionGuard(Connection& value, bool& direction) : owner(value), flag(direction) { flag = true; }
         ~DirectionGuard() {
             flag = false;
-            if (std::uncaught_exceptions() > exceptions) owner.fail_exception();
+            if (!this->returned) owner.fail_exception();
         }
     };
     // No-options sends take over inline. Bounded sends wake via the loop's
     // timer, where both external cancellation and deadlines are delivered.
-    struct ReplyGuard {
+    struct ReplyGuard : OperationExit {
         Connection& owner;
-        int exceptions = std::uncaught_exceptions();
         explicit ReplyGuard(Connection& value) : owner(value) { owner.writing_ = owner.replying_ = true; }
         ~ReplyGuard() {
             owner.writing_ = owner.replying_ = false;
-            if (std::uncaught_exceptions() > exceptions) owner.fail_exception();
+            if (!this->returned) owner.fail_exception();
             if (owner.bounded_waiter_) owner.bounded_waiter_->request_stop();
             else if (auto waiter = std::exchange(owner.write_waiter_, {})) waiter.resume();
         }
@@ -282,8 +298,8 @@ private:
         }
         ReplyGuard guard{*this};
         auto sent = co_await send_locked(frame, options, true);
-        if (!sent) co_return sent;
-        co_return co_await flush_control(options);
+        if (!sent) co_return guard.finish(sent);
+        co_return guard.finish(co_await flush_control(options));
     }
     Result<void> configure_extensions(const Negotiated& negotiated) {
         if (!negotiated.compression.enabled) return {};
@@ -419,7 +435,7 @@ private:
                         // Fail before the guard hands the direction to a
                         // queued send(), which must then observe the closure.
                         static_cast<void>(terminate(error));
-                        co_return fail(error);
+                        co_return writer.finish(fail(error));
                     }
                 }
                 static_cast<void>(terminate(error));

@@ -487,6 +487,10 @@ void test_line_ending_strictness() {
 
 void test_start_line_strictness() {
     test::section("start line strictness");
+    constexpr std::string_view leading = "\r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    CHECK(parse_all(leading).complete);
+    CHECK(parse_byte_by_byte(leading).complete);
+    CHECK(!parse_all("\r\n\r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n").ok);
 
     CHECK(!parse_all("GET\r\n\r\n").ok);                   // no target or version
     CHECK(!parse_all("GET /\r\n\r\n").ok);                 // no version

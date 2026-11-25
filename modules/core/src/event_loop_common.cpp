@@ -94,6 +94,7 @@ RootTask run_root(Task<void> task) {
 Result<void> EventLoop::run_until_complete(Task<void> task) {
     RootTask root = run_root(std::move(task));
     root.start();
+    std::exception_ptr post_failure;
 
     while (!root.finished()) {
         // Checked *before* pumping, because pumping blocks until something
@@ -111,9 +112,10 @@ Result<void> EventLoop::run_until_complete(Task<void> task) {
 
         // A failure here may still have delivered the completion that finished
         // the task, so the outcome is checked before the error is acted on.
-        Result<void> pumped = run_once();
+        Result<void> pumped = pump_once(Duration::min(), &post_failure);
         if (root.finished()) {
             root.rethrow_if_failed();
+            if (post_failure) std::rethrow_exception(post_failure);
             return pumped;
         }
         if (!pumped) {

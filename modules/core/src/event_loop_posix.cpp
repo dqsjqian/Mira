@@ -134,7 +134,7 @@ public:
         if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
         const detail::DispatchScope dispatching{dispatch_depth_};
 
-        std::vector<move_only_function<void()>> discarded_work;
+        std::vector<detail::PostedWork> discarded_work;
         {
             const std::lock_guard lock{mutex_};
             posted_.drain_into(discarded_work);
@@ -155,6 +155,7 @@ public:
             }
             finalize(id, fail(Errc::cancelled));
         }
+        detail::cancel_posts(discarded_work);
     }
 
     // ── handle registration ─────────────────────────────────────────────────
@@ -185,9 +186,8 @@ public:
     }
 
     void detach(int fd) noexcept {
-        // `detach` runs on the loop thread, but `acquire_datagram`/
-        // `release_datagram` may run on a foreign thread (see their comment),
-        // so this table access takes the lock like every other one.
+        // Update under the same lock as acquisition and cancellation. Public
+        // I/O and detach stay loop-affine; only scheduling and stop cross threads.
         {
             const std::lock_guard lock{mutex_};
             if (auto it = datagrams_.find(fd); it != datagrams_.end()) {
@@ -203,11 +203,8 @@ public:
 
     // The slot covers the whole retry loop; it is not released early on a
     // readiness notification.
-    // Held under `mutex_`, same as `add_waiter`/`add_timer`: a coroutine that
-    // migrated to another thread via `schedule_on` may call `receive_from`
-    // off the loop thread, and the loop thread can be inside `detach` at the
-    // same moment. The rest of the submission paths tolerate cross-thread
-    // callers; this table must not be the exception.
+    // Use the same lock as the rest of the operation table. This defensive
+    // synchronization does not relax EventLoop's thread-affinity contract.
     std::shared_ptr<bool> acquire_datagram(int fd, bool writing) {
         const std::lock_guard lock{mutex_};
         auto& slot = datagrams_[fd][writing ? 1U : 0U];
@@ -354,11 +351,11 @@ public:
         wake_from_submit();
     }
 
-    Result<void> post(move_only_function<void()> work) {
+    Result<void> post(move_only_function<void()> work, bool* cancelled = nullptr) {
         {
             const std::lock_guard lock{mutex_};
             if (shutting_down()) return fail(Errc::cancelled);
-            posted_.push(std::move(work));
+            posted_.push(std::move(work), cancelled);
         }
         wake_from_submit();
         return {};
@@ -386,7 +383,7 @@ public:
 
     // ── driving ─────────────────────────────────────────────────────────────
 
-    Result<void> run_once(Duration timeout) {
+    Result<void> run_once(Duration timeout, std::exception_ptr* deferred = nullptr) {
         if (shutting_down()) return fail(Errc::cancelled);
         if (dispatch_depth_ != 0) {
             detail::report_dispatch_violation("run_once re-entered from a resumed coroutine");
@@ -495,7 +492,6 @@ public:
                 }
             }
             posted_.drain_into(to_run);
-            wake_pending_.store(false, std::memory_order_release);
         }
 
         // Real completions, then deadlines, then cancellations — the order
@@ -507,6 +503,10 @@ public:
         Result<void> status{};
         if (wakeup_fired) {
             drain_wakeup();
+            // A producer before this reset is covered by the next queue/timer
+            // snapshot; one after it leaves a byte for the next poll. Clearing
+            // before draining could swallow a freshly published wake byte.
+            wake_pending_.store(false, std::memory_order_release);
             // Record the failure instead of returning here. Everything in
             // `resolved` and `to_run` has already been taken out of its queue
             // under the lock, so an early return would strand all of it:
@@ -548,7 +548,7 @@ public:
         for (const auto id : std::span(cancels).first(cancel_count)) {
             finalize(id, fail(Errc::cancelled));
         }
-        detail::dispatch_posts(to_run);
+        detail::dispatch_posts(to_run, deferred);
 
         return status;
     }
@@ -725,7 +725,7 @@ private:
     std::size_t pending_cancels_{0};
 
     // Swapped with the producer queue without allocating while dispatching.
-    std::vector<move_only_function<void()>> to_run_{};
+    std::vector<detail::PostedWork> to_run_{};
     detail::OperationId next_id_{detail::kNoOperation};
 
     /// Non-zero while a batch is being delivered. Loop thread only, which is
@@ -801,7 +801,10 @@ void EventLoop::detach(NativeHandle handle) {
 }
 
 void EventLoop::post(move_only_function<void()> work) {
-    (void)impl_->post(std::move(work));
+    if (impl_) (void)impl_->post(std::move(work));
+}
+bool EventLoop::post_hop(std::coroutine_handle<> handle, bool* cancelled) {
+    return impl_ && impl_->post([handle] { handle.resume(); }, cancelled).has_value();
 }
 
 Result<void> EventLoop::try_post(move_only_function<void()> work,
@@ -820,8 +823,10 @@ bool EventLoop::stopped() const noexcept {
 std::size_t EventLoop::outstanding() const noexcept {
     return impl_->outstanding();
 }
-Result<void> EventLoop::run_once(Duration timeout) {
-    return impl_->run_once(timeout);
+Result<void> EventLoop::run_once(Duration timeout) { return pump_once(timeout, nullptr); }
+
+Result<void> EventLoop::pump_once(Duration timeout, std::exception_ptr* deferred) {
+    return impl_->run_once(timeout, deferred);
 }
 
 Result<void> EventLoop::run() {

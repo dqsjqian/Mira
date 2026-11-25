@@ -1860,6 +1860,19 @@ void test_run_until_complete() {
     CHECK(loop.run_until_complete(root_returns_without_suspending(ran)).has_value());
     CHECK(ran == 3);
 
+    // A posted failure is independent of the root's lifetime: even when it
+    // fires in an earlier pass the root must finish before returning to main.
+    bool drained = false;
+    auto post_and_wait = [&]() -> Task<void> {
+        loop.post([] { throw std::logic_error("posted failure"); });
+        co_await loop.yield();
+        co_await loop.yield();
+        drained = true;
+    };
+    CHECK_THROWS(loop.run_until_complete(post_and_wait()), std::logic_error);
+    CHECK(drained);
+    CHECK(loop.outstanding() == 0);
+
     CHECK_THROWS(loop.run_until_complete(Task<void>{}), std::logic_error);
     const auto immediate_failure = []() -> Task<void> {
         throw std::runtime_error("immediate root failure");

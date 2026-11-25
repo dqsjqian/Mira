@@ -276,7 +276,7 @@ public:
             }
             finalize(id, fail(reason));
         }
-        discarded_work.clear();
+        detail::cancel_posts(discarded_work);
 
         if (port_ != nullptr) {
             ::CloseHandle(std::exchange(port_, nullptr));
@@ -691,13 +691,13 @@ public:
         }
     }
 
-    [[nodiscard]] Result<void> post(move_only_function<void()> work) {
+    [[nodiscard]] Result<void> post(move_only_function<void()> work, bool* cancelled = nullptr) {
         {
             const std::lock_guard lock{mutex_};
             if (shutting_down()) {
                 return fail(Errc::cancelled);
             }
-            posted_.push(std::move(work));
+            posted_.push(std::move(work), cancelled);
         }
         wake_from_submit();
         return Result<void>{};
@@ -721,7 +721,7 @@ public:
 
     // ── driving ─────────────────────────────────────────────────────────────
 
-    Result<void> run_once(Duration timeout) {
+    Result<void> run_once(Duration timeout, std::exception_ptr* deferred = nullptr) {
         if (shutting_down()) {
             return fail(Errc::cancelled);
         }
@@ -842,7 +842,7 @@ public:
             // Only timers reach this queue; kernel I/O waits for its packet.
             if (const auto fixed = fixed_reason_of(id)) finalize(id, fail(*fixed));
         }
-        detail::dispatch_posts(to_run);
+        detail::dispatch_posts(to_run, deferred);
 
         return Result<void>{};
     }
@@ -1127,7 +1127,7 @@ private:
     std::atomic<int> dispatch_depth_{0};
 
     // Swapped with producer queues without allocating while dispatching.
-    std::vector<move_only_function<void()>> to_run_{};
+    std::vector<detail::PostedWork> to_run_{};
 
     LPFN_ACCEPTEX accept_ex_{nullptr};
     LPFN_CONNECTEX connect_ex_{nullptr};
@@ -1187,7 +1187,10 @@ void EventLoop::detach(NativeHandle handle) {
 }
 
 void EventLoop::post(move_only_function<void()> work) {
-    (void)impl_->post(std::move(work));
+    if (impl_) (void)impl_->post(std::move(work));
+}
+bool EventLoop::post_hop(std::coroutine_handle<> handle, bool* cancelled) {
+    return impl_ && impl_->post([handle] { handle.resume(); }, cancelled).has_value();
 }
 
 Result<void> EventLoop::try_post(move_only_function<void()> work,
@@ -1206,8 +1209,10 @@ bool EventLoop::stopped() const noexcept {
 std::size_t EventLoop::outstanding() const noexcept {
     return impl_->outstanding();
 }
-Result<void> EventLoop::run_once(Duration timeout) {
-    return impl_->run_once(timeout);
+Result<void> EventLoop::run_once(Duration timeout) { return pump_once(timeout, nullptr); }
+
+Result<void> EventLoop::pump_once(Duration timeout, std::exception_ptr* deferred) {
+    return impl_->run_once(timeout, deferred);
 }
 
 Result<void> EventLoop::run() {

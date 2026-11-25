@@ -107,7 +107,7 @@ public:
                                            std::uint64_t size = 0, OperationOptions io = {}) {
         if (busy_ || active_ || !reusable_) co_return fail(Errc::invalid_argument);
         Guard guard{*this};
-        co_return co_await open(request, framing, size, std::move(io), Expectation::none);
+        co_return guard.finish(co_await open(request, framing, size, std::move(io), Expectation::none));
     }
 
     /// Duplex exchange: write the head, then upload the body pulled from `source`
@@ -138,7 +138,7 @@ public:
         const auto opened = co_await open(request, framing, size, std::move(io),
                                           upload.expect_continue ? Expectation::continue_100
                                                                  : Expectation::none);
-        if (!opened) co_return fail(opened.error());
+        if (!opened) co_return guard.finish(fail(opened.error()));
 
         Duplex duplex;
         // The caller's stop reaches every leg; each leg can also be cut alone.
@@ -166,16 +166,16 @@ public:
             std::rethrow_exception(exception);
         }
 
-        if (const auto error = budget_error(io_)) co_return invalidate(error);
+        if (const auto error = budget_error(io_)) co_return guard.finish(invalidate(error));
         if (!duplex.final_head) {
-            if (reader_cut) co_return invalidate(uploaded.error());
-            if (duplex.reader_error) co_return invalidate(duplex.reader_error);
-            co_return invalidate(uploaded ? make_error_code(Errc::invalid_argument)
-                                          : uploaded.error());
+            if (reader_cut) co_return guard.finish(invalidate(uploaded.error()));
+            if (duplex.reader_error) co_return guard.finish(invalidate(duplex.reader_error));
+            co_return guard.finish(invalidate(uploaded ? make_error_code(Errc::invalid_argument)
+                                                      : uploaded.error()));
         }
         // Only a failed stream write after the final head means the peer
         // closed on its refusal; producer and framing errors stay errors.
-        if (!uploaded && !duplex.write_failed) co_return invalidate(uploaded.error());
+        if (!uploaded && !duplex.write_failed) co_return guard.finish(invalidate(uploaded.error()));
         ExchangeResult result;
         result.continued = duplex.continued;
         result.body_sent = sent_;
@@ -188,7 +188,7 @@ public:
         }
         if (result.upload != UploadOutcome::complete) reusable_ = false;
         mark_response_reuse();
-        co_return result;
+        co_return guard.finish(result);
     }
 
     /// Duplex exchange of a borrowed contiguous body (content-length framing).
@@ -206,8 +206,8 @@ public:
         if (busy_ || !active_ || !uploading_) co_return fail(Errc::invalid_argument);
         Guard guard{*this};
         const auto result = co_await put_chunk(body, io_);
-        if (!result) co_return invalidate(result.error());
-        co_return Result<void>{};
+        if (!result) co_return guard.finish(invalidate(result.error()));
+        co_return guard.finish(Result<void>{});
     }
 
     /// Finish upload and read the final response head; incomplete fixed bodies fail with eof.
@@ -216,20 +216,20 @@ public:
         if (busy_ || !active_ || !uploading_) co_return fail(Errc::invalid_argument);
         Guard guard{*this};
         const auto ended = co_await end_body(io_);
-        if (!ended) co_return invalidate(ended.error());
+        if (!ended) co_return guard.finish(invalidate(ended.error()));
         uploading_ = false;
         std::size_t informational = 0;
         for (;;) {
             const auto step = co_await next(io_);
-            if (!step) co_return invalidate(step.error());
+            if (!step) co_return guard.finish(invalidate(step.error()));
             if (*step != ParseStep::head)
-                co_return invalidate(make_error_code(Errc::invalid_argument));
+                co_return guard.finish(invalidate(make_error_code(Errc::invalid_argument)));
             if (parser_.response().status >= 200) break;
             if (const auto skipped = skip_informational(informational); !skipped)
-                co_return invalidate(skipped.error());
+                co_return guard.finish(invalidate(skipped.error()));
         }
         mark_response_reuse();
-        co_return Result<void>{};
+        co_return guard.finish(Result<void>{});
     }
 
     /// Convenience for a borrowed contiguous body; the response must still be drained.
@@ -259,13 +259,13 @@ public:
         if (busy_ || !active_ || uploading_) co_return fail(Errc::invalid_argument);
         Guard guard{*this};
         const auto step = co_await next(io_);
-        if (!step) co_return invalidate(step.error());
-        if (*step == ParseStep::body) co_return parser_.body();
+        if (!step) co_return guard.finish(invalidate(step.error()));
+        if (*step == ParseStep::body) co_return guard.finish(parser_.body());
         if (*step != ParseStep::complete)
-            co_return invalidate(make_error_code(Errc::invalid_argument));
+            co_return guard.finish(invalidate(make_error_code(Errc::invalid_argument)));
         active_ = false;
         if (!input_.empty()) reusable_ = false;
-        co_return std::span<const std::byte>{};
+        co_return guard.finish(std::span<const std::byte>{});
     }
 
     /// Abandon an idle exchange; the caller must then close the stream. Rejects active I/O.
@@ -283,14 +283,17 @@ public:
 private:
     struct Guard {
         ClientConnection& owner;
-        int exceptions = std::uncaught_exceptions();
+        bool returned = false;
         explicit Guard(ClientConnection& value) : owner(value) { owner.busy_ = true; }
+        // A coroutine may resume inside an unrelated stack unwind. Record
+        // this operation's normal return, not the thread's exception count.
+        template<class T> T finish(T result) { returned = true; return result; }
         ~Guard() {
             owner.busy_ = false;
             // Streams and callbacks are permitted to throw. An interrupted
             // protocol operation cannot be resumed or recycled, but must still
             // leave the idle wrapper safe to destroy during stack unwinding.
-            if (std::uncaught_exceptions() > exceptions) {
+            if (!returned) {
                 owner.active_ = false;
                 owner.uploading_ = false;
                 owner.reusable_ = false;

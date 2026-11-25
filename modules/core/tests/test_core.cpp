@@ -412,6 +412,7 @@ void test_buffer() {
     // prepare/commit with a short read: only committed bytes become readable.
     std::span<std::byte> writable = buffer.prepare(64);
     CHECK(writable.size() == 64);
+    CHECK(to_string(buffer.readable()) == "HTTP/1.1\r\n");
     std::memcpy(writable.data(), "Host: x\r\n", 9);
     buffer.commit(9);
     CHECK(to_string(buffer.readable()) == "HTTP/1.1\r\nHost: x\r\n");
@@ -460,6 +461,23 @@ void test_buffer() {
     moved.prepare(1).front() = std::byte{'x'};
     moved.commit(1);
     CHECK(to_string(moved.readable()) == "x");
+
+    auto tail = moved.prepare(4);
+    moved.consume(99);  // consumes the committed prefix, not the writable span
+    CHECK(moved.empty());
+    std::memcpy(tail.data(), "next", 4);
+    moved.commit(3);
+    CHECK(to_string(moved.readable()) == "nex");
+    moved.append(moved.readable().subspan(1));
+    CHECK(to_string(moved.readable()) == "nexex");
+    moved.prepare(5).front() = std::byte{'!'};
+    moved.prepare(1).front() = std::byte{'?'};
+    Buffer copied = moved;
+    CHECK(to_string(copied.readable()) == "nexex");
+    copied.commit(1);
+    CHECK(to_string(copied.readable()) == "nexex?");
+    moved.commit(9);
+    CHECK(to_string(moved.readable()) == "nexex?");
 }
 
 void test_backend_numeric_limits() {

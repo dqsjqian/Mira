@@ -5,6 +5,8 @@
 #include "mira/transport/tcp.hpp"
 
 #include <array>
+#include <coroutine>
+#include <stdexcept>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -53,7 +55,36 @@ struct Script {
         co_return count;
     }
 };
+struct PausedHead : Script {
+    std::coroutine_handle<> resume{};
+    struct Gate {
+        PausedHead& owner;
+        bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> h) noexcept { owner.resume = h; }
+        void await_resume() const noexcept {}
+    };
+    Task<Result<std::size_t>> write_some(std::span<const std::byte> data, OperationOptions = {}) {
+        co_await Gate{*this};
+        co_return data.size();
+    }
+};
+Task<void> resume_during_unrelated_unwind() {
+    PausedHead transport;
+    transport.input = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    auto req = request();
+    ClientConnection client{transport};
+    TaskScope scope;
+    auto work = [&]() -> Task<void> { CHECK_VALUE(co_await client.start(req)); };
+    scope.spawn(work());
+    struct Release { std::coroutine_handle<> h; ~Release() { h.resume(); } };
+    try { Release release{transport.resume}; throw std::logic_error("unrelated"); }
+    catch (const std::logic_error&) {}
+    co_await scope.join();
+    const auto end = co_await client.read_body();
+    CHECK_VALUE(end && end->empty() && client.reusable());
+}
 Task<void> scripted() {
+    co_await resume_during_unrelated_unwind();
     test::section("short reads and writes, 1xx, true streaming reads, absolute deadlines");
     Script stream;
     stream.input = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nX: y\r\n\r\n"

@@ -183,7 +183,16 @@ Result<ParseStep> RequestParser::parse(Buffer& input) {
     // from having to rediscover it.
     for (;;) {
         switch (state_) {
-        case State::start_line: {
+        case State::start_line:
+            // A server can receive one empty CRLF before a request (RFC 9112
+            // section 2.2). Do not relax any other request-line grammar.
+            if (const auto bytes = input.readable(); bytes.size() >= 2 &&
+                bytes[0] == std::byte{'\r'} && bytes[1] == std::byte{'\n'}) {
+                input.consume(2);
+                state_ = State::after_leading_crlf;
+            }
+            [[fallthrough]];
+        case State::after_leading_crlf: {
             const Result<bool> parsed = parse_start_line(input);
             if (!parsed) {
                 return fail(parsed.error());

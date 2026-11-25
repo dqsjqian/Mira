@@ -160,6 +160,18 @@ struct MemoryStream {
     }
     void close() { closed = true; }
 };
+struct ChunkReader : MemoryStream {
+    std::size_t chunk = 512;
+    Task<Result<std::size_t>> read_some(std::span<std::byte> out, OperationOptions = {}) {
+        ++reads;
+        if (pos == input.size()) co_return fail(Mira::Errc::eof);
+        const auto count = std::min({out.size(), chunk, input.size() - pos});
+        std::copy_n(input.begin() + static_cast<std::ptrdiff_t>(pos), count, out.begin());
+        pos += count;
+        co_return count;
+    }
+};
+
 struct ClientMemoryStream : MemoryStream {
     Task<Result<std::size_t>> read_some(std::span<std::byte> out, OperationOptions options = {}) {
         if (input.empty()) {
@@ -228,6 +240,20 @@ Task<void> connection_tests() {
         CHECK(!(co_await fragmented.read_message()));
     }
     auto request = client_handshake("localhost");
+    for (const std::size_t chunk : {512U, 19U}) {
+        ChunkReader batched;
+        batched.chunk = chunk;
+        batched.input = bytes(request->request);
+        auto first = serialize(Frame{Opcode::binary, true, bytes("early")}, Role::client, test_mask);
+        batched.input.insert(batched.input.end(), first->begin(), first->end());
+        Limits exact;
+        exact.max_handshake = request->request.size();
+        Connection upgraded(batched, Role::server, exact);
+        CHECK((co_await upgraded.handshake()).has_value());
+        auto message = co_await upgraded.read_message();
+        CHECK(message && message->payload == bytes("early"));
+        CHECK(batched.reads == (batched.input.size() + chunk - 1) / chunk);
+    }
     MemoryStream stream;
     stream.input = bytes(request->request);
     Frame text{Opcode::text, true, bytes("echo")};

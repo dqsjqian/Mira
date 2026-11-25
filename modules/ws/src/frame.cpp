@@ -123,7 +123,7 @@ Result<void> FrameParser::parse_header() {
     }
     if (masked_) std::copy_n(header_.begin() + static_cast<std::ptrdiff_t>(pos), 4, mask_.begin());
     payload_size_ = static_cast<std::size_t>(size);
-    frame_.payload.reserve(payload_size_);
+    // Grow with received bytes; a frame header alone is not a reservation.
     header_ready_ = true;
     return {};
 }
@@ -161,11 +161,13 @@ Result<ParseResult> FrameParser::feed(std::span<const std::byte> bytes) {
     }
     auto count = std::min(payload_size_ - frame_.payload.size(), bytes.size() - result.consumed);
     const auto previous_size = frame_.payload.size();
-    for (std::size_t i = 0; i < count; ++i) {
-        auto byte = bytes[result.consumed++];
-        if (masked_) byte ^= mask_[frame_.payload.size() % 4];
-        frame_.payload.push_back(byte);
+    const auto piece = bytes.subspan(result.consumed, count);
+    frame_.payload.insert(frame_.payload.end(), piece.begin(), piece.end());
+    if (masked_) {
+        for (std::size_t i = previous_size; i < frame_.payload.size(); ++i)
+            frame_.payload[i] ^= mask_[i % mask_.size()];
     }
+    result.consumed += count;
     // RFC6455 UTF-8 state spans a message; control frames must not interrupt text validation.
     if (!control(frame_.opcode) && !message_compressed_ &&
         fragmented_.value_or(frame_.opcode) == Opcode::text &&
@@ -217,8 +219,11 @@ Result<std::vector<std::byte>> serialize(const Frame& frame, Role sender,
             output.push_back(std::byte((static_cast<std::uint64_t>(size) >> ((i - 1) * 8)) & 255));
     }
     if (mask) output.insert(output.end(), mask->begin(), mask->end());
-    for (std::size_t i = 0; i < size; ++i)
-        output.push_back(mask ? frame.payload[i] ^ (*mask)[i % 4] : frame.payload[i]);
+    const auto header_size = output.size();
+    output.insert(output.end(), frame.payload.begin(), frame.payload.end());
+    if (mask) {
+        for (std::size_t i = 0; i < size; ++i) output[header_size + i] ^= (*mask)[i % mask->size()];
+    }
     return output;
 }
 } // namespace Mira::ws

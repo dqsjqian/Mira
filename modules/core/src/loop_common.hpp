@@ -428,13 +428,30 @@ template<typename Impl>
     };
 }
 
+// Only a scheduler hop supplies a cancellation slot in the suspended frame.
+// Ordinary posts are destroyed on shutdown. Hops must instead unwind once.
+struct PostedWork {
+    move_only_function<void()> invoke;
+    bool* cancelled = nullptr;
+};
+inline void cancel_posts(std::vector<PostedWork>& batch) noexcept {
+    for (auto& item : batch) {
+        if (item.cancelled) {
+            *item.cancelled = true;
+            item.invoke();
+        }
+    }
+    batch.clear();
+}
+
 /// One throwing application callback must not strand later reliable control
 /// callbacks already removed from the queue. Finish the batch, then propagate
 /// the first exception to the host's pump boundary.
-inline void dispatch_posts(std::vector<move_only_function<void()>>& batch) {
+inline void dispatch_posts(std::vector<PostedWork>& batch,
+                           std::exception_ptr* deferred = nullptr) {
     std::exception_ptr failure;
     for (auto& work : batch) {
-        auto running = std::move(work);
+        auto running = std::move(work.invoke);
         try {
             running();
         } catch (...) {
@@ -442,25 +459,30 @@ inline void dispatch_posts(std::vector<move_only_function<void()>>& batch) {
         }
     }
     batch.clear();
-    if (failure) std::rethrow_exception(failure);
+    if (failure) {
+        if (!deferred) std::rethrow_exception(failure);
+        if (!*deferred) *deferred = std::move(failure);
+    }
 }
 
 /// Work queued by `post()`, drained on the loop thread.
 class PostQueue {
 public:
-    void push(move_only_function<void()>&& work) { queued_.push_back(std::move(work)); }
+    void push(move_only_function<void()>&& work, bool* cancelled) {
+        queued_.emplace_back(std::move(work), cancelled);
+    }
 
     [[nodiscard]] bool empty() const noexcept { return queued_.empty(); }
     [[nodiscard]] std::size_t size() const noexcept { return queued_.size(); }
 
-    void drain_into(std::vector<move_only_function<void()>>& out) noexcept {
+    void drain_into(std::vector<PostedWork>& out) noexcept {
         out.swap(queued_);
     }
 
     void clear() noexcept { queued_.clear(); }
 
 private:
-    std::vector<move_only_function<void()>> queued_{};
+    std::vector<PostedWork> queued_{};
 };
 
 }  // namespace Mira::detail

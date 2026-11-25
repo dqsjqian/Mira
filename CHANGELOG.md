@@ -8,6 +8,18 @@ records; they are not additional definitions of the current build version.
 
 ### Fixed
 
+- Only committed bytes of `Buffer` are readable. Consuming the readable prefix
+  no longer invalidates an outstanding writable span; repeated reads reuse storage.
+- The HTTP server accepts one leading CRLF before a request line. Response
+  framing remains strict, including the existing rules for 1xx and 204.
+- WebSocket upgrades read in blocks, retaining any first-frame bytes that
+  arrived with the handshake. Frame payloads grow with received data and
+  masking operates on whole slices.
+- HTTP/1 and WebSocket operation cleanup distinguishes the operation's own
+  exceptions from unrelated stack unwinding on the thread that resumes it.
+- `schedule_on(EventLoop&)` observes loop teardown without running ordinary
+  abandoned posts. `run_until_complete` lets the root finish before propagating
+  a posted callback's exception. POSIX wake coalescing is reset after draining.
 - A buffered HTTP/1 server no longer reserves the request body from the
   declared Content-Length beyond 1 MiB. With a large or unbounded
   `max_body_size`, one header could allocate gigabytes before any body byte

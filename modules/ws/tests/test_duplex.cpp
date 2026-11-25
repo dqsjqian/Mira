@@ -395,7 +395,25 @@ Task<void> custom_stream_without_scheduler() {
     co_await readers.join();
     CHECK(!connection.closed());
 }
+Task<void> resume_during_unrelated_unwind() {
+    PausedWriter stream;
+    stream.paused_writes = 1;
+    ws::Connection connection(stream, ws::Role::server);
+    CHECK(connection.adopt_extended_connect("websocket", 200).has_value());
+    TaskScope scope;
+    auto send = [&]() -> Task<void> {
+        CHECK((co_await connection.send(ws::Frame{ws::Opcode::text, true, bytes("ok")})).has_value());
+    };
+    scope.spawn(send());
+    struct Release { PausedWriter::Gate& gate; ~Release() { gate.release(); } };
+    try { Release release{stream.gate}; throw std::logic_error("unrelated"); }
+    catch (const std::logic_error&) {}
+    co_await scope.join();
+    CHECK(!connection.closed());
+}
+
 Task<void> run(EventLoop& loop) {
+    co_await resume_during_unrelated_unwind();
     co_await custom_stream_without_scheduler();
     co_await queued_pong_during_pong_write();
     co_await close_completes_with_queued_pong();

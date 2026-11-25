@@ -2,6 +2,7 @@
 #include "mira/core/bounded_executor.hpp"
 #include "mira/core/executor.hpp"
 #include "mira/core/loop_group.hpp"
+#include "mira/core/task_scope.hpp"
 
 #include <array>
 #include <atomic>
@@ -74,6 +75,11 @@ void test_budget() {
     CHECK(budget.stats().peak <= budget.limit());
 }
 
+Task<void> record_hop(EventLoop& loop, int& outcome) {
+    try { co_await schedule_on(loop); outcome = 1; }
+    catch (const std::system_error& ex) { outcome = ex.code() == Errc::cancelled ? 2 : -1; }
+}
+
 void test_bounded_post() {
     test::section("bounded admission includes dispatch batch and allows reentry");
     auto made = EventLoop::create();
@@ -115,8 +121,22 @@ void test_bounded_post() {
         CHECK(bytes.used() == 8);
     }
     CHECK(bytes.used() == 0);
+    int outcome = 0;
+    bool ordinary_ran = false;
+    TaskScope children;
+    {
+        auto closing = EventLoop::create();
+        closing->post([&] { ordinary_ran = true; });
+        children.spawn(record_hop(*closing, outcome));
+        CHECK(outcome == 0);
+    }
+    CHECK(!ordinary_ran && outcome == 2);
+    children.join().sync_get();
     auto moved = std::move(*made);
     CHECK(!made->try_post([] {}, bytes));
+    outcome = 0;
+    record_hop(*made, outcome).sync_get();
+    CHECK(outcome == 2);
 }
 
 Task<void> control_task(EventLoop& loop, BoundedExecutor& gate) {

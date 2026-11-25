@@ -33,6 +33,7 @@
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include "mira/core/functional.hpp"  // mira::move_only_function — posted work
 #include <memory>
 #include <span>
@@ -214,6 +215,25 @@ public:
     /// time out. Code that loops on `yield()` must watch its own stop token.
     [[nodiscard]] Task<void> yield();
 
+    /// Implementation of schedule_on(EventLoop&). A queued hop cancelled
+    /// by teardown unwinds on the shutdown thread with system_error(cancelled).
+    class Hop {
+    public:
+        explicit Hop(EventLoop& loop) noexcept : loop_(&loop) {}
+        bool await_ready() const noexcept { return false; }
+        bool await_suspend(std::coroutine_handle<> h) {
+            if (loop_->post_hop(h, &cancelled_)) return true;
+            cancelled_ = true;  // never published; may continue in place
+            return false;
+        }
+        void await_resume() const {
+            if (cancelled_) throw std::system_error(make_error_code(Errc::cancelled));
+        }
+    private:
+        EventLoop* loop_;
+        bool cancelled_ = false;
+    };
+
     /// Queue `work` to run on the loop thread. Safe from any thread.
     ///
     /// Move-only: a callable capturing a `Task` (itself move-only) can be
@@ -288,6 +308,8 @@ public:
     /// coroutine and arranges its resumption off-thread — a name resolver
     /// handing work to a thread pool, say — has to keep the loop aware of it,
     /// or `run()` will already return while that work is still pending.
+    /// A throwing posted callback is saved until the root has finished. A
+    /// root exception takes precedence; otherwise the first post failure wins.
     Result<void> run_until_complete(Task<void> task);
 
     /// Ask the loop to return from `run()`. Safe from any thread.
@@ -320,6 +342,8 @@ public:
 
 private:
     class Impl;
+    Result<void> pump_once(Duration timeout, std::exception_ptr* deferred);
+    bool post_hop(std::coroutine_handle<> handle, bool* cancelled);
 
     explicit EventLoop(std::unique_ptr<Impl> impl) noexcept;
 
