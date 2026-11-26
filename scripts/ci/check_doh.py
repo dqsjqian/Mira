@@ -251,7 +251,8 @@ def main() -> int:
                     else:
                         with spawn([args.http_server, "0"]) as http_port:
                             result = subprocess.run(
-                                [curl, "-sS", "--max-time", "8", "--doh-url", f"https://localhost:{port}/dns-query",
+                                [curl, "-sS", "--max-time", "8", "--noproxy", "*",
+                                 "--doh-url", f"https://localhost:{port}/dns-query",
                                  "--cacert", str(cert), f"http://mira.test:{http_port}/"],
                                 capture_output=True, text=True, timeout=TIMEOUT)
                         unsupported = result.returncode in (2, 4) or "doh-url" in result.stderr
